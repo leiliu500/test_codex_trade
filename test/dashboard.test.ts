@@ -30,6 +30,8 @@ test("dashboard exposes liveness and feed tabs before any entries, orders, or hi
   assert.match(html, /Live Feed Into System/);
   assert.match(html, /Entry Evaluations &amp; Decisions/);
   assert.match(html, /Potential Missed Entry Review/);
+  assert.match(html, /Entry Gate Blocks/);
+  assert.match(html, /Strategy state/);
   assert.match(html, /Actionable stages only/);
 });
 
@@ -64,6 +66,7 @@ test("dashboard separates potential hindsight misses from routine no-signal eval
   assert.equal(snapshot.tuning.falseNegativeSummary.potentialMisses, 1);
   assert.equal(snapshot.tuning.falseNegativeSummary.bullishPotentialMisses, 1);
   assert.equal(snapshot.tuning.falseNegativeSummary.bearishPotentialMisses, 0);
+  assert.deepEqual(snapshot.tuning.falseNegativeSummary.gateBlocks, [{ reason: "NO_DIRECTION_PASSED", count: 3 }]);
   assert.equal(snapshot.tuning.potentialMisses[0]?.direction, "BULLISH");
   assert.ok(Math.abs((snapshot.tuning.potentialMisses[0]?.forwardMoveBps ?? 0) - 3) < 1e-9);
   assert.deepEqual(snapshot.tuning.potentialMisses[0]?.failedGates, [

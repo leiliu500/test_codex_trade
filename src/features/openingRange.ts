@@ -1,7 +1,9 @@
 import type { EngineConfig } from "../config.js";
 import type { OpeningRangeState } from "../types.js";
 import { quantileNearestRank } from "../utils/statistics.js";
-import { isAtOrAfter, isBefore, marketDate } from "../utils/time.js";
+import { isAtOrAfter, isBefore, marketDate, parseClock, secondsSinceMidnight } from "../utils/time.js";
+
+const OPENING_RANGE_EDGE_TOLERANCE_SEC = 60;
 
 export class OpeningRangeTracker {
   readonly #config: EngineConfig;
@@ -9,6 +11,8 @@ export class OpeningRangeTracker {
   #date: string | undefined;
   #high: number | undefined;
   #low: number | undefined;
+  #firstObservationSecond: number | undefined;
+  #lastObservationSecond: number | undefined;
   #bullishBreakout: number | undefined;
   #bearishBreakout: number | undefined;
 
@@ -17,12 +21,28 @@ export class OpeningRangeTracker {
     this.#priorWidths = priorWidthsBps;
   }
 
+  restore(marketDateValue: string, state: OpeningRangeState): void {
+    if (!state.complete || !(state.high !== undefined && state.high > 0) ||
+        !(state.low !== undefined && state.low > 0 && state.low <= state.high)) {
+      throw new Error("Cannot restore an incomplete or invalid opening range");
+    }
+    this.#date = marketDateValue;
+    this.#high = state.high;
+    this.#low = state.low;
+    this.#firstObservationSecond = parseClock(this.#config.session.marketOpen);
+    this.#lastObservationSecond = parseClock(this.#config.session.openingRangeEnd) - 1;
+    this.#bullishBreakout = state.bullishBreakoutTimestamp;
+    this.#bearishBreakout = state.bearishBreakoutTimestamp;
+  }
+
   update(timestamp: number, price: number): OpeningRangeState {
     const date = marketDate(timestamp, this.#config.timeZone);
     if (date !== this.#date) {
       this.#date = date;
       this.#high = undefined;
       this.#low = undefined;
+      this.#firstObservationSecond = undefined;
+      this.#lastObservationSecond = undefined;
       this.#bullishBreakout = undefined;
       this.#bearishBreakout = undefined;
     }
@@ -31,9 +51,17 @@ export class OpeningRangeTracker {
     if (inRange) {
       this.#high = this.#high === undefined ? price : Math.max(this.#high, price);
       this.#low = this.#low === undefined ? price : Math.min(this.#low, price);
+      const second = secondsSinceMidnight(timestamp, this.#config.timeZone);
+      this.#firstObservationSecond ??= second;
+      this.#lastObservationSecond = second;
     }
+    const marketOpenSecond = parseClock(this.#config.session.marketOpen);
+    const openingRangeEndSecond = parseClock(this.#config.session.openingRangeEnd);
+    const fullSessionCoverage = this.#firstObservationSecond !== undefined && this.#lastObservationSecond !== undefined &&
+      this.#firstObservationSecond <= marketOpenSecond + OPENING_RANGE_EDGE_TOLERANCE_SEC &&
+      this.#lastObservationSecond >= openingRangeEndSecond - OPENING_RANGE_EDGE_TOLERANCE_SEC;
     const complete = isAtOrAfter(timestamp, this.#config.session.openingRangeEnd, this.#config.timeZone)
-      && this.#high !== undefined && this.#low !== undefined;
+      && this.#high !== undefined && this.#low !== undefined && fullSessionCoverage;
     let midpoint: number | undefined;
     let widthBps: number | undefined;
     let percentile: number | undefined;
