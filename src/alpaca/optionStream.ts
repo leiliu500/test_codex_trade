@@ -21,6 +21,7 @@ export interface AlpacaOptionStreamConfig {
   feed?: "indicative" | "opra";
   sandbox?: boolean;
   url?: string;
+  connectTimeoutMs?: number;
 }
 
 export class AlpacaOptionWebSocket implements OptionStream {
@@ -39,6 +40,7 @@ export class AlpacaOptionWebSocket implements OptionStream {
       feed,
       sandbox,
       url: config.url ?? `wss://${host}/v1beta1/${feed}`,
+      connectTimeoutMs: config.connectTimeoutMs ?? 10_000,
     };
   }
 
@@ -61,6 +63,25 @@ export class AlpacaOptionWebSocket implements OptionStream {
       });
       this.#socket = socket;
       socket.binaryType = "arraybuffer";
+      const timeout = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        socket.terminate();
+        reject(new Error(`Timed out authenticating ${this.#config.feed.toUpperCase()} option stream`));
+      }, this.#config.connectTimeoutMs);
+      const resolveOnce = (): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        handlers.onState?.(true);
+        resolve();
+      };
+      const rejectOnce = (error: unknown): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        reject(error);
+      };
       socket.on("open", () => this.#send({ action: "auth", key: this.#config.apiKey, secret: this.#config.apiSecret }));
       socket.on("message", (data: RawData) => {
         try {
@@ -70,22 +91,33 @@ export class AlpacaOptionWebSocket implements OptionStream {
             if (message.T === "success" && message.msg === "authenticated") {
               this.#authenticated = true;
               if (this.#symbols.size > 0) this.#send({ action: "subscribe", quotes: [...this.#symbols] });
-              else if (!settled) { settled = true; handlers.onState?.(true); resolve(); }
+              else resolveOnce();
             } else if (message.T === "subscription") {
-              if (!settled) { settled = true; handlers.onState?.(true); resolve(); }
+              const quotes = Array.isArray(message.quotes) ? message.quotes : [];
+              const missing = [...this.#symbols].filter((symbol) => !quotes.includes(symbol));
+              if (missing.length > 0) {
+                throw new Error(`${this.#config.feed.toUpperCase()} option subscription acknowledgement is missing ${missing.length} symbols`);
+              }
+              resolveOnce();
             } else if (message.T === "q") void handlers.onQuote(adaptAlpacaOptionQuote(message));
             else if (message.T === "error") throw new Error(`Alpaca option stream error ${String(message.code)}: ${String(message.msg)}`);
           }
         } catch (error) {
           handlers.onError?.(error);
-          if (!settled) { settled = true; reject(error); }
+          rejectOnce(error);
         }
       });
       socket.on("error", (error) => {
         handlers.onError?.(error);
-        if (!settled) { settled = true; reject(error); }
+        rejectOnce(error);
       });
-      socket.on("close", () => { this.#socket = undefined; this.#authenticated = false; handlers.onState?.(false); });
+      socket.on("close", () => {
+        clearTimeout(timeout);
+        this.#socket = undefined;
+        this.#authenticated = false;
+        handlers.onState?.(false);
+        rejectOnce(new Error(`${this.#config.feed.toUpperCase()} option stream closed before subscription`));
+      });
     });
   }
 

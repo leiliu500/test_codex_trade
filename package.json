@@ -14,6 +14,8 @@
   "description": "Causal SPY intraday options research, replay, selection, execution, and risk engine",
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "build:prod": "tsc -p tsconfig.build.json",
+    "start": "node dist/src/main.js",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "tsx --test test/**/*.test.ts",
     "backtest": "tsx src/cli/backtest.ts",

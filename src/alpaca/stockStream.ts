@@ -19,6 +19,7 @@ export interface AlpacaStockStreamConfig {
   feed?: "iex" | "sip";
   symbol?: "SPY";
   url?: string;
+  connectTimeoutMs?: number;
 }
 
 export class AlpacaStockWebSocket implements StockStream {
@@ -34,6 +35,7 @@ export class AlpacaStockWebSocket implements StockStream {
       feed,
       symbol: config.symbol ?? "SPY",
       url: config.url ?? `wss://stream.data.alpaca.markets/v2/${feed}`,
+      connectTimeoutMs: config.connectTimeoutMs ?? 10_000,
     };
   }
 
@@ -42,36 +44,63 @@ export class AlpacaStockWebSocket implements StockStream {
     this.#handlers = handlers;
     return new Promise((resolve, reject) => {
       let settled = false;
-      const socket = new WebSocket(this.#config.url, {
-        headers: {
-          "APCA-API-KEY-ID": this.#config.apiKey,
-          "APCA-API-SECRET-KEY": this.#config.apiSecret,
-        },
-      });
+      const socket = new WebSocket(this.#config.url);
       this.#socket = socket;
-      socket.on("open", () => {
-        socket.send(JSON.stringify({ action: "subscribe", trades: [this.#config.symbol], quotes: [this.#config.symbol] }));
-      });
+      const timeout = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        socket.terminate();
+        reject(new Error(`Timed out authenticating SPY ${this.#config.feed.toUpperCase()} stream`));
+      }, this.#config.connectTimeoutMs);
+      const resolveOnce = (): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        handlers.onState?.(true);
+        resolve();
+      };
+      const rejectOnce = (error: unknown): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        reject(error);
+      };
+      socket.on("open", () => socket.send(JSON.stringify({
+        action: "auth", key: this.#config.apiKey, secret: this.#config.apiSecret,
+      })));
       socket.on("message", (data: RawData) => {
         try {
           const messages = JSON.parse(data.toString()) as Array<Record<string, unknown>>;
           for (const message of messages) {
-            if (message.T === "subscription") {
-              if (!settled) { settled = true; handlers.onState?.(true); resolve(); }
+            if (message.T === "success" && message.msg === "authenticated") {
+              socket.send(JSON.stringify({
+                action: "subscribe", trades: [this.#config.symbol], quotes: [this.#config.symbol],
+              }));
+            } else if (message.T === "subscription") {
+              const trades = Array.isArray(message.trades) ? message.trades : [];
+              const quotes = Array.isArray(message.quotes) ? message.quotes : [];
+              if (!trades.includes(this.#config.symbol) || !quotes.includes(this.#config.symbol)) {
+                throw new Error(`SPY ${this.#config.feed.toUpperCase()} subscription acknowledgement is incomplete`);
+              }
+              resolveOnce();
             } else if (message.T === "q") void handlers.onQuote(adaptAlpacaStockQuote(message));
             else if (message.T === "t") void handlers.onTrade(adaptAlpacaStockTrade(message));
             else if (message.T === "error") throw new Error(`Alpaca stock stream error ${String(message.code)}: ${String(message.msg)}`);
           }
         } catch (error) {
           handlers.onError?.(error);
-          if (!settled) { settled = true; reject(error); }
+          rejectOnce(error);
         }
       });
       socket.on("error", (error) => {
         handlers.onError?.(error);
-        if (!settled) { settled = true; reject(error); }
+        rejectOnce(error);
       });
-      socket.on("close", () => { this.#socket = undefined; handlers.onState?.(false); });
+      socket.on("close", () => {
+        this.#socket = undefined;
+        handlers.onState?.(false);
+        rejectOnce(new Error(`SPY ${this.#config.feed.toUpperCase()} stream closed before subscription`));
+      });
     });
   }
 
