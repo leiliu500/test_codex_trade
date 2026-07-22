@@ -32,6 +32,7 @@
     "noiseFloorBps": 0.01
   },
   "signals": {
+    "entryQualityMode": "SHADOW",
     "minEfficiency60": 0.28,
     "minR2Medium": 0.15,
     "impulseFastSlopeScore": 0.42,
@@ -56,7 +57,7 @@
     "followThroughMaxSec": 15,
     "followThroughMinimumBps": 0,
     "followThroughScope": "BULLISH_IMPULSE",
-    "shadowFollowThroughScope": "ALL",
+    "shadowFollowThroughScope": "BULLISH_IMPULSE",
     "blockWhipsaw": true
   },
   "regimes": {
@@ -105,7 +106,8 @@
     "maxRiskDollarsPerTrade": 500,
     "maxPremiumDollarsPerTrade": 1500,
     "maxContracts": 10,
-    "maxTradesPerDay": 6,
+    "maxTradesPerDay": 1000,
+    "entryQualityMaxTradesPerDay": 6,
     "maxDailyLossDollars": 1000,
     "hardOptionStopPct": 0.25,
     "optionProfitTargetPct": 0.35,

@@ -1,4 +1,4 @@
-import type { EngineConfig } from "../config.js";
+import type { EngineConfig, FollowThroughScope } from "../config.js";
 import type { OptionStream } from "../alpaca/optionStream.js";
 import type { StockStream } from "../alpaca/stockStream.js";
 import type { TradingRestClient } from "../alpaca/restClient.js";
@@ -79,7 +79,7 @@ export class SpyOptionsTradingRuntime {
   readonly #selector: OptionSelector;
   readonly #universe: OptionUniverseManager;
   readonly #signals: SignalEngine;
-  readonly #shadowSignals: SignalEngine | undefined;
+  readonly #shadowSignals = new Map<FollowThroughScope, SignalEngine>();
   readonly #orders: LiveOrderManager;
   readonly #stockReceiver: SpySipReceiver;
   readonly #restoredRuntimeState: RestoredRuntimeState;
@@ -130,10 +130,13 @@ export class SpyOptionsTradingRuntime {
     this.#universe = new OptionUniverseManager(options.config);
     this.#signals = new SignalEngine(options.config);
     if (options.config.signals.shadowFollowThroughScope !== "DISABLED") {
-      const shadowConfig = structuredClone(options.config);
-      shadowConfig.signals.followThroughScope = options.config.signals.shadowFollowThroughScope;
-      this.#shadowSignals = new SignalEngine(shadowConfig);
-    } else this.#shadowSignals = undefined;
+      for (const scope of ["BULLISH_IMPULSE", "IMPULSE", "ALL"] as const) {
+        const shadowConfig = structuredClone(options.config);
+        shadowConfig.signals.entryQualityMode = "ENFORCE";
+        shadowConfig.signals.followThroughScope = scope;
+        this.#shadowSignals.set(scope, new SignalEngine(shadowConfig));
+      }
+    }
     if (options.restoredFeatureCheckpoint) {
       this.#lastFeature = options.restoredFeatureCheckpoint;
       this.#lastSpot = options.restoredFeatureCheckpoint.price;
@@ -142,7 +145,7 @@ export class SpyOptionsTradingRuntime {
     const restored = restoreRuntimeState(options.restoredAuditEvents ?? [], this.#now(), options.config.timeZone);
     this.#restoredRuntimeState = restored;
     this.#signals.restoreState(restored.signal);
-    this.#shadowSignals?.restoreState(restored.signal);
+    for (const engine of this.#shadowSignals.values()) engine.restoreState(restored.signal);
     this.#recorder = options.recorder ?? new MemoryRecorder();
     this.#history = options.history;
     this.#orders = new LiveOrderManager({
@@ -186,9 +189,22 @@ export class SpyOptionsTradingRuntime {
         marketDate: this.#restoredRuntimeState.risk.marketDate,
         restoredEntries: this.#restoredRuntimeState.risk.entries,
         restoredRealizedPnl: this.#restoredRuntimeState.risk.realizedPnl,
-        maxTradesPerDay: this.#config.risk.maxTradesPerDay,
+        entryQualityMode: this.#config.signals.entryQualityMode,
+        activeMaxTradesPerDay: this.#config.signals.entryQualityMode === "ENFORCE"
+          ? this.#config.risk.entryQualityMaxTradesPerDay : this.#config.risk.maxTradesPerDay,
+        maxTradesPerDay: this.#config.signals.entryQualityMode === "ENFORCE"
+          ? this.#config.risk.entryQualityMaxTradesPerDay : this.#config.risk.maxTradesPerDay,
+        shadowMaxTradesPerDay: this.#config.risk.entryQualityMaxTradesPerDay,
         maxDailyLossDollars: this.#config.risk.maxDailyLossDollars,
-        entryCapReached: this.#restoredRuntimeState.risk.entries >= this.#config.risk.maxTradesPerDay,
+        activeEntryCapReached: this.#restoredRuntimeState.risk.entries >= (
+          this.#config.signals.entryQualityMode === "ENFORCE"
+            ? this.#config.risk.entryQualityMaxTradesPerDay : this.#config.risk.maxTradesPerDay
+        ),
+        entryCapReached: this.#restoredRuntimeState.risk.entries >= (
+          this.#config.signals.entryQualityMode === "ENFORCE"
+            ? this.#config.risk.entryQualityMaxTradesPerDay : this.#config.risk.maxTradesPerDay
+        ),
+        shadowEntryCapReached: this.#restoredRuntimeState.risk.entries >= this.#config.risk.entryQualityMaxTradesPerDay,
         knownClientOrderIds: this.#restoredRuntimeState.knownClientOrderIds.size,
       });
       this.#synchronizeHistoryPriorities();
@@ -229,6 +245,10 @@ export class SpyOptionsTradingRuntime {
         strategyStateStatus: this.#strategyStateStatus,
         restoredStockEvents: this.#restoredStockEvents,
         restoredFeatureBars: this.#restoredFeatureBars,
+        entryQualityMode: this.#config.signals.entryQualityMode,
+        activeFollowThroughScope: this.#config.signals.followThroughScope,
+        shadowFollowThroughScope: this.#config.signals.shadowFollowThroughScope,
+        shadowFollowThroughScopes: [...this.#shadowSignals.keys()],
       });
     } catch (error) {
       this.#recordError(error);
@@ -259,11 +279,12 @@ export class SpyOptionsTradingRuntime {
         this.#updateStrategyState(feature);
         await this.#refreshUniverse(feature.price, this.#now());
         await this.#tickExecution(this.#now());
-        const shadowEvaluation = this.#shadowSignals?.evaluateDetailed(feature, this.#lastRegime);
-        const shadowAudit = shadowEvaluation ? {
-          scope: this.#config.signals.shadowFollowThroughScope,
-          ...signalEvaluationSummary(shadowEvaluation),
-        } : null;
+        const shadowEvaluations = Object.fromEntries([...this.#shadowSignals.entries()].map(([scope, engine]) => [
+          scope,
+          { scope, ...signalEvaluationSummary(engine.evaluateDetailed(feature, this.#lastRegime!)) },
+        ]));
+        const primaryShadowScope = this.#config.signals.shadowFollowThroughScope;
+        const shadowAudit = primaryShadowScope === "DISABLED" ? null : shadowEvaluations[primaryShadowScope] ?? null;
         const runtimeBlocks: string[] = [];
         if (!this.#executionEnabled) runtimeBlocks.push("EXECUTION_DISABLED");
         if (this.#killSwitch) runtimeBlocks.push("KILL_SWITCH");
@@ -281,6 +302,7 @@ export class SpyOptionsTradingRuntime {
             regimeReasons: this.#lastRegime.reasons,
             directions: [],
             shadowEvaluation: shadowAudit,
+            shadowEvaluations,
             feature: entryFeatureSummary(feature),
           });
           return;
@@ -288,15 +310,21 @@ export class SpyOptionsTradingRuntime {
 
         const evaluation = this.#signals.evaluateDetailed(feature, this.#lastRegime);
         const signal = evaluation.signal;
+        const researchOnlyAfterCutoff = signal !== undefined &&
+          secondsSinceMidnight(feature.timestamp, this.#config.timeZone) >
+            parseClock(this.#config.options.zeroDteEntryCutoff);
         await this.#auditRuntime(feature.timestamp, "live_entry_evaluation", {
           timestamp: feature.timestamp,
-          decision: signal ? "SIGNAL" : "NO_SIGNAL",
-          reasons: evaluation.reasons,
+          decision: signal ? (researchOnlyAfterCutoff ? "RESEARCH_ONLY" : "SIGNAL") : "NO_SIGNAL",
+          reasons: researchOnlyAfterCutoff
+            ? [...evaluation.reasons, "ZERO_DTE_ENTRY_CUTOFF_PASSED"] : evaluation.reasons,
+          actionability: researchOnlyAfterCutoff ? "RESEARCH_ONLY" : signal ? "ACTIONABLE" : "NONE",
           regime: this.#lastRegime.regime,
           regimeConfidence: this.#lastRegime.confidence,
           regimeReasons: this.#lastRegime.reasons,
           directions: evaluation.directions,
           shadowEvaluation: shadowAudit,
+          shadowEvaluations,
           ...(signal ? {
             signalId: signal.id,
             direction: signal.direction,
@@ -305,7 +333,7 @@ export class SpyOptionsTradingRuntime {
           } : {}),
           feature: entryFeatureSummary(feature),
         });
-        if (!signal) return;
+        if (!signal || researchOnlyAfterCutoff) return;
         const subscribedContracts = this.#contracts.filter((contract) => this.#subscribedSymbols.has(contract.symbol));
         const decisionTimestamp = this.#now();
         const selection = this.#selector.select(signal, subscribedContracts, this.#book, decisionTimestamp);
@@ -638,7 +666,9 @@ export class SpyOptionsTradingRuntime {
       this.#universe.retainOpenPosition(symbol, this.#now());
       this.#retainedPositionSymbol = symbol;
       this.#signals.recordEntry(this.#execution.position!.direction, this.#execution.position!.entryTimestamp);
-      this.#shadowSignals?.recordEntry(this.#execution.position!.direction, this.#execution.position!.entryTimestamp);
+      for (const engine of this.#shadowSignals.values()) {
+        engine.recordEntry(this.#execution.position!.direction, this.#execution.position!.entryTimestamp);
+      }
     } else if (!symbol && this.#retainedPositionSymbol) {
       this.#universe.releaseClosedPosition(this.#retainedPositionSymbol);
       this.#retainedPositionSymbol = undefined;

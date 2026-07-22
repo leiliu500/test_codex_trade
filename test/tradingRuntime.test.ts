@@ -23,6 +23,8 @@ const callSymbol = "SPY260722C00501000";
 const immediateRuntimeConfig = structuredClone(defaultConfig);
 immediateRuntimeConfig.signals.followThroughMinSec = 0;
 immediateRuntimeConfig.signals.followThroughMaxSec = 0;
+const enforcedRuntimeConfig = structuredClone(defaultConfig);
+enforcedRuntimeConfig.signals.entryQualityMode = "ENFORCE";
 
 test("option universe readiness follows the 0DTE cutoff while protecting open exposure", () => {
   const beforeCutoff = zonedDateTimeToEpoch(date, "14:29:59");
@@ -211,7 +213,8 @@ test("end-to-end paper runtime arms SIP/OPRA and routes an eligible signal to a 
   assert.equal(orderRequest?.data.signalId, selection?.data.signalId);
   const riskRecovery = recorder.events.find((event) => event.type === "daily_risk_state_recovery");
   assert.equal(riskRecovery?.data.restoredEntries, 0);
-  assert.equal(riskRecovery?.data.maxTradesPerDay, defaultConfig.risk.maxTradesPerDay);
+  assert.equal(riskRecovery?.data.activeMaxTradesPerDay, defaultConfig.risk.maxTradesPerDay);
+  assert.equal(riskRecovery?.data.shadowMaxTradesPerDay, defaultConfig.risk.entryQualityMaxTradesPerDay);
   await runtime.close();
   assert.deepEqual(history.priorityChanges.at(-1), []);
 });
@@ -258,13 +261,105 @@ test("restart restoration deduplicates partial entry fills and preserves the dai
   assert.ok(decision.reasons.includes("MAX_DAILY_ENTRIES_REACHED"));
 });
 
-test("paper runtime waits for causal follow-through before submitting an entry", async () => {
-  let decisionTime = now;
+test("restart after six unique fills restores an active shadow entry cap", async () => {
+  const restoredAuditEvents: AuditEvent[] = Array.from({ length: 6 }, (_, index) => ({
+    timestamp: now - (index + 1) * 1_000,
+    marketDate: date,
+    type: "entry_fill",
+    configVersion: "before",
+    data: {
+      signalId: `restart-fill-${index}`,
+      position: {
+        symbol: callSymbol,
+        direction: index % 2 === 0 ? "BULLISH" : "BEARISH",
+        entryTimestamp: now - (index + 1) * 1_000,
+      },
+    },
+  }));
+  const recorder = new MemoryRecorder();
+  const runtime = new SpyOptionsTradingRuntime({
+    config: defaultConfig,
+    client: new FakeRuntimeClient(),
+    stockStream: new FakeStockStream(),
+    optionStream: new FakeOptionStream(),
+    executionEnabled: false,
+    executionMode: "paper",
+    now: () => now,
+    executionTickMs: 60_000,
+    recorder,
+    restoredAuditEvents,
+  });
+  await runtime.start();
+  const recovery = recorder.events.find((event) => event.type === "daily_risk_state_recovery");
+  assert.equal(recovery?.data.restoredEntries, 6);
+  assert.equal(recovery?.data.activeEntryCapReached, false);
+  assert.equal(recovery?.data.shadowEntryCapReached, true);
+  await runtime.close();
+});
+
+test("shadow confirmation observes a pending candidate without delaying the paper order", async () => {
   const client = new FakeRuntimeClient();
   const optionStream = new FakeOptionStream();
   const recorder = new MemoryRecorder();
   const runtime = new SpyOptionsTradingRuntime({
     config: defaultConfig,
+    client,
+    stockStream: new FakeStockStream(),
+    optionStream,
+    executionEnabled: true,
+    executionMode: "paper",
+    now: () => now,
+    executionTickMs: 60_000,
+    recorder,
+  });
+  await runtime.start();
+  await optionStream.quote({
+    symbol: callSymbol, timestamp: now, bidPrice: 1.99, askPrice: 2.01, bidSize: 100, askSize: 100,
+  });
+  await runtime.ingestFeature(bullishFeature());
+  assert.equal(client.requests.length, 1);
+  const evaluation = recorder.events.find((event) => event.type === "live_entry_evaluation");
+  assert.equal(evaluation?.data.decision, "SIGNAL");
+  const shadow = evaluation?.data.shadowEvaluation as Record<string, unknown>;
+  assert.equal(shadow.decision, "NO_SIGNAL");
+  assert.deepEqual(shadow.reasons, ["FOLLOW_THROUGH_PENDING"]);
+  await runtime.close();
+});
+
+test("post-14:30 baseline candidates are labeled research-only before option selection", async () => {
+  const afterCutoff = zonedDateTimeToEpoch(date, "14:30:01");
+  const client = new FakeRuntimeClient();
+  client.clock.timestamp = afterCutoff;
+  const recorder = new MemoryRecorder();
+  const runtime = new SpyOptionsTradingRuntime({
+    config: defaultConfig,
+    client,
+    stockStream: new FakeStockStream(),
+    optionStream: new FakeOptionStream(),
+    executionEnabled: true,
+    executionMode: "paper",
+    now: () => afterCutoff,
+    executionTickMs: 60_000,
+    recorder,
+  });
+  await runtime.start();
+  await runtime.ingestFeature({ ...bullishFeature(), timestamp: afterCutoff });
+  const evaluation = recorder.events.find((event) => event.type === "live_entry_evaluation");
+  assert.equal(evaluation?.data.decision, "RESEARCH_ONLY");
+  assert.equal(evaluation?.data.actionability, "RESEARCH_ONLY");
+  assert.ok((evaluation?.data.reasons as string[]).includes("ZERO_DTE_ENTRY_CUTOFF_PASSED"));
+  assert.equal(recorder.events.some((event) => event.type === "live_signal_selection"), false);
+  assert.equal(client.requests.length, 0);
+  await runtime.close();
+});
+
+test("enforced opt-in waits for causal follow-through before submitting an entry", async () => {
+  let decisionTime = now;
+  const client = new FakeRuntimeClient();
+  const optionStream = new FakeOptionStream();
+  const recorder = new MemoryRecorder();
+  const runtime = new SpyOptionsTradingRuntime({
+    config: enforcedRuntimeConfig,
     client,
     stockStream: new FakeStockStream(),
     optionStream,
@@ -299,7 +394,7 @@ test("paper runtime waits for causal follow-through before submitting an entry",
   await runtime.close();
 });
 
-test("all-entry shadow confirmation is audited but cannot submit an order", async () => {
+test("all confirmation scopes are audited together and cannot submit an order", async () => {
   let decisionTime = now;
   const client = new FakeRuntimeClient();
   const recorder = new MemoryRecorder();
@@ -323,7 +418,9 @@ test("all-entry shadow confirmation is audited but cannot submit an order", asyn
   const latest = evaluations.at(-1)!;
   assert.equal(latest.data.decision, "SKIPPED");
   assert.ok((latest.data.reasons as string[]).includes("EXECUTION_DISABLED"));
-  assert.equal((latest.data.shadowEvaluation as Record<string, unknown>).decision, "SIGNAL");
+  const shadowProfiles = latest.data.shadowEvaluations as Record<string, Record<string, unknown>>;
+  assert.deepEqual(Object.keys(shadowProfiles), ["BULLISH_IMPULSE", "IMPULSE", "ALL"]);
+  assert.equal(shadowProfiles.ALL?.decision, "SIGNAL");
   assert.equal(client.requests.length, 0);
   await runtime.close();
 });

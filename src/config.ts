@@ -2,6 +2,7 @@ import defaultConfigJson from "../config/default.json" with { type: "json" };
 import { parseClock } from "./utils/time.js";
 
 export type FollowThroughScope = "BULLISH_IMPULSE" | "IMPULSE" | "ALL";
+export type EntryQualityMode = "SHADOW" | "ENFORCE";
 
 export interface EngineConfig {
   version: string;
@@ -37,6 +38,7 @@ export interface EngineConfig {
     noiseFloorBps: number;
   };
   signals: {
+    entryQualityMode: EntryQualityMode;
     minEfficiency60: number;
     minR2Medium: number;
     impulseFastSlopeScore: number;
@@ -111,6 +113,7 @@ export interface EngineConfig {
     maxPremiumDollarsPerTrade: number;
     maxContracts: number;
     maxTradesPerDay: number;
+    entryQualityMaxTradesPerDay: number;
     maxDailyLossDollars: number;
     hardOptionStopPct: number;
     optionProfitTargetPct: number;
@@ -199,6 +202,13 @@ export function validateConfig(config: EngineConfig): void {
   if (!scopes.has(config.signals.followThroughScope) ||
       (config.signals.shadowFollowThroughScope !== "DISABLED" && !scopes.has(config.signals.shadowFollowThroughScope))) {
     throw new Error("Follow-through scope must be BULLISH_IMPULSE, IMPULSE, ALL, or DISABLED for shadow evaluation");
+  }
+  if (!new Set<EntryQualityMode>(["SHADOW", "ENFORCE"]).has(config.signals.entryQualityMode)) {
+    throw new Error("Entry-quality mode must be SHADOW or ENFORCE");
+  }
+  if (!(Number.isInteger(config.risk.maxTradesPerDay) && config.risk.maxTradesPerDay > 0 &&
+        Number.isInteger(config.risk.entryQualityMaxTradesPerDay) && config.risk.entryQualityMaxTradesPerDay > 0)) {
+    throw new Error("Daily entry caps must be positive integers");
   }
   if (!(config.risk.earlyScratchMinAgeSec >= 0 &&
         config.risk.earlyScratchMaxAgeSec >= config.risk.earlyScratchMinAgeSec &&

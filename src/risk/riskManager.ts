@@ -29,7 +29,9 @@ export class RiskManager {
     if (!request.account.active) reasons.push("ACCOUNT_INACTIVE_OR_BLOCKED");
     if (!request.account.optionsApproved) reasons.push("OPTIONS_APPROVAL_INSUFFICIENT");
     if (request.account.killSwitch) reasons.push("KILL_SWITCH_ACTIVE");
-    if (daily.entries >= this.#config.risk.maxTradesPerDay) reasons.push("MAX_DAILY_ENTRIES_REACHED");
+    const maxTradesPerDay = this.#config.signals.entryQualityMode === "ENFORCE"
+      ? this.#config.risk.entryQualityMaxTradesPerDay : this.#config.risk.maxTradesPerDay;
+    if (daily.entries >= maxTradesPerDay) reasons.push("MAX_DAILY_ENTRIES_REACHED");
     if (daily.realizedPnl <= -this.#config.risk.maxDailyLossDollars) reasons.push("MAX_DAILY_LOSS_REACHED");
     if (this.#config.risk.onePositionAtATime && request.hasOpenPosition) reasons.push("POSITION_ALREADY_OPEN");
 

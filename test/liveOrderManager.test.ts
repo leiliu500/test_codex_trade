@@ -210,6 +210,56 @@ test("ambiguous submission is recovered by deterministic client order ID without
   assert.ok(recorder.events.some((event) => event.type === "broker_submission_recovered"));
 });
 
+test("restored six-fill cap is shadow-audited without blocking a paper entry", async () => {
+  const client = new FakeTradingClient();
+  const recorder = new MemoryRecorder();
+  const manager = new LiveOrderManager({
+    config: defaultConfig,
+    client,
+    recorder,
+    restoredRiskState: { marketDate: date, entries: 6, realizedPnl: 0 },
+  });
+  await manager.initialize(start);
+  const submitted = await manager.submitEntry({
+    timestamp: start, signal: signal(), candidate: candidate(), quote: optionQuote(start),
+  });
+  assert.equal(submitted.submitted, true);
+  const riskEvent = recorder.events.find((event) => event.type === "risk_decision");
+  const activeRisk = riskEvent?.data.risk as Record<string, unknown>;
+  const shadowAudit = riskEvent?.data.shadowRisk as Record<string, unknown>;
+  const shadowRisk = shadowAudit.risk as Record<string, unknown>;
+  assert.equal(activeRisk.allowed, true);
+  assert.equal(shadowRisk.allowed, false);
+  assert.ok((shadowRisk.reasons as string[]).includes("MAX_DAILY_ENTRIES_REACHED"));
+});
+
+test("early scratch is audited in shadow mode without closing the paper position", async () => {
+  const client = new FakeTradingClient();
+  const recorder = new MemoryRecorder();
+  const manager = new LiveOrderManager({ config: defaultConfig, client, recorder });
+  await manager.initialize(start);
+  const submitted = await manager.submitEntry({
+    timestamp: start, signal: signal(), candidate: candidate(), quote: optionQuote(start),
+  });
+  client.fill(submitted.brokerOrder!.id, submitted.risk!.quantity, 2, "filled");
+  await manager.tick({ timestamp: start + 400, optionQuote: optionQuote(start + 400) });
+  const reversed = {
+    symbol: "SPY", timestamp: start + 5_500, marketDate: date, price: 499.99,
+    fast: { normalizedSlope: -0.5 }, medium: { normalizedSlope: 0.5 },
+    vwap: { sessionVwap: 499 },
+  } as unknown as FeatureSnapshot;
+  const state = await manager.tick({
+    timestamp: start + 5_500,
+    optionQuote: optionQuote(start + 5_500),
+    feature: reversed,
+  });
+  assert.equal(state.pending, undefined);
+  assert.equal(state.position?.symbol, symbol);
+  const shadowExit = recorder.events.find((event) => event.type === "shadow_exit_decision");
+  assert.equal(shadowExit?.data.reason, "EARLY_SCRATCH");
+  assert.equal(shadowExit?.data.activeDecision, "HOLD");
+});
+
 test("startup halts when an open broker order has no restored local lifecycle state", async () => {
   const client = new FakeTradingClient();
   await client.submitOrder({

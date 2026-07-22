@@ -53,6 +53,11 @@ function feature(direction: 1 | -1 = 1): FeatureSnapshot {
 const immediateSignalConfig = structuredClone(defaultConfig);
 immediateSignalConfig.signals.followThroughMinSec = 0;
 immediateSignalConfig.signals.followThroughMaxSec = 0;
+const enforcedSignalConfig = structuredClone(defaultConfig);
+enforcedSignalConfig.signals.entryQualityMode = "ENFORCE";
+const enforcedImmediateSignalConfig = structuredClone(enforcedSignalConfig);
+enforcedImmediateSignalConfig.signals.followThroughMinSec = 0;
+enforcedImmediateSignalConfig.signals.followThroughMaxSec = 0;
 
 test("regime ordering distinguishes whipsaw, reversal, strong and grind", () => {
   const strong = feature();
@@ -125,7 +130,8 @@ test("bullish impulses stop after 13:00 and all executable signals stop after 14
     ...feature(1),
     timestamp: zonedDateTimeToEpoch("2026-07-22", "13:00:01"),
   };
-  const bullish = new SignalEngine(immediateSignalConfig).evaluateDetailed(afterBullishCutoff, unclassified);
+  assert.equal(new SignalEngine(immediateSignalConfig).evaluate(afterBullishCutoff, unclassified)?.direction, "BULLISH");
+  const bullish = new SignalEngine(enforcedImmediateSignalConfig).evaluateDetailed(afterBullishCutoff, unclassified);
   assert.equal(bullish.signal, undefined);
   assert.ok(bullish.directions.find((item) => item.direction === "BULLISH")?.reasons
     .includes("BULLISH_IMPULSE_CUTOFF_PASSED"));
@@ -134,18 +140,18 @@ test("bullish impulses stop after 13:00 and all executable signals stop after 14
     ...feature(-1),
     timestamp: afterBullishCutoff.timestamp,
   };
-  assert.equal(new SignalEngine(immediateSignalConfig).evaluate(
+  assert.equal(new SignalEngine(enforcedImmediateSignalConfig).evaluate(
     bearishFeature, { regime: "STRONG_DOWN", confidence: 1, reasons: [] },
   )?.direction, "BEARISH");
 
   const afterEntryCutoff = { ...feature(1), timestamp: zonedDateTimeToEpoch("2026-07-22", "14:30:01") };
-  const cutoff = new SignalEngine(immediateSignalConfig).evaluateDetailed(afterEntryCutoff, unclassified);
+  const cutoff = new SignalEngine(enforcedImmediateSignalConfig).evaluateDetailed(afterEntryCutoff, unclassified);
   assert.equal(cutoff.signal, undefined);
   assert.ok(cutoff.reasons.includes("ZERO_DTE_ENTRY_CUTOFF_PASSED"));
 });
 
 test("causal follow-through confirms only aligned movement observed 5-15 seconds later", () => {
-  const winnerEngine = new SignalEngine(defaultConfig);
+  const winnerEngine = new SignalEngine(enforcedSignalConfig);
   const first = feature(1);
   const regime: RegimeDecision = { regime: "STRONG_UP", confidence: 1, reasons: [] };
   const armed = winnerEngine.evaluateDetailed(first, regime);
@@ -158,7 +164,7 @@ test("causal follow-through confirms only aligned movement observed 5-15 seconds
   assert.equal(confirmed.signal?.timestamp, first.timestamp + 5_000);
   assert.ok(confirmed.signal?.reasons.some((reason) => reason.includes("causal follow-through confirmed")));
 
-  const loserEngine = new SignalEngine(defaultConfig);
+  const loserEngine = new SignalEngine(enforcedSignalConfig);
   assert.equal(loserEngine.evaluate(first, regime), undefined);
   assert.equal(loserEngine.evaluate(
     { ...first, timestamp: first.timestamp + 5_000, price: 500.99 }, regime,
@@ -170,12 +176,21 @@ test("causal follow-through confirms only aligned movement observed 5-15 seconds
   assert.deepEqual(failed.reasons, ["FOLLOW_THROUGH_FAILED"]);
 });
 
-test("default confirmation scope affects bullish impulses while the all-entry profile remains available for shadow research", () => {
+test("default execution is immediate while enforced A/B profiles confirm selected scopes", () => {
   const bearish = feature(-1);
   const down: RegimeDecision = { regime: "STRONG_DOWN", confidence: 1, reasons: [] };
   assert.equal(new SignalEngine(defaultConfig).evaluate(bearish, down)?.direction, "BEARISH");
+  const bullish = feature(1);
+  const up: RegimeDecision = { regime: "STRONG_UP", confidence: 1, reasons: [] };
+  assert.equal(new SignalEngine(defaultConfig).evaluate(bullish, up)?.direction, "BULLISH");
+
+  const bullishOnly = new SignalEngine(enforcedSignalConfig).evaluateDetailed(bullish, up);
+  assert.equal(bullishOnly.signal, undefined);
+  assert.deepEqual(bullishOnly.reasons, ["FOLLOW_THROUGH_PENDING"]);
+  assert.equal(new SignalEngine(enforcedSignalConfig).evaluate(bearish, down)?.direction, "BEARISH");
 
   const allEntryConfig = structuredClone(defaultConfig);
+  allEntryConfig.signals.entryQualityMode = "ENFORCE";
   allEntryConfig.signals.followThroughScope = "ALL";
   const shadow = new SignalEngine(allEntryConfig).evaluateDetailed(bearish, down);
   assert.equal(shadow.signal, undefined);

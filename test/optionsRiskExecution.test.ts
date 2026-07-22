@@ -25,6 +25,12 @@ test("configuration cannot enable later-dated or overnight option trading", () =
   const invalidScope = structuredClone(defaultConfig);
   invalidScope.signals.followThroughScope = "INVALID" as typeof invalidScope.signals.followThroughScope;
   assert.throws(() => validateConfig(invalidScope), /Follow-through scope/);
+  const invalidMode = structuredClone(defaultConfig);
+  invalidMode.signals.entryQualityMode = "INVALID" as typeof invalidMode.signals.entryQualityMode;
+  assert.throws(() => validateConfig(invalidMode), /Entry-quality mode/);
+  const invalidShadowCap = structuredClone(defaultConfig);
+  invalidShadowCap.risk.entryQualityMaxTradesPerDay = 0;
+  assert.throws(() => validateConfig(invalidShadowCap), /Daily entry caps/);
 });
 
 test("Black-Scholes values/Greeks and IV bisection are internally consistent", () => {
@@ -57,7 +63,9 @@ test("delta-adjusted cost implements spread/slippage/multiple mathematics", () =
 });
 
 test("risk sizing honors every cap and resets stop/target from actual fill", () => {
-  const manager = new RiskManager(defaultConfig);
+  const riskConfig = structuredClone(defaultConfig);
+  riskConfig.risk.maxTradesPerDay = 3;
+  const manager = new RiskManager(riskConfig);
   const timestamp = zonedDateTimeToEpoch("2026-07-22", "11:00:00");
   const decision = manager.evaluate({
     timestamp, optionMid: 2, hasOpenPosition: false,
@@ -68,7 +76,7 @@ test("risk sizing honors every cap and resets stop/target from actual fill", () 
   const filled = manager.createFilledPosition("SPY260722C00500000", "BULLISH", 5, 2.20, timestamp);
   assert.ok(Math.abs(filled.stopPrice - 1.65) < 1e-12);
   assert.ok(Math.abs(filled.targetPrice - 2.97) < 1e-12);
-  for (let i = 0; i < defaultConfig.risk.maxTradesPerDay - 1; i += 1) manager.recordEntry(timestamp);
+  for (let i = 0; i < riskConfig.risk.maxTradesPerDay - 1; i += 1) manager.recordEntry(timestamp);
   assert.equal(manager.evaluate({ timestamp, optionMid: 2, hasOpenPosition: false, account: {
     equity: 100_000, optionBuyingPower: 10_000, active: true, optionsApproved: true, killSwitch: false,
   } }).allowed, true);
@@ -76,6 +84,26 @@ test("risk sizing honors every cap and resets stop/target from actual fill", () 
   assert.equal(manager.evaluate({ timestamp, optionMid: 2, hasOpenPosition: false, account: {
     equity: 100_000, optionBuyingPower: 10_000, active: true, optionsApproved: true, killSwitch: false,
   } }).allowed, false);
+});
+
+test("six restored fills block the shadow profile without blocking active paper risk", () => {
+  const timestamp = zonedDateTimeToEpoch("2026-07-22", "11:00:00");
+  const restored = { marketDate: "2026-07-22", entries: 6, realizedPnl: 0 };
+  const request = {
+    timestamp, optionMid: 2, hasOpenPosition: false,
+    account: { equity: 100_000, optionBuyingPower: 10_000, active: true, optionsApproved: true, killSwitch: false },
+  };
+  const active = new RiskManager(defaultConfig);
+  active.restoreState(restored);
+  assert.equal(active.evaluate(request).allowed, true);
+
+  const enforcedConfig = structuredClone(defaultConfig);
+  enforcedConfig.signals.entryQualityMode = "ENFORCE";
+  const shadow = new RiskManager(enforcedConfig);
+  shadow.restoreState(restored);
+  const shadowDecision = shadow.evaluate(request);
+  assert.equal(shadowDecision.allowed, false);
+  assert.ok(shadowDecision.reasons.includes("MAX_DAILY_ENTRIES_REACHED"));
 });
 
 const exitContext = (position: PositionState, timestamp: number, mid: number) => ({
@@ -117,7 +145,9 @@ test("opposite regimes and 8-second trend invalidation exit", () => {
 });
 
 test("early scratch exits only when an unproductive position and its underlying both reverse", () => {
-  const manager = new ExitManager(defaultConfig);
+  const enforcedConfig = structuredClone(defaultConfig);
+  enforcedConfig.signals.entryQualityMode = "ENFORCE";
+  const manager = new ExitManager(enforcedConfig);
   const entry = zonedDateTimeToEpoch("2026-07-22", "11:00:00");
   const position: PositionState = {
     symbol: "OPT", direction: "BULLISH", quantity: 1, averageEntryPrice: 2,
@@ -130,6 +160,9 @@ test("early scratch exits only when an unproductive position and its underlying 
     medium: { normalizedSlope: 0.5 },
     vwap: { sessionVwap: 499 },
   } as unknown as FeatureSnapshot;
+  assert.equal(new ExitManager(defaultConfig).evaluate({
+    ...exitContext(position, entry + 5_000, 2), feature: reversed,
+  }).exit, false);
   assert.equal(manager.evaluate({ ...exitContext(position, entry + 4_000, 2), feature: reversed }).exit, false);
   assert.equal(manager.evaluate({ ...exitContext(position, entry + 5_000, 2), feature: reversed }).reason, "EARLY_SCRATCH");
 
