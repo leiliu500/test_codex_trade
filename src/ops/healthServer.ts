@@ -2,8 +2,26 @@ import { createServer, type Server } from "node:http";
 
 export interface HealthState {
   ready: boolean;
+  brokerRequired?: boolean;
+  marketDataFeed?: string;
+  optionDataFeed?: string;
   lastStockQuoteAgeMs?: number;
   lastStockTradeAgeMs?: number;
+  receivedStockQuotes?: number;
+  receivedStockTrades?: number;
+  receivedOptionQuotes?: number;
+  lastOptionQuoteAgeMs?: number;
+  completedBars?: number;
+  rejectedMarketEvents?: number;
+  lastFeatureTimestamp?: number;
+  reconnectAttempt?: number;
+  lastStreamError?: string;
+  optionWebsocketConnected?: boolean;
+  executionEnabled?: boolean;
+  executionMode?: "paper" | "live";
+  accountOptionsApproved?: boolean;
+  positionOpen?: boolean;
+  pendingOrder?: boolean;
   subscribedOptionContracts: number;
   openPositionOptionQuoteAgeMs?: number;
   websocketConnected: boolean;
@@ -17,7 +35,9 @@ export interface HealthState {
 
 export function healthReadiness(state: HealthState): { status: "ok" | "degraded" | "halted"; checks: HealthState } {
   if (state.killSwitch || !state.positionsReconciled || !state.recorderHealthy) return { status: "halted", checks: state };
-  if (!state.ready || !state.websocketConnected || !state.brokerAvailable) return { status: "degraded", checks: state };
+  if (!state.ready || !state.websocketConnected || (state.brokerRequired !== false && !state.brokerAvailable)) {
+    return { status: "degraded", checks: state };
+  }
   return { status: "ok", checks: state };
 }
 

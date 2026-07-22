@@ -22,6 +22,36 @@ npm run backtest -- /tmp/spy-demo.jsonl
 
 Configuration lives in [`config/default.json`](config/default.json). Calibration profiles must contain only sessions strictly before the replayed session.
 
+## Docker
+
+Build and start the paper-safe runtime with Docker Compose:
+
+```bash
+docker-compose up --build -d
+docker-compose ps
+curl http://127.0.0.1:8080/live
+curl http://127.0.0.1:8080/ready
+docker-compose logs -f spy-options-engine
+```
+
+Compose reads broker credentials from the local `.env` file at runtime and never copies that file into the image. It forces `TRADING_MODE=paper`, enables broker-backed paper orders, consumes SPY quotes/trades from SIP, and consumes executable option quotes from OPRA. `/live` reports process liveness. `/ready` returns 200 only after Alpaca acknowledges both WebSocket feeds, the paper account and options approval are verified, and open orders/positions reconcile safely. It exposes message counters and execution state without exposing credentials. The Alpaca account must have real-time SIP and OPRA entitlement. Set `ENABLE_LIVE_ORDERS=false` to receive SIP without submitting paper orders; set `MARKET_DATA_ENABLED=false` as well for paper-idle mode. Readiness remains degraded in either reduced mode.
+
+The image is multi-stage, runs as the unprivileged Node user, has a read-only root filesystem in Compose, and does not copy `.env`, credentials, replay data, tests, or development dependencies into the runtime image.
+
+Stop the service without removing application source or local data:
+
+```bash
+docker-compose down
+```
+
+To replay a mounted event file using the same production image:
+
+```bash
+docker build -t spy-options-engine:local .
+docker run --rm --read-only -v "$PWD/replay-output:/data:ro" \
+  spy-options-engine:local node dist/src/cli/backtest.js /data/events.jsonl conservative
+```
+
 ## What is implemented
 
 - Strict quote validation, rolling 99th-percentile/fixed size winsorization, duplicate and sequence checks.
@@ -62,7 +92,7 @@ npm run calibrate -- features.jsonl 2026-01-02 2026-03-31 data-v1 > calibration.
 
 ## Live integration boundary
 
-`src/alpaca/` includes authenticated Alpaca stock JSON streaming, option MsgPack streaming, paper/live REST selection, contract/snapshot pagination, whole-contract option orders, and broker reconciliation without embedding credentials or silently enabling real orders. A deployment wires these adapters through `SerializedDecisionQueue`, records every decision, and exposes `/live` and `/ready`. Unknown broker state must halt and reconcile. `src/main.ts` deliberately refuses implicit live startup even if environment flags are set.
+`src/alpaca/` includes authenticated Alpaca stock JSON streaming, option MsgPack streaming, paper/live REST selection, contract/snapshot pagination, whole-contract option orders, and broker reconciliation without embedding credentials or silently enabling real-money orders. The Docker runtime wires SPY SIP quotes/trades through the feature and signal engine, selects only same-day SPY options using OPRA quotes, and routes eligible entries and protective exits to Alpaca paper trading. Unknown broker state halts execution. `src/main.ts` still refuses real-money `TRADING_MODE=live`; enabling that mode requires a separate, explicit promotion.
 
 `LiveOrderManager` is the broker-backed execution boundary. Call `initialize()` before accepting signals, `submitEntry()` only with an eligible selector result and fresh option quote, and `tick()` on each option quote/timer to poll fills and enforce exits. Paper mode remains the default. The manager cannot guarantee profit; its purpose is deterministic execution, bounded risk, profit protection, and safe failure behavior.
 

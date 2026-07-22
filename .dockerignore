@@ -1,0 +1,14 @@
+.git
+.gitignore
+.env
+.env.*
+!.env.example
+node_modules
+dist
+coverage
+replay-output
+*.log
+Dockerfile*
+docker-compose*.yml
+README.md
+test

@@ -1,9 +1,10 @@
-import type { AccountState, OptionContract, OptionSnapshot, PositionState } from "../types.js";
+import type { AccountState, OptionContract, OptionSnapshot, PositionState, StockQuote } from "../types.js";
 import type { OrderSide } from "../execution/orderExecutor.js";
 import { parseOccSymbol } from "../options/occSymbol.js";
 import { assertSameDaySpyOptionOrder, sameDaySpyOptionContractReasons, sameDaySpyOptionSymbolReasons } from "../options/tradingInvariants.js";
 import { marketDate } from "../utils/time.js";
 import { defaultConfig } from "../config.js";
+import { adaptAlpacaStockQuote } from "./stockStream.js";
 
 export interface BrokerOrderRequest {
   clientOrderId: string;
@@ -96,6 +97,14 @@ export class AlpacaTradingRestClient implements TradingRestClient {
   async getMarketClock(): Promise<{ timestamp: number; isOpen: boolean }> {
     const raw = await this.#request<{ timestamp: string; is_open: boolean }>(this.#config.tradingBaseUrl, "/v2/clock");
     return { timestamp: Date.parse(raw.timestamp), isOpen: raw.is_open };
+  }
+
+  async getLatestSpySipQuote(): Promise<StockQuote> {
+    const raw = await this.#request<{ quote: Record<string, unknown>; symbol?: string }>(
+      this.#config.dataBaseUrl,
+      "/v2/stocks/SPY/quotes/latest?feed=sip",
+    );
+    return adaptAlpacaStockQuote({ ...raw.quote, S: raw.symbol ?? "SPY" });
   }
 
   async listOptionContracts(): Promise<OptionContract[]> {

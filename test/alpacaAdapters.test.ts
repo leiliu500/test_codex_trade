@@ -28,6 +28,9 @@ test("concrete Alpaca REST adapter uses paper-safe v2 option/order/account mappi
       trading_blocked: false, account_blocked: false,
     });
     if (url.endsWith("/v2/clock")) return json({ timestamp: "2026-07-22T14:30:00Z", is_open: true });
+    if (url.includes("/v2/stocks/SPY/quotes/latest?feed=sip")) return json({ symbol: "SPY", quote: {
+      t: "2026-07-22T14:30:00Z", bp: 500, ap: 500.01, bs: 100, as: 120, bx: "P", ax: "Q",
+    } });
     if (url.includes("/v2/options/contracts?")) return json({ option_contracts: [{
       symbol: "SPY260722C00500000", underlying_symbol: "SPY", expiration_date: "2026-07-22",
       strike_price: "500", type: "call", tradable: true, status: "active", open_interest: "1000",
@@ -65,6 +68,7 @@ test("concrete Alpaca REST adapter uses paper-safe v2 option/order/account mappi
     equity: 100000, optionBuyingPower: 25000, active: true, optionsApproved: true, killSwitch: false,
   });
   assert.equal((await client.getMarketClock()).isOpen, true);
+  assert.equal((await client.getLatestSpySipQuote()).symbol, "SPY");
   const contracts = await client.listOptionContracts();
   assert.equal(contracts[0]!.openInterest, 1000);
   const snapshots = await client.getOptionSnapshots([contracts[0]!.symbol]);
