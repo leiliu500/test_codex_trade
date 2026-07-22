@@ -23,6 +23,7 @@ interface PendingBrokerExecution {
   state: OrderState;
   direction: TradeSignal["direction"];
   signalId?: string;
+  underlyingEntryPrice?: number;
   exitReason?: ExitReason;
   cancelRequested?: boolean;
   lastPolledAt: number;
@@ -179,6 +180,7 @@ export class LiveOrderManager {
         state,
         direction: request.signal.direction,
         signalId: request.signal.id,
+        underlyingEntryPrice: request.signal.featureSnapshot.price,
         lastPolledAt: clock.timestamp,
       };
       await this.#synchronizeBrokerOrder(brokerOrder, clock.timestamp);
@@ -323,7 +325,9 @@ export class LiveOrderManager {
       this.#orders.recordFill(pending.state, timestamp, incrementalQuantity, incrementalPrice);
       if (pending.purpose === "ENTRY") {
         const firstFill = this.#position === undefined;
-        this.#position = reconcileEntryExposure(pending.state, pending.direction, timestamp, this.#risk, this.#position);
+        this.#position = reconcileEntryExposure(
+          pending.state, pending.direction, timestamp, this.#risk, this.#position, pending.underlyingEntryPrice,
+        );
         if (firstFill) this.#risk.recordEntry(timestamp);
         await this.#audit(timestamp, "entry_fill", {
           signalId: pending.signalId,

@@ -14,7 +14,9 @@ import { LiveOrderManager, type LiveExecutionSnapshot } from "../execution/liveO
 import { OptionBook } from "../options/optionBook.js";
 import { OptionSelector } from "../options/optionSelector.js";
 import { OptionUniverseManager } from "../options/optionUniverse.js";
-import { SignalEngine, type RestoredSignalState } from "../strategy/signalEngine.js";
+import {
+  SignalEngine, type RestoredSignalState, type SignalEvaluation,
+} from "../strategy/signalEngine.js";
 import { classifyRegime } from "../strategy/regimeClassifier.js";
 import { SpySipReceiver } from "./spySipReceiver.js";
 import { isAtOrAfter, marketDate, parseClock, secondsSinceMidnight, zonedDateTimeToEpoch } from "../utils/time.js";
@@ -77,8 +79,10 @@ export class SpyOptionsTradingRuntime {
   readonly #selector: OptionSelector;
   readonly #universe: OptionUniverseManager;
   readonly #signals: SignalEngine;
+  readonly #shadowSignals: SignalEngine | undefined;
   readonly #orders: LiveOrderManager;
   readonly #stockReceiver: SpySipReceiver;
+  readonly #restoredRuntimeState: RestoredRuntimeState;
   #contracts: OptionContract[] = [];
   #subscribedSymbols = new Set<string>();
   #optionConnected = false;
@@ -125,13 +129,20 @@ export class SpyOptionsTradingRuntime {
     this.#selector = new OptionSelector(options.config);
     this.#universe = new OptionUniverseManager(options.config);
     this.#signals = new SignalEngine(options.config);
+    if (options.config.signals.shadowFollowThroughScope !== "DISABLED") {
+      const shadowConfig = structuredClone(options.config);
+      shadowConfig.signals.followThroughScope = options.config.signals.shadowFollowThroughScope;
+      this.#shadowSignals = new SignalEngine(shadowConfig);
+    } else this.#shadowSignals = undefined;
     if (options.restoredFeatureCheckpoint) {
       this.#lastFeature = options.restoredFeatureCheckpoint;
       this.#lastSpot = options.restoredFeatureCheckpoint.price;
       this.#lastRegime = classifyRegime(options.restoredFeatureCheckpoint, options.config.regimes);
     }
-    const restored = restoredRuntimeState(options.restoredAuditEvents ?? [], this.#now(), options.config.timeZone);
+    const restored = restoreRuntimeState(options.restoredAuditEvents ?? [], this.#now(), options.config.timeZone);
+    this.#restoredRuntimeState = restored;
     this.#signals.restoreState(restored.signal);
+    this.#shadowSignals?.restoreState(restored.signal);
     this.#recorder = options.recorder ?? new MemoryRecorder();
     this.#history = options.history;
     this.#orders = new LiveOrderManager({
@@ -171,6 +182,15 @@ export class SpyOptionsTradingRuntime {
       await this.#stockReceiver.startBuffered();
       await this.#restoreStrategyState(Math.max(clock.timestamp, this.#now()));
       this.#execution = await this.#orders.initialize(clock.timestamp);
+      await this.#auditRuntime(clock.timestamp, "daily_risk_state_recovery", {
+        marketDate: this.#restoredRuntimeState.risk.marketDate,
+        restoredEntries: this.#restoredRuntimeState.risk.entries,
+        restoredRealizedPnl: this.#restoredRuntimeState.risk.realizedPnl,
+        maxTradesPerDay: this.#config.risk.maxTradesPerDay,
+        maxDailyLossDollars: this.#config.risk.maxDailyLossDollars,
+        entryCapReached: this.#restoredRuntimeState.risk.entries >= this.#config.risk.maxTradesPerDay,
+        knownClientOrderIds: this.#restoredRuntimeState.knownClientOrderIds.size,
+      });
       this.#synchronizeHistoryPriorities();
       this.#positionsReconciled = true;
       this.#brokerAvailable = true;
@@ -239,6 +259,11 @@ export class SpyOptionsTradingRuntime {
         this.#updateStrategyState(feature);
         await this.#refreshUniverse(feature.price, this.#now());
         await this.#tickExecution(this.#now());
+        const shadowEvaluation = this.#shadowSignals?.evaluateDetailed(feature, this.#lastRegime);
+        const shadowAudit = shadowEvaluation ? {
+          scope: this.#config.signals.shadowFollowThroughScope,
+          ...signalEvaluationSummary(shadowEvaluation),
+        } : null;
         const runtimeBlocks: string[] = [];
         if (!this.#executionEnabled) runtimeBlocks.push("EXECUTION_DISABLED");
         if (this.#killSwitch) runtimeBlocks.push("KILL_SWITCH");
@@ -255,6 +280,7 @@ export class SpyOptionsTradingRuntime {
             regimeConfidence: this.#lastRegime.confidence,
             regimeReasons: this.#lastRegime.reasons,
             directions: [],
+            shadowEvaluation: shadowAudit,
             feature: entryFeatureSummary(feature),
           });
           return;
@@ -270,6 +296,7 @@ export class SpyOptionsTradingRuntime {
           regimeConfidence: this.#lastRegime.confidence,
           regimeReasons: this.#lastRegime.reasons,
           directions: evaluation.directions,
+          shadowEvaluation: shadowAudit,
           ...(signal ? {
             signalId: signal.id,
             direction: signal.direction,
@@ -611,6 +638,7 @@ export class SpyOptionsTradingRuntime {
       this.#universe.retainOpenPosition(symbol, this.#now());
       this.#retainedPositionSymbol = symbol;
       this.#signals.recordEntry(this.#execution.position!.direction, this.#execution.position!.entryTimestamp);
+      this.#shadowSignals?.recordEntry(this.#execution.position!.direction, this.#execution.position!.entryTimestamp);
     } else if (!symbol && this.#retainedPositionSymbol) {
       this.#universe.releaseClosedPosition(this.#retainedPositionSymbol);
       this.#retainedPositionSymbol = undefined;
@@ -671,13 +699,29 @@ function entryFeatureSummary(feature: FeatureSnapshot): Record<string, unknown> 
   };
 }
 
-interface RestoredRuntimeState {
+function signalEvaluationSummary(evaluation: SignalEvaluation): Record<string, unknown> {
+  const signal = evaluation.signal;
+  return {
+    decision: signal ? "SIGNAL" : "NO_SIGNAL",
+    reasons: evaluation.reasons,
+    directions: evaluation.directions,
+    ...(signal ? {
+      signalId: signal.id,
+      direction: signal.direction,
+      kind: signal.kind,
+      regime: signal.regime,
+      projectedMoveBps: signal.projectedMoveBps,
+    } : {}),
+  };
+}
+
+export interface RestoredRuntimeState {
   signal: RestoredSignalState;
   risk: DailyRiskState;
   knownClientOrderIds: Set<string>;
 }
 
-function restoredRuntimeState(
+export function restoreRuntimeState(
   events: readonly AuditEvent[], timestamp: number, timeZone: string,
 ): RestoredRuntimeState {
   const date = marketDate(timestamp, timeZone);

@@ -50,6 +50,10 @@ function feature(direction: 1 | -1 = 1): FeatureSnapshot {
   };
 }
 
+const immediateSignalConfig = structuredClone(defaultConfig);
+immediateSignalConfig.signals.followThroughMinSec = 0;
+immediateSignalConfig.signals.followThroughMaxSec = 0;
+
 test("regime ordering distinguishes whipsaw, reversal, strong and grind", () => {
   const strong = feature();
   assert.equal(classifyRegime(strong, defaultConfig.regimes).regime, "STRONG_UP");
@@ -85,7 +89,7 @@ test("clean bullish/bearish opening-range impulses mirror direction", () => {
   for (const direction of [1, -1] as const) {
     const f = feature(direction);
     const regime = classifyRegime(f, defaultConfig.regimes);
-    const signal = new SignalEngine(defaultConfig).evaluate(f, regime);
+    const signal = new SignalEngine(immediateSignalConfig).evaluate(f, regime);
     assert.equal(signal?.kind, "IMPULSE");
     assert.equal(signal?.direction, direction > 0 ? "BULLISH" : "BEARISH");
     assert.equal(signal?.votes.filter((vote) => vote.passed).length, 4);
@@ -100,19 +104,82 @@ test("late bullish impulses require an established up regime without blocking be
     vwap: { ...feature(1).vwap, rollingVwapSlopeBpsPerSec: -0.01 },
   };
   const unclassified: RegimeDecision = { regime: "UNCLASSIFIED", confidence: 0, reasons: [] };
-  const blocked = new SignalEngine(defaultConfig).evaluateDetailed(lateBullish, unclassified);
+  const blocked = new SignalEngine(immediateSignalConfig).evaluateDetailed(lateBullish, unclassified);
   assert.equal(blocked.signal, undefined);
   assert.ok(blocked.directions.find((item) => item.direction === "BULLISH")?.reasons
     .includes("LATE_BULLISH_IMPULSE_REQUIRES_UP_REGIME"));
 
   const confirmed: RegimeDecision = { regime: "STRONG_UP", confidence: 1, reasons: [] };
-  assert.equal(new SignalEngine(defaultConfig).evaluate(lateBullish, confirmed)?.kind, "IMPULSE");
+  assert.equal(new SignalEngine(immediateSignalConfig).evaluate(lateBullish, confirmed)?.kind, "IMPULSE");
 
   const lateBearish = {
     ...feature(-1),
     timestamp: zonedDateTimeToEpoch("2026-07-22", "12:49:00"),
   };
-  assert.equal(new SignalEngine(defaultConfig).evaluate(lateBearish, unclassified)?.direction, "BEARISH");
+  assert.equal(new SignalEngine(immediateSignalConfig).evaluate(lateBearish, unclassified)?.direction, "BEARISH");
+});
+
+test("bullish impulses stop after 13:00 and all executable signals stop after 14:30 ET", () => {
+  const unclassified: RegimeDecision = { regime: "STRONG_UP", confidence: 1, reasons: [] };
+  const afterBullishCutoff = {
+    ...feature(1),
+    timestamp: zonedDateTimeToEpoch("2026-07-22", "13:00:01"),
+  };
+  const bullish = new SignalEngine(immediateSignalConfig).evaluateDetailed(afterBullishCutoff, unclassified);
+  assert.equal(bullish.signal, undefined);
+  assert.ok(bullish.directions.find((item) => item.direction === "BULLISH")?.reasons
+    .includes("BULLISH_IMPULSE_CUTOFF_PASSED"));
+
+  const bearishFeature = {
+    ...feature(-1),
+    timestamp: afterBullishCutoff.timestamp,
+  };
+  assert.equal(new SignalEngine(immediateSignalConfig).evaluate(
+    bearishFeature, { regime: "STRONG_DOWN", confidence: 1, reasons: [] },
+  )?.direction, "BEARISH");
+
+  const afterEntryCutoff = { ...feature(1), timestamp: zonedDateTimeToEpoch("2026-07-22", "14:30:01") };
+  const cutoff = new SignalEngine(immediateSignalConfig).evaluateDetailed(afterEntryCutoff, unclassified);
+  assert.equal(cutoff.signal, undefined);
+  assert.ok(cutoff.reasons.includes("ZERO_DTE_ENTRY_CUTOFF_PASSED"));
+});
+
+test("causal follow-through confirms only aligned movement observed 5-15 seconds later", () => {
+  const winnerEngine = new SignalEngine(defaultConfig);
+  const first = feature(1);
+  const regime: RegimeDecision = { regime: "STRONG_UP", confidence: 1, reasons: [] };
+  const armed = winnerEngine.evaluateDetailed(first, regime);
+  assert.equal(armed.signal, undefined);
+  assert.deepEqual(armed.reasons, ["FOLLOW_THROUGH_PENDING"]);
+  assert.equal(winnerEngine.evaluate({ ...first, timestamp: first.timestamp + 4_000, price: 501.01 }, regime), undefined);
+  const confirmed = winnerEngine.evaluateDetailed(
+    { ...first, timestamp: first.timestamp + 5_000, price: 501.02 }, regime,
+  );
+  assert.equal(confirmed.signal?.timestamp, first.timestamp + 5_000);
+  assert.ok(confirmed.signal?.reasons.some((reason) => reason.includes("causal follow-through confirmed")));
+
+  const loserEngine = new SignalEngine(defaultConfig);
+  assert.equal(loserEngine.evaluate(first, regime), undefined);
+  assert.equal(loserEngine.evaluate(
+    { ...first, timestamp: first.timestamp + 5_000, price: 500.99 }, regime,
+  ), undefined);
+  const failed = loserEngine.evaluateDetailed(
+    { ...first, timestamp: first.timestamp + 15_000, price: 500.98 }, regime,
+  );
+  assert.equal(failed.signal, undefined);
+  assert.deepEqual(failed.reasons, ["FOLLOW_THROUGH_FAILED"]);
+});
+
+test("default confirmation scope affects bullish impulses while the all-entry profile remains available for shadow research", () => {
+  const bearish = feature(-1);
+  const down: RegimeDecision = { regime: "STRONG_DOWN", confidence: 1, reasons: [] };
+  assert.equal(new SignalEngine(defaultConfig).evaluate(bearish, down)?.direction, "BEARISH");
+
+  const allEntryConfig = structuredClone(defaultConfig);
+  allEntryConfig.signals.followThroughScope = "ALL";
+  const shadow = new SignalEngine(allEntryConfig).evaluateDetailed(bearish, down);
+  assert.equal(shadow.signal, undefined);
+  assert.deepEqual(shadow.reasons, ["FOLLOW_THROUGH_PENDING"]);
 });
 
 test("steady grind passes with acceleration near zero, but excessive adverse acceleration blocks", () => {
@@ -127,19 +194,19 @@ test("steady grind passes with acceleration near zero, but excessive adverse acc
     ofi5: 0,
   };
   const regime = classifyRegime(grindFeature, defaultConfig.regimes);
-  assert.equal(new SignalEngine(defaultConfig).evaluate(grindFeature, regime)?.kind, "GRIND");
+  assert.equal(new SignalEngine(immediateSignalConfig).evaluate(grindFeature, regime)?.kind, "GRIND");
   const adverse = { ...grindFeature, fast: { ...grindFeature.fast, normalizedAcceleration: -0.46 } };
-  assert.equal(new SignalEngine(defaultConfig).evaluate(adverse, regime), undefined);
+  assert.equal(new SignalEngine(immediateSignalConfig).evaluate(adverse, regime), undefined);
 });
 
 test("global gates block stale data, whipsaw, time violations, and cooldown only after entry", () => {
   const base = feature();
-  const engine = new SignalEngine(defaultConfig);
+  const engine = new SignalEngine(immediateSignalConfig);
   assert.equal(engine.evaluate({ ...base, dataValid: false }, classifyRegime(base, defaultConfig.regimes)), undefined);
   assert.equal(engine.evaluate(base, { regime: "HIGH_VOL_WHIPSAW", confidence: 1, reasons: [] }), undefined);
   const outside = { ...base, timestamp: zonedDateTimeToEpoch("2026-07-22", "15:31:00") };
-  assert.equal(new SignalEngine(defaultConfig).evaluate(outside, classifyRegime(outside, defaultConfig.regimes)), undefined);
-  const first = new SignalEngine(defaultConfig);
+  assert.equal(new SignalEngine(immediateSignalConfig).evaluate(outside, classifyRegime(outside, defaultConfig.regimes)), undefined);
+  const first = new SignalEngine(immediateSignalConfig);
   assert.ok(first.evaluate(base, classifyRegime(base, defaultConfig.regimes)));
   // A candidate alone does not start the 600-second entry cooldown; a new engine timestamp after signal interval can emit.
   const later = { ...base, timestamp: base.timestamp + 6_000 };
@@ -158,7 +225,7 @@ test("opening range cannot become complete from a late-started partial session",
 
 test("restored entry and signal timestamps preserve restart cooldowns", () => {
   const base = feature();
-  const engine = new SignalEngine(defaultConfig);
+  const engine = new SignalEngine(immediateSignalConfig);
   engine.restoreState({
     lastSignalTimestamp: base.timestamp - 1_000,
     lastEntries: { BULLISH: base.timestamp - 1_000 },
@@ -208,7 +275,7 @@ test("feature checkpoint restores exact opening range while trade-only history r
 
 test("detailed signal evaluation reports global and directional block decisions", () => {
   const base = feature();
-  const invalid = new SignalEngine(defaultConfig).evaluateDetailed(
+  const invalid = new SignalEngine(immediateSignalConfig).evaluateDetailed(
     { ...base, dataValid: false, invalidReasons: ["STALE_QUOTE"] },
     classifyRegime(base, defaultConfig.regimes),
   );
@@ -220,7 +287,7 @@ test("detailed signal evaluation reports global and directional block decisions"
     ...base,
     medium: { ...base.medium, normalizedSlope: -0.2 },
   };
-  const directional = new SignalEngine(defaultConfig).evaluateDetailed(
+  const directional = new SignalEngine(immediateSignalConfig).evaluateDetailed(
     mixed,
     classifyRegime(mixed, defaultConfig.regimes),
   );
@@ -231,7 +298,7 @@ test("detailed signal evaluation reports global and directional block decisions"
 
 test("option selector rejects wide cost and ranks an eligible liquid contract", () => {
   const f = feature();
-  const signal = new SignalEngine(defaultConfig).evaluate(f, classifyRegime(f, defaultConfig.regimes))!;
+  const signal = new SignalEngine(immediateSignalConfig).evaluate(f, classifyRegime(f, defaultConfig.regimes))!;
   const expirationDate = "2026-07-22";
   const good: OptionContract = { symbol: "SPY260722C00501000", underlying: "SPY", expirationDate, strike: 501, type: "call", active: true, tradable: true };
   const bad: OptionContract = { ...good, symbol: "SPY260722C00502000", strike: 502 };
@@ -250,7 +317,7 @@ test("option selector rejects wide cost and ranks an eligible liquid contract", 
 
 test("option selection uses an explicit causal decision timestamp", () => {
   const f = feature();
-  const signal = new SignalEngine(defaultConfig).evaluate(f, classifyRegime(f, defaultConfig.regimes))!;
+  const signal = new SignalEngine(immediateSignalConfig).evaluate(f, classifyRegime(f, defaultConfig.regimes))!;
   const contract: OptionContract = {
     symbol: "SPY260722C00501000", underlying: "SPY", expirationDate: "2026-07-22",
     strike: 501, type: "call", active: true, tradable: true,

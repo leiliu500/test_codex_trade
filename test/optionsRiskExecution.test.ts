@@ -18,6 +18,13 @@ test("configuration cannot enable later-dated or overnight option trading", () =
   const afterClose = structuredClone(defaultConfig);
   afterClose.session.forceExit = "16:00:00";
   assert.throws(() => validateConfig(afterClose), /forceExit < 16:00/);
+  const invalidConfirmation = structuredClone(defaultConfig);
+  invalidConfirmation.signals.followThroughMinSec = 16;
+  invalidConfirmation.signals.followThroughMaxSec = 15;
+  assert.throws(() => validateConfig(invalidConfirmation), /Follow-through confirmation/);
+  const invalidScope = structuredClone(defaultConfig);
+  invalidScope.signals.followThroughScope = "INVALID" as typeof invalidScope.signals.followThroughScope;
+  assert.throws(() => validateConfig(invalidScope), /Follow-through scope/);
 });
 
 test("Black-Scholes values/Greeks and IV bisection are internally consistent", () => {
@@ -107,6 +114,31 @@ test("opposite regimes and 8-second trend invalidation exit", () => {
   assert.equal(first.exit, false);
   const later = manager.evaluate({ ...exitContext(first.updatedPosition, entry + 9000, 2), feature });
   assert.equal(later.reason, "TREND_INVALIDATION");
+});
+
+test("early scratch exits only when an unproductive position and its underlying both reverse", () => {
+  const manager = new ExitManager(defaultConfig);
+  const entry = zonedDateTimeToEpoch("2026-07-22", "11:00:00");
+  const position: PositionState = {
+    symbol: "OPT", direction: "BULLISH", quantity: 1, averageEntryPrice: 2,
+    entryTimestamp: entry, stopPrice: 1.5, targetPrice: 2.7,
+    highWaterMark: 2, lowWaterMark: 2, underlyingEntryPrice: 500,
+  };
+  const reversed = {
+    price: 499.99,
+    fast: { normalizedSlope: -0.5 },
+    medium: { normalizedSlope: 0.5 },
+    vwap: { sessionVwap: 499 },
+  } as unknown as FeatureSnapshot;
+  assert.equal(manager.evaluate({ ...exitContext(position, entry + 4_000, 2), feature: reversed }).exit, false);
+  assert.equal(manager.evaluate({ ...exitContext(position, entry + 5_000, 2), feature: reversed }).reason, "EARLY_SCRATCH");
+
+  const hadFavorableMovement = { ...position, highWaterMark: 2.03 };
+  assert.equal(manager.evaluate({
+    ...exitContext(hadFavorableMovement, entry + 5_000, 2), feature: reversed,
+  }).exit, false);
+  const stillAligned = { ...reversed, fast: { normalizedSlope: 0.5 } } as unknown as FeatureSnapshot;
+  assert.equal(manager.evaluate({ ...exitContext(position, entry + 5_000, 2), feature: stillAligned }).exit, false);
 });
 
 test("order state machine handles rounding, partial fill, replacement and cancel", () => {

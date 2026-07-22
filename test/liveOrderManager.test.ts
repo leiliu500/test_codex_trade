@@ -92,7 +92,7 @@ function signal(timestamp = start): TradeSignal {
   return {
     id: `sig-${timestamp}`, timestamp, direction: "BULLISH", kind: "IMPULSE", regime: "STRONG_UP",
     projectedMoveBps: 12, votes: [], reasons: [],
-    featureSnapshot: { symbol: "SPY", timestamp } as FeatureSnapshot,
+    featureSnapshot: { symbol: "SPY", timestamp, price: 500 } as FeatureSnapshot,
   };
 }
 
@@ -124,6 +124,7 @@ test("live manager submits an option entry, reconciles partial fill, cancels rem
   let state = await manager.tick({ timestamp: start + 500, optionQuote: optionQuote(start + 500) });
   assert.equal(state.position?.quantity, 2);
   assert.equal(state.position?.averageEntryPrice, 2.02);
+  assert.equal(state.position?.underlyingEntryPrice, 500);
   assert.ok(Math.abs(state.position!.stopPrice - 1.515) < 1e-12);
   assert.equal(state.pending?.purpose, "ENTRY");
 

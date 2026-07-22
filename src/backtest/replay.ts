@@ -249,7 +249,7 @@ export class ReplayEngine {
       quantity: this.#position.quantity,
       timestamp,
       quote,
-      marketable: reason === "FORCED_SESSION_EXIT" || reason === "KILL_SWITCH",
+      marketable: reason === "FORCED_SESSION_EXIT" || reason === "KILL_SWITCH" || reason === "EARLY_SCRATCH",
     });
     state = this.#orders.submit(state, timestamp);
     this.#pending = { purpose: "EXIT", state, reason };
@@ -301,6 +301,7 @@ export class ReplayEngine {
     if (pending.purpose === "ENTRY") {
       this.#position = this.#risk.createFilledPosition(
         pending.state.symbol, pending.signal.direction, pending.state.filledQuantity, pending.state.averageFillPrice, timestamp,
+        pending.signal.featureSnapshot.price,
       );
       this.#positionSignal = pending.signal;
       this.#positionCandidate = pending.candidate;

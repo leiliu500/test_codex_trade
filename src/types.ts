@@ -253,6 +253,7 @@ export interface PositionState {
   targetPrice: number;
   highWaterMark: number;
   lowWaterMark: number;
+  underlyingEntryPrice?: number;
   invalidSince?: number;
 }
 
@@ -265,6 +266,7 @@ export type ExitReason =
   | "TRAILING_STOP"
   | "MAX_HOLD"
   | "OPPOSITE_REGIME"
+  | "EARLY_SCRATCH"
   | "TREND_INVALIDATION";
 
 export interface ExitDecision {

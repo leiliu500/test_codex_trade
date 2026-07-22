@@ -1,4 +1,4 @@
-import { defaultConfig } from "../config.js";
+import { defaultConfig, type EngineConfig } from "../config.js";
 import { SecondAggregator } from "../features/secondAggregator.js";
 import { FeatureEngine } from "../features/featureEngine.js";
 import { classifyRegime } from "../strategy/regimeClassifier.js";
@@ -118,6 +118,20 @@ async function main(): Promise<void> {
     votesPassed: signal.votes.filter((vote) => vote.passed).map((vote) => vote.name),
     price: signal.featureSnapshot.price,
   }));
+  const baselineConfig = structuredClone(defaultConfig);
+  baselineConfig.signals.followThroughMinSec = 0;
+  baselineConfig.signals.followThroughMaxSec = 0;
+  baselineConfig.signals.bullishImpulseCutoff = baselineConfig.session.entryEnd;
+  baselineConfig.options.zeroDteEntryCutoff = baselineConfig.session.entryEnd;
+  const baselineSignals = evaluateSignals(bars, priorClose, baselineConfig);
+  const impulseConfirmationConfig = structuredClone(defaultConfig);
+  impulseConfirmationConfig.signals.followThroughScope = "IMPULSE";
+  const impulseConfirmationSignals = evaluateSignals(bars, priorClose, impulseConfirmationConfig);
+  const allEntryConfirmationConfig = structuredClone(defaultConfig);
+  allEntryConfirmationConfig.signals.followThroughScope = "ALL";
+  const allEntryConfirmationSignals = evaluateSignals(bars, priorClose, allEntryConfirmationConfig);
+  const baselineSummary = summarizeSignals(baselineSignals, bars);
+  const guardedSummary = summarizeSignals(signals, bars);
   process.stdout.write(`${JSON.stringify({
     date, symbol: "SPY", feed, priorClose,
     sourceEvents: { quotes: quoteCount, trades: tradeCount, rejectedQuotes, rejectedTrades },
@@ -129,6 +143,17 @@ async function main(): Promise<void> {
     regimeSeconds: regimes,
     invalidFeatureReasons: invalidReasons,
     signalDetails,
+    guardComparison: {
+      baseline: baselineSummary,
+      guarded: guardedSummary,
+      profiles: {
+        immediateEntry: baselineSummary,
+        bullishImpulseConfirmation: guardedSummary,
+        impulseConfirmation: summarizeSignals(impulseConfirmationSignals, bars),
+        allEntryConfirmation: summarizeSignals(allEntryConfirmationSignals, bars),
+      },
+      suppressedOrDelayedSignals: Math.max(0, baselineSignals.length - signals.length),
+    },
     optionBacktest: {
       performed: false,
       reason: "Alpaca historical options data does not provide timestamped bid/ask quotes required by the spread and cost gate.",
@@ -136,6 +161,66 @@ async function main(): Promise<void> {
       pnl: null,
     },
   }, null, 2)}\n`);
+}
+
+function evaluateSignals(
+  bars: readonly SecondBar[], priorClose: number, config: EngineConfig,
+): TradeSignal[] {
+  const features = new FeatureEngine(config);
+  features.setPriorClose(priorClose);
+  const signalEngine = new SignalEngine(config);
+  const signals: TradeSignal[] = [];
+  for (const bar of bars) {
+    const feature = features.onBar(bar);
+    if (!feature) continue;
+    const signal = signalEngine.evaluate(feature, classifyRegime(feature, config.regimes));
+    if (signal) signals.push(signal);
+  }
+  return signals;
+}
+
+function summarizeSignals(signals: readonly TradeSignal[], bars: readonly SecondBar[]): Record<string, unknown> {
+  const prices = new Map<number, number>();
+  for (const bar of bars) {
+    const price = bar.microprice ?? bar.mid ?? bar.tradeVwap;
+    if (price !== undefined && Number.isFinite(price)) prices.set(bar.timestamp, price);
+  }
+  const byKind: Record<string, number> = {};
+  const byDirection: Record<string, number> = {};
+  let bullishImpulseAfter1300 = 0;
+  let after1430 = 0;
+  for (const signal of signals) {
+    byKind[signal.kind] = (byKind[signal.kind] ?? 0) + 1;
+    byDirection[signal.direction] = (byDirection[signal.direction] ?? 0) + 1;
+    const time = zonedParts(signal.timestamp, defaultConfig.timeZone);
+    const seconds = time.hour * 3600 + time.minute * 60 + time.second;
+    if (signal.direction === "BULLISH" && signal.kind === "IMPULSE" && seconds > 13 * 3600) bullishImpulseAfter1300 += 1;
+    if (seconds > 14 * 3600 + 30 * 60) after1430 += 1;
+  }
+  const forwardDirectionalBps: Record<string, unknown> = {};
+  for (const horizonSec of [5, 15, 30, 60]) {
+    const values = signals.flatMap((signal) => {
+      const future = prices.get(signal.timestamp + horizonSec * 1000);
+      if (future === undefined) return [];
+      const sign = signal.direction === "BULLISH" ? 1 : -1;
+      return [sign * (future / signal.featureSnapshot.price - 1) * 10_000];
+    });
+    const sorted = [...values].sort((a, b) => a - b);
+    forwardDirectionalBps[String(horizonSec)] = {
+      observations: values.length,
+      average: values.length > 0 ? values.reduce((sum, value) => sum + value, 0) / values.length : null,
+      median: values.length > 0 ? sorted[Math.floor(sorted.length / 2)] : null,
+      alignedRate: values.length > 0 ? values.filter((value) => value >= 0).length / values.length : null,
+    };
+  }
+  return {
+    signals: signals.length,
+    byKind,
+    byDirection,
+    bullishImpulseAfter1300,
+    after1430,
+    forwardDirectionalBps,
+  };
 }
 
 async function fetchPages<T>(
