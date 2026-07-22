@@ -8,7 +8,7 @@ The package includes quote sanitization, one-second median aggregation, robust e
 
 This is research software, not investment advice. It defaults to paper mode. Live submission must be supplied by a broker adapter and explicitly enabled; this repository does not silently place real orders.
 
-The option-only/day-only constraints are enforced at the contract-universe, selector, order-state, filled-position, and broker REST boundaries. New entries stop at the configured 0DTE cutoff (14:30 ET by default), all broker orders use `time_in_force=day`, and open positions receive a mandatory marketable-limit exit at 15:50 ET—before same-day expiration. A stock symbol, non-SPY option, or later-dated SPY option is rejected before submission.
+The option-only/day-only constraints are enforced at the contract-universe, selector, order-state, filled-position, and broker REST boundaries. New entries stop at the configured 0DTE cutoff (14:30 ET by default), bullish impulse entries stop after 13:00 ET, and bullish impulse candidates require causal directional follow-through observed 5–15 seconds later. The broader all-entry confirmation profile is evaluated only as nested shadow audit data and cannot reach option selection or order submission. The default daily entry cap is six and is restored from durable fills across restarts. Unproductive new positions can scratch during their first 30 seconds only when the option has not moved favorably and SPY has reversed. All broker orders use `time_in_force=day`, and open positions receive a mandatory marketable-limit exit at 15:50 ET—before same-day expiration. A stock symbol, non-SPY option, or later-dated SPY option is rejected before submission.
 
 ## Run
 
@@ -18,9 +18,10 @@ npm test
 npm run typecheck
 npm run demo -- /tmp/spy-demo.jsonl
 npm run backtest -- /tmp/spy-demo.jsonl
+npm run test:historical -- 2026-07-21 iex
 ```
 
-Configuration lives in [`config/default.json`](config/default.json). Calibration profiles must contain only sessions strictly before the replayed session.
+Configuration lives in [`config/default.json`](config/default.json). Calibration profiles must contain only sessions strictly before the replayed session. The historical signal test reports a `guardComparison` block that evaluates immediate entry, bullish-impulse confirmation, all-impulse confirmation, and all-entry confirmation on the same downloaded tape; its forward returns are research labels and never enter the causal signal decision.
 
 ## Docker
 
@@ -91,9 +92,9 @@ docker run --rm --read-only -v "$PWD/replay-output:/data:ro" \
 - Completed-second median quote aggregation, raw Level-I OFI, trade VWAP/volume, qualified empty-second forward fills, and stale ages.
 - Causal endpoint quadratic regression on log microprice with exponential half-life weights, Huber IRLS, weighted R², MAD, slope uncertainty, and 10/30/120-second normalized state. The separately versioned constant-acceleration Kalman filter is included for A/B research.
 - Realized movement, efficiency, sign changes, EWMA pressure, session/rolling/anchored VWAP, opening range, gap, breakout/retest memory, five-minute historical calibration, and strict anti-leakage fallback behavior.
-- Ordered regime classification plus symmetric impulse/grind decisions, capped physical projection, entry-time/cooldown gates, and complete signal vote audit data.
+- Ordered regime classification plus symmetric impulse/grind decisions, capped physical projection, scoped causal 5–15 second follow-through with an all-entry shadow profile, the 13:00 bullish-impulse/14:30 global cutoffs, entry cooldown gates, and complete signal vote audit data.
 - Independent option quote/snapshot storage, strict same-day SPY OCC validation, bounded 0DTE subscription universe, Black–Scholes Greeks and IV bisection, liquidity filters, delta-adjusted cost gate, gamma diagnostic, and the specified candidate score.
-- Account/risk/premium/buying-power sizing caps, fill-price stop/target reset, daily ET limits, partial-fill exposure reconciliation, priority exits, trailing/high-water logic, and trend grace periods.
+- Account/risk/premium/buying-power sizing caps, restart-continuous daily ET limits, fill-price stop/target reset, partial-fill exposure reconciliation, early scratch protection, priority exits, trailing/high-water logic, and trend grace periods.
 - Tick-aware limit pricing, replacement/cancel timers, deterministic IDs/state, optimistic midpoint-touch, conservative, and queue replay models, plus restart reconciliation interfaces.
 - Broker-backed serialized order management with deterministic submission recovery, cumulative partial-fill reconciliation, actual-fill stop/target resets, passive-to-aggressive entry replacement, hard-stop/trailing/kill-switch exits, and persistent marketable 15:50 liquidation.
 - Arrival-order JSONL replay through the live modules, full audit events, signal funnel/rejections, trade/execution/prediction statistics, walk-forward folds, purge/embargo, and session bootstrap helpers.

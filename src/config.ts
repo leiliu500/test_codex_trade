@@ -1,6 +1,8 @@
 import defaultConfigJson from "../config/default.json" with { type: "json" };
 import { parseClock } from "./utils/time.js";
 
+export type FollowThroughScope = "BULLISH_IMPULSE" | "IMPULSE" | "ALL";
+
 export interface EngineConfig {
   version: string;
   symbol: "SPY";
@@ -54,6 +56,12 @@ export interface EngineConfig {
     minimumSignalIntervalSec: number;
     lateBullishImpulseStart: string;
     lateBullishImpulseRequiresUpRegime: boolean;
+    bullishImpulseCutoff: string;
+    followThroughMinSec: number;
+    followThroughMaxSec: number;
+    followThroughMinimumBps: number;
+    followThroughScope: FollowThroughScope;
+    shadowFollowThroughScope: FollowThroughScope | "DISABLED";
     blockWhipsaw: boolean;
   };
   regimes: {
@@ -111,6 +119,10 @@ export interface EngineConfig {
     trailingProfitFloorPct: number;
     maxHoldSec: number;
     trendInvalidationGraceSec: number;
+    earlyScratchMinAgeSec: number;
+    earlyScratchMaxAgeSec: number;
+    earlyScratchMinimumFavorablePct: number;
+    earlyScratchUnderlyingReversalBps: number;
     staleDataEmergencySec: number;
     onePositionAtATime: boolean;
   };
@@ -165,6 +177,7 @@ export function validateConfig(config: EngineConfig): void {
   }
   const entryStart = parseClock(config.session.entryStart);
   const lateBullishImpulseStart = parseClock(config.signals.lateBullishImpulseStart);
+  const bullishImpulseCutoff = parseClock(config.signals.bullishImpulseCutoff);
   const zeroDteCutoff = parseClock(config.options.zeroDteEntryCutoff);
   const entryEnd = parseClock(config.session.entryEnd);
   const forceExit = parseClock(config.session.forceExit);
@@ -173,5 +186,24 @@ export function validateConfig(config: EngineConfig): void {
   }
   if (!(entryStart <= lateBullishImpulseStart && lateBullishImpulseStart <= entryEnd)) {
     throw new Error("Late bullish impulse confirmation must begin inside the entry window");
+  }
+  if (!(lateBullishImpulseStart <= bullishImpulseCutoff && bullishImpulseCutoff <= zeroDteCutoff)) {
+    throw new Error("Bullish impulse cutoff must follow late confirmation and precede the 0DTE cutoff");
+  }
+  if (!(config.signals.followThroughMinSec >= 0 &&
+        config.signals.followThroughMaxSec >= config.signals.followThroughMinSec &&
+        config.signals.followThroughMinimumBps >= 0)) {
+    throw new Error("Follow-through confirmation requires 0 <= minSec <= maxSec and non-negative bps");
+  }
+  const scopes = new Set<FollowThroughScope>(["BULLISH_IMPULSE", "IMPULSE", "ALL"]);
+  if (!scopes.has(config.signals.followThroughScope) ||
+      (config.signals.shadowFollowThroughScope !== "DISABLED" && !scopes.has(config.signals.shadowFollowThroughScope))) {
+    throw new Error("Follow-through scope must be BULLISH_IMPULSE, IMPULSE, ALL, or DISABLED for shadow evaluation");
+  }
+  if (!(config.risk.earlyScratchMinAgeSec >= 0 &&
+        config.risk.earlyScratchMaxAgeSec >= config.risk.earlyScratchMinAgeSec &&
+        config.risk.earlyScratchMinimumFavorablePct >= 0 &&
+        config.risk.earlyScratchUnderlyingReversalBps >= 0)) {
+    throw new Error("Early scratch thresholds must be non-negative and use minAgeSec <= maxAgeSec");
   }
 }

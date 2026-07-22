@@ -71,6 +71,7 @@ export class RiskManager {
 
   createFilledPosition(
     symbol: string, direction: Direction, quantity: number, averageFillPrice: number, timestamp: number,
+    underlyingEntryPrice?: number,
   ): PositionState {
     const invariantReasons = sameDaySpyOptionSymbolReasons(symbol, timestamp, this.#config.timeZone);
     if (invariantReasons.length > 0) {
@@ -86,6 +87,7 @@ export class RiskManager {
       targetPrice: averageFillPrice * (1 + this.#config.risk.optionProfitTargetPct),
       highWaterMark: averageFillPrice,
       lowWaterMark: averageFillPrice,
+      ...(underlyingEntryPrice !== undefined ? { underlyingEntryPrice } : {}),
     };
   }
 

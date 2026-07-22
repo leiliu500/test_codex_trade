@@ -165,11 +165,12 @@ export function reconcileEntryExposure(
   timestamp: number,
   riskManager: RiskManager,
   existing?: PositionState,
+  underlyingEntryPrice?: number,
 ): PositionState | undefined {
   if (state.filledQuantity < 1) return existing;
   if (existing && existing.symbol !== state.symbol) throw new Error("Partial fill conflicts with authoritative position");
   return riskManager.createFilledPosition(
     state.symbol, direction, state.filledQuantity, state.averageFillPrice,
-    existing?.entryTimestamp ?? timestamp,
+    existing?.entryTimestamp ?? timestamp, existing?.underlyingEntryPrice ?? underlyingEntryPrice,
   );
 }

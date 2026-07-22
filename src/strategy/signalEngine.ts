@@ -24,10 +24,18 @@ export interface RestoredSignalState {
   lastEntries?: Partial<Record<Direction, number>>;
 }
 
+interface PendingFollowThrough {
+  direction: Direction;
+  kind: TradeSignal["kind"];
+  armedAt: number;
+  entryReferencePrice: number;
+}
+
 export class SignalEngine {
   readonly #config: EngineConfig;
   #lastSignalTimestamp = -Infinity;
   readonly #lastEntries: Partial<Record<Direction, number>> = {};
+  #pendingFollowThrough: PendingFollowThrough | undefined;
 
   constructor(config: EngineConfig) { this.#config = config; }
 
@@ -57,11 +65,17 @@ export class SignalEngine {
     if (!inSessionWindow(feature.timestamp, this.#config.session.entryStart, this.#config.session.entryEnd, this.#config.timeZone)) {
       globalReasons.push("OUTSIDE_ENTRY_WINDOW");
     }
+    if (secondsSinceMidnight(feature.timestamp, this.#config.timeZone) > parseClock(this.#config.options.zeroDteEntryCutoff)) {
+      globalReasons.push("ZERO_DTE_ENTRY_CUTOFF_PASSED");
+    }
     if (this.#config.signals.blockWhipsaw && regime.regime === "HIGH_VOL_WHIPSAW") globalReasons.push("WHIPSAW_REGIME_BLOCKED");
     if (feature.timestamp - this.#lastSignalTimestamp < this.#config.signals.minimumSignalIntervalSec * 1000) {
       globalReasons.push("MINIMUM_SIGNAL_INTERVAL");
     }
-    if (globalReasons.length > 0) return { passed: false, reasons: globalReasons, directions: [] };
+    if (globalReasons.length > 0) {
+      this.#pendingFollowThrough = undefined;
+      return { passed: false, reasons: globalReasons, directions: [] };
+    }
 
     const directions = (["BULLISH", "BEARISH"] as const).map((direction) => {
       const reasons: string[] = [];
@@ -77,9 +91,12 @@ export class SignalEngine {
     });
     const candidates = directions.flatMap((direction) => direction.signal ? [direction.signal] : []);
     if (candidates.length === 0) {
+      const pendingExpired = this.#pendingFollowThrough !== undefined &&
+        feature.timestamp - this.#pendingFollowThrough.armedAt >= this.#config.signals.followThroughMaxSec * 1000;
+      if (pendingExpired) this.#pendingFollowThrough = undefined;
       return {
         passed: false,
-        reasons: ["NO_DIRECTION_PASSED"],
+        reasons: [pendingExpired ? "FOLLOW_THROUGH_EXPIRED" : "NO_DIRECTION_PASSED"],
         directions: directions.map(({ signal: _signal, ...direction }) => direction),
       };
     }
@@ -88,13 +105,69 @@ export class SignalEngine {
       return b.projectedMoveBps - a.projectedMoveBps;
     });
     const selected = candidates[0]!;
+    const directionEvaluations = directions.map(({ signal: _signal, ...direction }) => direction);
+    if (this.#config.signals.followThroughMinSec > 0 && this.#requiresFollowThrough(selected)) {
+      const confirmation = this.#confirmFollowThrough(selected, feature);
+      if (!confirmation.confirmed) {
+        return { passed: false, reasons: confirmation.reasons, directions: directionEvaluations };
+      }
+      selected.reasons.push(
+        `causal follow-through confirmed after ${confirmation.elapsedSec.toFixed(1)}s at ${confirmation.moveBps.toFixed(3)} bps`,
+      );
+    } else {
+      this.#pendingFollowThrough = undefined;
+    }
     this.#lastSignalTimestamp = feature.timestamp;
     return {
       passed: true,
       signal: selected,
       reasons: selected.reasons,
-      directions: directions.map(({ signal: _signal, ...direction }) => direction),
+      directions: directionEvaluations,
     };
+  }
+
+  #confirmFollowThrough(
+    selected: TradeSignal, feature: FeatureSnapshot,
+  ): { confirmed: true; elapsedSec: number; moveBps: number } | { confirmed: false; reasons: string[] } {
+    const pending = this.#pendingFollowThrough;
+    if (!pending || pending.direction !== selected.direction || pending.kind !== selected.kind) {
+      this.#pendingFollowThrough = {
+        direction: selected.direction,
+        kind: selected.kind,
+        armedAt: feature.timestamp,
+        entryReferencePrice: feature.price,
+      };
+      return { confirmed: false, reasons: [pending ? "FOLLOW_THROUGH_DIRECTION_CHANGED" : "FOLLOW_THROUGH_PENDING"] };
+    }
+    const elapsedMs = feature.timestamp - pending.armedAt;
+    const elapsedSec = elapsedMs / 1000;
+    if (elapsedMs < this.#config.signals.followThroughMinSec * 1000) {
+      return { confirmed: false, reasons: ["FOLLOW_THROUGH_PENDING"] };
+    }
+    const sign = selected.direction === "BULLISH" ? 1 : -1;
+    const moveBps = sign * (feature.price / pending.entryReferencePrice - 1) * 10_000;
+    if (elapsedMs <= this.#config.signals.followThroughMaxSec * 1000 &&
+        moveBps >= this.#config.signals.followThroughMinimumBps) {
+      this.#pendingFollowThrough = undefined;
+      return { confirmed: true, elapsedSec, moveBps };
+    }
+    if (elapsedMs < this.#config.signals.followThroughMaxSec * 1000) {
+      return { confirmed: false, reasons: ["FOLLOW_THROUGH_NOT_CONFIRMED"] };
+    }
+    this.#pendingFollowThrough = {
+      direction: selected.direction,
+      kind: selected.kind,
+      armedAt: feature.timestamp,
+      entryReferencePrice: feature.price,
+    };
+    return { confirmed: false, reasons: ["FOLLOW_THROUGH_FAILED"] };
+  }
+
+  #requiresFollowThrough(signal: TradeSignal): boolean {
+    const scope = this.#config.signals.followThroughScope;
+    if (scope === "ALL") return true;
+    if (scope === "IMPULSE") return signal.kind === "IMPULSE";
+    return signal.direction === "BULLISH" && signal.kind === "IMPULSE";
   }
 
   #evaluateDirection(
@@ -164,6 +237,12 @@ export class SignalEngine {
       regime.regime !== "STRONG_UP" && regime.regime !== "GRIND_UP";
     if (impulsePassed && lateBullishImpulseNeedsConfirmation) {
       blockedReasons.push("LATE_BULLISH_IMPULSE_REQUIRES_UP_REGIME");
+      return undefined;
+    }
+    const bullishImpulseCutoffPassed = direction === "BULLISH" &&
+      secondsSinceMidnight(f.timestamp, this.#config.timeZone) > parseClock(this.#config.signals.bullishImpulseCutoff);
+    if (impulsePassed && bullishImpulseCutoffPassed) {
+      blockedReasons.push("BULLISH_IMPULSE_CUTOFF_PASSED");
       return undefined;
     }
     if (impulsePassed) {

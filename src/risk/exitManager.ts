@@ -42,6 +42,20 @@ export class ExitManager {
       );
       if (mark! <= trailingStop) return finish("TRAILING_STOP");
     }
+
+    const ageSec = (context.timestamp - position.entryTimestamp) / 1000;
+    if (context.feature && position.underlyingEntryPrice !== undefined &&
+        ageSec >= this.#config.risk.earlyScratchMinAgeSec &&
+        ageSec <= this.#config.risk.earlyScratchMaxAgeSec) {
+      const sign = position.direction === "BULLISH" ? 1 : -1;
+      const favorableMoveReached = position.highWaterMark >=
+        position.averageEntryPrice * (1 + this.#config.risk.earlyScratchMinimumFavorablePct);
+      const underlyingMoveBps = sign *
+        (context.feature.price / position.underlyingEntryPrice - 1) * 10_000;
+      const underlyingReversed = underlyingMoveBps <= -this.#config.risk.earlyScratchUnderlyingReversalBps &&
+        sign * context.feature.fast.normalizedSlope < 0;
+      if (!favorableMoveReached && underlyingReversed) return finish("EARLY_SCRATCH");
+    }
     if (context.timestamp - position.entryTimestamp >= this.#config.risk.maxHoldSec * 1000) return finish("MAX_HOLD");
     if (context.regime && isOppositeRegime(position.direction, context.regime.regime)) return finish("OPPOSITE_REGIME");
 

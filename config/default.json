@@ -1,5 +1,5 @@
 {
-  "version": "spy-0dte-day-only-2",
+  "version": "spy-0dte-entry-quality-3",
   "symbol": "SPY",
   "timeZone": "America/New_York",
   "session": {
@@ -51,6 +51,12 @@
     "minimumSignalIntervalSec": 5,
     "lateBullishImpulseStart": "12:45:00",
     "lateBullishImpulseRequiresUpRegime": true,
+    "bullishImpulseCutoff": "13:00:00",
+    "followThroughMinSec": 5,
+    "followThroughMaxSec": 15,
+    "followThroughMinimumBps": 0,
+    "followThroughScope": "BULLISH_IMPULSE",
+    "shadowFollowThroughScope": "ALL",
     "blockWhipsaw": true
   },
   "regimes": {
@@ -99,7 +105,7 @@
     "maxRiskDollarsPerTrade": 500,
     "maxPremiumDollarsPerTrade": 1500,
     "maxContracts": 10,
-    "maxTradesPerDay": 1000,
+    "maxTradesPerDay": 6,
     "maxDailyLossDollars": 1000,
     "hardOptionStopPct": 0.25,
     "optionProfitTargetPct": 0.35,
@@ -108,6 +114,10 @@
     "trailingProfitFloorPct": 0.02,
     "maxHoldSec": 1200,
     "trendInvalidationGraceSec": 8,
+    "earlyScratchMinAgeSec": 5,
+    "earlyScratchMaxAgeSec": 30,
+    "earlyScratchMinimumFavorablePct": 0.01,
+    "earlyScratchUnderlyingReversalBps": 0.1,
     "staleDataEmergencySec": 10,
     "onePositionAtATime": true
   }
