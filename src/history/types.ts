@@ -19,6 +19,7 @@ export interface HistoricalMarketEvent {
 
 export interface MarketHistorySink {
   recordMarketEvent(event: HistoricalMarketEvent): void;
+  setPrioritySymbols?(symbols: ReadonlySet<string>): void;
   healthy(): boolean;
 }
 
@@ -30,6 +31,10 @@ export class CompositeMarketHistorySink implements MarketHistorySink {
 
   recordMarketEvent(event: HistoricalMarketEvent): void {
     for (const sink of this.#sinks) sink.recordMarketEvent(event);
+  }
+
+  setPrioritySymbols(symbols: ReadonlySet<string>): void {
+    for (const sink of this.#sinks) sink.setPrioritySymbols?.(symbols);
   }
 
   healthy(): boolean { return this.#sinks.every((sink) => sink.healthy()); }

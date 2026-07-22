@@ -32,6 +32,8 @@ services:
       STOCK_DATA_FEED: sip
       OPTION_DATA_FEED: opra
       HISTORY_DATABASE_ENABLED: "true"
+      MARKET_HISTORY_QUOTE_SAMPLE_MS: ${MARKET_HISTORY_QUOTE_SAMPLE_MS:-250}
+      MARKET_HISTORY_RETENTION_DAYS: ${MARKET_HISTORY_RETENTION_DAYS:-7}
       DATABASE_URL: "postgresql://spy_options:${POSTGRES_PASSWORD:-spy_options_local}@postgres:5432/spy_options"
       KILL_SWITCH: ${KILL_SWITCH:-false}
       HEALTH_HOST: 0.0.0.0

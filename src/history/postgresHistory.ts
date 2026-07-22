@@ -13,6 +13,9 @@ export interface PostgresHistoryStoreOptions {
   batchSize?: number;
   flushIntervalMs?: number;
   maxQueuedEvents?: number;
+  quoteSampleIntervalMs?: number;
+  retentionDays?: number;
+  retentionCleanupIntervalMs?: number;
   onError?: (error: unknown) => void;
 }
 
@@ -45,6 +48,9 @@ CREATE INDEX IF NOT EXISTS market_events_date_type_id_idx
   ON market_events (market_date, event_type, id);
 CREATE INDEX IF NOT EXISTS market_events_symbol_provider_idx
   ON market_events (symbol, provider_timestamp);
+CREATE INDEX IF NOT EXISTS market_events_quote_retention_idx
+  ON market_events (market_date, id)
+  WHERE event_type IN ('stock_quote', 'option_quote');
 
 CREATE TABLE IF NOT EXISTS audit_events (
   id BIGSERIAL PRIMARY KEY,
@@ -128,9 +134,17 @@ export class PostgresHistoryStore implements HistoryStore, AuditRecorder {
   readonly #batchSize: number;
   readonly #flushIntervalMs: number;
   readonly #maxQueuedEvents: number;
+  readonly #quoteSampleIntervalMs: number;
+  readonly #retentionDays: number;
+  readonly #retentionCleanupIntervalMs: number;
   readonly #onError: ((error: unknown) => void) | undefined;
+  readonly #lastPersistedQuoteTimestamp = new Map<string, number>();
+  #prioritySymbols = new Set<string>();
   #queue: HistoricalMarketEvent[] = [];
   #flushTimer: ReturnType<typeof setInterval> | undefined;
+  #retentionTimer: ReturnType<typeof setInterval> | undefined;
+  #retentionRunning = false;
+  #retentionTail: Promise<void> = Promise.resolve();
   #flushTail: Promise<void> = Promise.resolve();
   #marketHealthy = false;
   #auditHealthy = false;
@@ -142,6 +156,9 @@ export class PostgresHistoryStore implements HistoryStore, AuditRecorder {
     this.#batchSize = options.batchSize ?? 500;
     this.#flushIntervalMs = options.flushIntervalMs ?? 250;
     this.#maxQueuedEvents = options.maxQueuedEvents ?? 250_000;
+    this.#quoteSampleIntervalMs = options.quoteSampleIntervalMs ?? 250;
+    this.#retentionDays = options.retentionDays ?? 7;
+    this.#retentionCleanupIntervalMs = options.retentionCleanupIntervalMs ?? 60_000;
     this.#onError = options.onError;
   }
 
@@ -152,10 +169,17 @@ export class PostgresHistoryStore implements HistoryStore, AuditRecorder {
     this.#flushTimer = setInterval(() => {
       void this.flush().catch((error: unknown) => this.#recordError(error, "market"));
     }, this.#flushIntervalMs);
+    if (this.#retentionDays > 0) {
+      await this.#runRetentionCleanup();
+      this.#retentionTimer = setInterval(() => {
+        void this.#runRetentionCleanup().catch((error: unknown) => this.#recordError(error, "market"));
+      }, this.#retentionCleanupIntervalMs);
+    }
   }
 
   recordMarketEvent(event: HistoricalMarketEvent): void {
     if (this.#closed) throw new Error("Cannot record market history after the database store is closed");
+    if (!this.#shouldPersistMarketEvent(event)) return;
     if (this.#queue.length >= this.#maxQueuedEvents) {
       const error = new Error(`Market history queue exceeded ${this.#maxQueuedEvents} events`);
       this.#recordError(error, "market");
@@ -165,6 +189,10 @@ export class PostgresHistoryStore implements HistoryStore, AuditRecorder {
     if (this.#queue.length >= this.#batchSize) {
       void this.flush().catch((error: unknown) => this.#recordError(error, "market"));
     }
+  }
+
+  setPrioritySymbols(symbols: ReadonlySet<string>): void {
+    this.#prioritySymbols = new Set(symbols);
   }
 
   async record(event: AuditEvent): Promise<void> {
@@ -303,7 +331,10 @@ export class PostgresHistoryStore implements HistoryStore, AuditRecorder {
   async close(): Promise<void> {
     if (this.#closed) return;
     if (this.#flushTimer) clearInterval(this.#flushTimer);
+    if (this.#retentionTimer) clearInterval(this.#retentionTimer);
     this.#flushTimer = undefined;
+    this.#retentionTimer = undefined;
+    await this.#retentionTail;
     while (this.#queue.length > 0) await this.flush();
     await this.#flushTail;
     this.#closed = true;
@@ -341,6 +372,46 @@ export class PostgresHistoryStore implements HistoryStore, AuditRecorder {
       this.#recordError(error, "market");
       throw error;
     }
+  }
+
+  #shouldPersistMarketEvent(event: HistoricalMarketEvent): boolean {
+    if (event.type !== "stock_quote" && event.type !== "option_quote") return true;
+    const key = `${event.type}:${event.symbol}`;
+    const previous = this.#lastPersistedQuoteTimestamp.get(key);
+    if (this.#quoteSampleIntervalMs === 0 || this.#prioritySymbols.has(event.symbol) || previous === undefined ||
+        event.providerTimestamp - previous >= this.#quoteSampleIntervalMs) {
+      this.#lastPersistedQuoteTimestamp.set(key, Math.max(previous ?? -Infinity, event.providerTimestamp));
+      return true;
+    }
+    return false;
+  }
+
+  async #cleanupExpiredQuotes(): Promise<void> {
+    await this.#client.query(
+      `WITH latest AS (
+         SELECT max(market_date) AS market_date FROM market_events
+       ), expired AS (
+         SELECT id FROM market_events, latest
+         WHERE latest.market_date IS NOT NULL
+           AND market_events.market_date < latest.market_date - $1::integer
+           AND event_type IN ('stock_quote', 'option_quote')
+         ORDER BY id ASC
+         LIMIT 100000
+       )
+       DELETE FROM market_events USING expired
+       WHERE market_events.id = expired.id`,
+      [this.#retentionDays],
+    );
+  }
+
+  #runRetentionCleanup(): Promise<void> {
+    if (this.#retentionRunning) return this.#retentionTail;
+    this.#retentionRunning = true;
+    const cleanup = this.#cleanupExpiredQuotes();
+    this.#retentionTail = cleanup
+      .catch(() => undefined)
+      .finally(() => { this.#retentionRunning = false; });
+    return cleanup;
   }
 
   #recordError(error: unknown, channel: "market" | "audit"): void {

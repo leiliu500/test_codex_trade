@@ -12,6 +12,7 @@ import type {
 } from "../src/types.js";
 import { zonedDateTimeToEpoch } from "../src/utils/time.js";
 import type { HistoricalMarketEvent, MarketHistorySink } from "../src/history/types.js";
+import { MemoryRecorder } from "../src/ops/recorder.js";
 
 const date = "2026-07-22";
 const now = zonedDateTimeToEpoch(date, "10:20:00");
@@ -41,7 +42,9 @@ class FakeOptionStream implements OptionStream {
 
 class FakeHistory implements MarketHistorySink {
   readonly events: HistoricalMarketEvent[] = [];
+  readonly priorityChanges: string[][] = [];
   recordMarketEvent(event: HistoricalMarketEvent): void { this.events.push(event); }
+  setPrioritySymbols(symbols: ReadonlySet<string>): void { this.priorityChanges.push([...symbols]); }
   healthy(): boolean { return true; }
 }
 
@@ -124,9 +127,10 @@ test("end-to-end paper runtime arms SIP/OPRA and routes an eligible signal to a 
   const stockStream = new FakeStockStream();
   const optionStream = new FakeOptionStream();
   const history = new FakeHistory();
+  const recorder = new MemoryRecorder();
   const runtime = new SpyOptionsTradingRuntime({
     config: defaultConfig, client, stockStream, optionStream, executionEnabled: true,
-    executionMode: "paper", now: () => now, executionTickMs: 60_000, history,
+    executionMode: "paper", now: () => now, executionTickMs: 60_000, history, recorder,
   });
   await runtime.start();
   assert.equal(runtime.healthState().ready, true);
@@ -144,10 +148,16 @@ test("end-to-end paper runtime arms SIP/OPRA and routes an eligible signal to a 
   assert.equal(client.requests[0]?.timeInForce, "day");
   assert.notEqual(client.requests[0]?.symbol, "SPY");
   assert.equal(runtime.healthState().pendingOrder, true);
+  assert.deepEqual(history.priorityChanges.at(-1), [callSymbol]);
   assert.ok(history.events.some((event) => event.type === "option_contract" && event.symbol === callSymbol));
   assert.ok(history.events.some((event) => event.type === "option_snapshot" && event.symbol === callSymbol));
   assert.equal(history.events.find((event) => event.type === "option_snapshot")?.marketDate, date);
   assert.ok(history.events.some((event) => event.type === "option_quote" && event.symbol === callSymbol));
   assert.ok(history.events.some((event) => event.type === "feature_snapshot" && event.symbol === "SPY"));
+  const evaluation = recorder.events.find((event) => event.type === "live_entry_evaluation");
+  assert.equal(evaluation?.data.decision, "SIGNAL");
+  assert.equal(evaluation?.data.direction, "BULLISH");
+  assert.ok(Array.isArray(evaluation?.data.directions));
   await runtime.close();
+  assert.deepEqual(history.priorityChanges.at(-1), []);
 });

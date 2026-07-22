@@ -24,9 +24,16 @@ if (environment.tradingMode === "live") {
 const logger = new JsonLogger([
   environment.alpacaApiKey ?? "", environment.alpacaApiSecret ?? "", environment.databaseUrl ?? "",
 ]);
-const dashboard = new TradingDashboardStore();
+const dashboard = new TradingDashboardStore(
+  Date.now(),
+  environment.historyDatabaseEnabled,
+  environment.historyQuoteSampleMs,
+  environment.historyRetentionDays,
+);
 const history = environment.historyDatabaseEnabled ? new PostgresHistoryStore({
   connectionString: environment.databaseUrl!,
+  quoteSampleIntervalMs: environment.historyQuoteSampleMs,
+  retentionDays: environment.historyRetentionDays,
   onError: (error) => logger.log("error", "postgres_history_error", {
     error: error instanceof Error ? error.message : String(error),
   }),

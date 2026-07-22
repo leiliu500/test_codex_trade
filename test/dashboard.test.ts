@@ -11,8 +11,26 @@ function event(type: string, data: Record<string, unknown>, offset = 0): AuditEv
   return { timestamp: timestamp + offset, marketDate: "2026-07-22", type, configVersion: "test", data };
 }
 
+test("dashboard exposes liveness and feed tabs before any entries, orders, or history", () => {
+  const dashboard = new TradingDashboardStore(Date.now() - 2_000, true, 250, 7);
+  const snapshot = dashboard.snapshot();
+  assert.equal(snapshot.activeOrders.length, 0);
+  assert.equal(snapshot.decisions.length, 0);
+  assert.equal(snapshot.liveData.persistenceEnabled, true);
+  assert.equal(snapshot.liveData.quoteSampleIntervalMs, 250);
+  assert.equal(snapshot.liveData.retentionDays, 7);
+  assert.equal(snapshot.liveData.totalEvents, 0);
+  assert.deepEqual(snapshot.liveData.recentEvents, []);
+  assert.ok(snapshot.liveData.uptimeMs >= 2_000);
+  const html = tradingDashboardHtml();
+  assert.match(html, /Engine heartbeat/);
+  assert.match(html, /data-tab="liveDataTab"/);
+  assert.match(html, /Live Feed Into System/);
+  assert.match(html, /Entry Evaluations &amp; Decisions/);
+});
+
 test("dashboard reconstructs fired entries, broker execution, trades, and performance from audit history", () => {
-  const dashboard = new TradingDashboardStore(timestamp);
+  const dashboard = new TradingDashboardStore(timestamp, true);
   dashboard.record(event("live_signal_selection", {
     signalId: "signal-1", timestamp, direction: "BULLISH", kind: "IMPULSE", regime: "STRONG_UP",
     projectedMoveBps: 8.5, candidate: symbol,
@@ -44,6 +62,14 @@ test("dashboard reconstructs fired entries, broker execution, trades, and perfor
     marketDate: "2026-07-22", symbol,
     data: { symbol, timestamp: timestamp + 45, bidPrice: 2.4, askPrice: 2.42, bidSize: 50, askSize: 40 },
   } satisfies HistoricalMarketEvent);
+  dashboard.record(event("live_entry_evaluation", {
+    timestamp, decision: "NO_SIGNAL", reasons: ["NO_DIRECTION_PASSED"], regime: "CHOP_DOJI",
+    feature: { price: 501 },
+    directions: [{
+      direction: "BULLISH", passed: false, reasons: ["MEDIUM_SLOPE_MISALIGNED"],
+      votes: [{ name: "FAST_SLOPE", passed: false, value: 0.1, threshold: 0.42 }],
+    }],
+  }, 50));
 
   const openSnapshot = dashboard.snapshot();
   assert.equal(openSnapshot.activeOrders.length, 1);
@@ -55,6 +81,13 @@ test("dashboard reconstructs fired entries, broker execution, trades, and perfor
   assert.equal(openSnapshot.activeOrders[0]?.targetPrice, 2.7);
   assert.ok(Math.abs(openSnapshot.performance.unrealizedPnl - 80) < 1e-9);
   assert.ok(Math.abs(openSnapshot.performance.totalPnl - 80) < 1e-9);
+  assert.equal(openSnapshot.liveData.totalEvents, 1);
+  assert.equal(openSnapshot.liveData.eventCounts.option_quote, 1);
+  assert.equal(openSnapshot.liveData.recentEvents[0]?.channel, "OPRA");
+  assert.match(openSnapshot.liveData.recentEvents[0]?.summary ?? "", /bid 2\.40/);
+  assert.equal(openSnapshot.decisions[0]?.stage, "ENTRY_EVALUATION");
+  assert.equal(openSnapshot.decisions[0]?.outcome, "NO_SIGNAL");
+  assert.equal(openSnapshot.decisions[0]?.directions?.[0]?.reasons[0], "MEDIUM_SLOPE_MISALIGNED");
 
   dashboard.record(event("broker_order_request", {
     purpose: "EXIT", reason: "PROFIT_TARGET",
