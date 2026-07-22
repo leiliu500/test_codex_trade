@@ -44,7 +44,8 @@ export class ExitManager {
     }
 
     const ageSec = (context.timestamp - position.entryTimestamp) / 1000;
-    if (context.feature && position.underlyingEntryPrice !== undefined &&
+    if (this.#config.signals.entryQualityMode === "ENFORCE" &&
+        context.feature && position.underlyingEntryPrice !== undefined &&
         ageSec >= this.#config.risk.earlyScratchMinAgeSec &&
         ageSec <= this.#config.risk.earlyScratchMaxAgeSec) {
       const sign = position.direction === "BULLISH" ? 1 : -1;

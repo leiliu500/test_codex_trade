@@ -118,20 +118,21 @@ async function main(): Promise<void> {
     votesPassed: signal.votes.filter((vote) => vote.passed).map((vote) => vote.name),
     price: signal.featureSnapshot.price,
   }));
-  const baselineConfig = structuredClone(defaultConfig);
-  baselineConfig.signals.followThroughMinSec = 0;
-  baselineConfig.signals.followThroughMaxSec = 0;
-  baselineConfig.signals.bullishImpulseCutoff = baselineConfig.session.entryEnd;
-  baselineConfig.options.zeroDteEntryCutoff = baselineConfig.session.entryEnd;
-  const baselineSignals = evaluateSignals(bars, priorClose, baselineConfig);
+  const baselineSignals = signals;
+  const bullishImpulseConfirmationConfig = structuredClone(defaultConfig);
+  bullishImpulseConfirmationConfig.signals.entryQualityMode = "ENFORCE";
+  bullishImpulseConfirmationConfig.signals.followThroughScope = "BULLISH_IMPULSE";
+  const bullishImpulseConfirmationSignals = evaluateSignals(bars, priorClose, bullishImpulseConfirmationConfig);
   const impulseConfirmationConfig = structuredClone(defaultConfig);
+  impulseConfirmationConfig.signals.entryQualityMode = "ENFORCE";
   impulseConfirmationConfig.signals.followThroughScope = "IMPULSE";
   const impulseConfirmationSignals = evaluateSignals(bars, priorClose, impulseConfirmationConfig);
   const allEntryConfirmationConfig = structuredClone(defaultConfig);
+  allEntryConfirmationConfig.signals.entryQualityMode = "ENFORCE";
   allEntryConfirmationConfig.signals.followThroughScope = "ALL";
   const allEntryConfirmationSignals = evaluateSignals(bars, priorClose, allEntryConfirmationConfig);
   const baselineSummary = summarizeSignals(baselineSignals, bars);
-  const guardedSummary = summarizeSignals(signals, bars);
+  const guardedSummary = summarizeSignals(bullishImpulseConfirmationSignals, bars);
   process.stdout.write(`${JSON.stringify({
     date, symbol: "SPY", feed, priorClose,
     sourceEvents: { quotes: quoteCount, trades: tradeCount, rejectedQuotes, rejectedTrades },
@@ -152,7 +153,7 @@ async function main(): Promise<void> {
         impulseConfirmation: summarizeSignals(impulseConfirmationSignals, bars),
         allEntryConfirmation: summarizeSignals(allEntryConfirmationSignals, bars),
       },
-      suppressedOrDelayedSignals: Math.max(0, baselineSignals.length - signals.length),
+      suppressedOrDelayedSignals: Math.max(0, baselineSignals.length - bullishImpulseConfirmationSignals.length),
     },
     optionBacktest: {
       performed: false,

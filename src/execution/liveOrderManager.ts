@@ -88,13 +88,16 @@ export class LiveOrderManager {
   readonly #recorder: AuditRecorder;
   readonly #orders: OrderExecutor;
   readonly #risk: RiskManager;
+  readonly #shadowRisk: RiskManager;
   readonly #exits: ExitManager;
+  readonly #shadowExits: ExitManager;
   readonly #knownClientOrderIds: Set<string>;
   #position: PositionState | undefined;
   #pending: PendingBrokerExecution | undefined;
   readonly #lastOptionQuotes = new Map<string, OptionQuote>();
   #halted = false;
   #haltReason: string | undefined;
+  #shadowScratchAuditedEntryTimestamp: number | undefined;
   #tail: Promise<void> = Promise.resolve();
 
   constructor(options: LiveOrderManagerOptions) {
@@ -103,8 +106,15 @@ export class LiveOrderManager {
     this.#recorder = options.recorder ?? new MemoryRecorder();
     this.#orders = new OrderExecutor(options.config);
     this.#risk = new RiskManager(options.config);
-    if (options.restoredRiskState) this.#risk.restoreState(options.restoredRiskState);
     this.#exits = new ExitManager(options.config);
+    const shadowConfig = structuredClone(options.config);
+    shadowConfig.signals.entryQualityMode = "ENFORCE";
+    this.#shadowRisk = new RiskManager(shadowConfig);
+    this.#shadowExits = new ExitManager(shadowConfig);
+    if (options.restoredRiskState) {
+      this.#risk.restoreState(options.restoredRiskState);
+      this.#shadowRisk.restoreState(options.restoredRiskState);
+    }
     this.#position = options.restoredPosition ? { ...options.restoredPosition } : undefined;
     this.#knownClientOrderIds = new Set(options.knownClientOrderIds ?? []);
   }
@@ -150,13 +160,19 @@ export class LiveOrderManager {
       const account = await this.#client.getAccount();
       const guardedAccount: AccountState = { ...account, killSwitch: account.killSwitch || request.killSwitch === true };
       const optionMid = (request.quote.bidPrice + request.quote.askPrice) / 2;
-      const risk = this.#risk.evaluate({
+      const riskRequest = {
         timestamp: clock.timestamp,
         optionMid,
         account: guardedAccount,
         hasOpenPosition: this.#position !== undefined,
+      };
+      const risk = this.#risk.evaluate(riskRequest);
+      const shadowRisk = this.#shadowRisk.evaluate(riskRequest);
+      await this.#audit(clock.timestamp, "risk_decision", {
+        signalId: request.signal.id,
+        risk,
+        shadowRisk: { mode: "SHADOW", risk: shadowRisk },
       });
-      await this.#audit(clock.timestamp, "risk_decision", { signalId: request.signal.id, risk });
       if (!risk.allowed) return { submitted: false, reasons: risk.reasons, risk };
 
       const clientOrderId = this.#clientOrderId("entry", request.signal.id, clock.timestamp);
@@ -199,7 +215,7 @@ export class LiveOrderManager {
       }
 
       if (this.#pending?.purpose === "ENTRY" && this.#position) {
-        const exit = this.#evaluateExit(request);
+        const exit = await this.#evaluateExit(request);
         if (exit.exit) {
           await this.#audit(request.timestamp, "partial_entry_exit_requested", { reason: exit.reason, position: this.#position });
           await this.#requestCancel(request.timestamp);
@@ -214,7 +230,7 @@ export class LiveOrderManager {
       }
 
       if (this.#position) {
-        const exit = this.#evaluateExit(request);
+        const exit = await this.#evaluateExit(request);
         if (exit.exit) await this.#submitExit(request.timestamp, exit.reason!);
       }
       return this.snapshot();
@@ -235,17 +251,39 @@ export class LiveOrderManager {
     };
   }
 
-  #evaluateExit(request: ExecutionTick): ReturnType<ExitManager["evaluate"]> {
+  async #evaluateExit(request: ExecutionTick): Promise<ReturnType<ExitManager["evaluate"]>> {
     if (!this.#position) throw new Error("Cannot evaluate exit without a position");
     const quote = this.#quoteFor(this.#position.symbol, request.optionQuote);
-    const decision = this.#exits.evaluate({
+    const position = { ...this.#position };
+    const context = {
       timestamp: request.timestamp,
-      position: this.#position,
+      position,
       ...(quote ? { optionQuote: quote } : {}),
       ...(request.feature ? { feature: request.feature } : {}),
       ...(request.regime ? { regime: request.regime } : {}),
       killSwitch: request.killSwitch === true,
-    });
+    };
+    const decision = this.#exits.evaluate(context);
+    const shadowDecision = this.#shadowExits.evaluate({ ...context, position: { ...position } });
+    if (shadowDecision.reason === "EARLY_SCRATCH" &&
+        this.#shadowScratchAuditedEntryTimestamp !== position.entryTimestamp) {
+      this.#shadowScratchAuditedEntryTimestamp = position.entryTimestamp;
+      await this.#audit(request.timestamp, "shadow_exit_decision", {
+        mode: "SHADOW",
+        reason: shadowDecision.reason,
+        symbol: position.symbol,
+        direction: position.direction,
+        entryTimestamp: position.entryTimestamp,
+        averageEntryPrice: position.averageEntryPrice,
+        underlyingEntryPrice: position.underlyingEntryPrice ?? null,
+        highWaterMark: shadowDecision.updatedPosition.highWaterMark,
+        markPrice: shadowDecision.markPrice ?? null,
+        liquidationPrice: shadowDecision.liquidationPrice ?? null,
+        featurePrice: request.feature?.price ?? null,
+        fastSlope: request.feature?.fast.normalizedSlope ?? null,
+        activeDecision: decision.reason ?? "HOLD",
+      });
+    }
     this.#position = decision.updatedPosition;
     return decision;
   }
@@ -328,7 +366,11 @@ export class LiveOrderManager {
         this.#position = reconcileEntryExposure(
           pending.state, pending.direction, timestamp, this.#risk, this.#position, pending.underlyingEntryPrice,
         );
-        if (firstFill) this.#risk.recordEntry(timestamp);
+        if (firstFill) {
+          this.#risk.recordEntry(timestamp);
+          this.#shadowRisk.recordEntry(timestamp);
+          this.#shadowScratchAuditedEntryTimestamp = undefined;
+        }
         await this.#audit(timestamp, "entry_fill", {
           signalId: pending.signalId,
           incrementalQuantity, incrementalPrice, cumulativeQuantity: totalFilled, position: this.#position,
@@ -337,6 +379,7 @@ export class LiveOrderManager {
         const exitingPosition = { ...this.#position };
         const realizedPnl = 100 * incrementalQuantity * (incrementalPrice - exitingPosition.averageEntryPrice);
         this.#risk.recordRealizedPnl(timestamp, realizedPnl);
+        this.#shadowRisk.recordRealizedPnl(timestamp, realizedPnl);
         this.#position.quantity -= incrementalQuantity;
         await this.#audit(timestamp, "exit_fill", {
           reason: pending.exitReason, incrementalQuantity, incrementalPrice, realizedPnl,
@@ -345,7 +388,10 @@ export class LiveOrderManager {
           highWaterMark: exitingPosition.highWaterMark, lowWaterMark: exitingPosition.lowWaterMark,
           remainingQuantity: this.#position.quantity,
         });
-        if (this.#position.quantity === 0) this.#position = undefined;
+        if (this.#position.quantity === 0) {
+          this.#position = undefined;
+          this.#shadowScratchAuditedEntryTimestamp = undefined;
+        }
       }
     }
 

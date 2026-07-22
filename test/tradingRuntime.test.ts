@@ -23,6 +23,8 @@ const callSymbol = "SPY260722C00501000";
 const immediateRuntimeConfig = structuredClone(defaultConfig);
 immediateRuntimeConfig.signals.followThroughMinSec = 0;
 immediateRuntimeConfig.signals.followThroughMaxSec = 0;
+const enforcedRuntimeConfig = structuredClone(defaultConfig);
+enforcedRuntimeConfig.signals.entryQualityMode = "ENFORCE";
 
 test("option universe readiness follows the 0DTE cutoff while protecting open exposure", () => {
   const beforeCutoff = zonedDateTimeToEpoch(date, "14:29:59");
@@ -38,23 +40,35 @@ test("option universe readiness follows the 0DTE cutoff while protecting open ex
 
 class FakeStockStream implements StockStream {
   handlers: StockStreamHandlers | undefined;
+  connectCalls = 0;
+  closeCalls = 0;
   async connect(handlers: StockStreamHandlers): Promise<void> {
+    this.connectCalls += 1;
     this.handlers = handlers;
     handlers.onState?.(true);
   }
-  async close(): Promise<void> { this.handlers?.onState?.(false); }
+  async close(): Promise<void> {
+    this.closeCalls += 1;
+    this.handlers?.onState?.(false);
+  }
 }
 
 class FakeOptionStream implements OptionStream {
   handlers: OptionStreamHandlers | undefined;
   readonly subscribed = new Set<string>();
+  connectCalls = 0;
+  closeCalls = 0;
   async subscribe(symbols: readonly string[]): Promise<void> { for (const symbol of symbols) this.subscribed.add(symbol); }
   async unsubscribe(symbols: readonly string[]): Promise<void> { for (const symbol of symbols) this.subscribed.delete(symbol); }
   async connect(handlers: OptionStreamHandlers): Promise<void> {
+    this.connectCalls += 1;
     this.handlers = handlers;
     handlers.onState?.(true);
   }
-  async close(): Promise<void> { this.handlers?.onState?.(false); }
+  async close(): Promise<void> {
+    this.closeCalls += 1;
+    this.handlers?.onState?.(false);
+  }
   async quote(quote: OptionQuote): Promise<void> { await this.handlers?.onQuote(quote); }
 }
 
@@ -76,12 +90,18 @@ class FakeRuntimeClient implements SpyOptionsRuntimeClient {
     equity: 100_000, optionBuyingPower: 25_000, active: true, optionsApproved: true, killSwitch: false,
   };
   clock = { timestamp: now, isOpen: true };
+  latestQuoteCalls = 0;
+  listContractCalls = 0;
   async getAccount(): Promise<AccountState> { return { ...this.account }; }
   async getMarketClock(): Promise<{ timestamp: number; isOpen: boolean }> { return { ...this.clock }; }
   async getLatestSpySipQuote(): Promise<StockQuote> {
+    this.latestQuoteCalls += 1;
     return { symbol: "SPY", timestamp: now, bidPrice: 500.99, askPrice: 501.01, bidSize: 100, askSize: 100 };
   }
-  async listOptionContracts(): Promise<OptionContract[]> { return [{ ...this.contract }]; }
+  async listOptionContracts(): Promise<OptionContract[]> {
+    this.listContractCalls += 1;
+    return [{ ...this.contract }];
+  }
   async getOptionSnapshots(symbols: readonly string[]): Promise<OptionSnapshot[]> {
     return symbols.map((symbol) => ({
       symbol, timestamp: now - 86_400_000, impliedVolatility: 0.22, greeks: { delta: 0.52, gamma: 0.02 },
@@ -167,6 +187,91 @@ function bearishFeature(timestamp = now, price = 499): FeatureSnapshot {
   };
 }
 
+async function waitFor(predicate: () => boolean, timeoutMs = 1_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() >= deadline) throw new Error("Timed out waiting for runtime state transition");
+    await new Promise<void>((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+test("market-closed startup remains idle without SIP, OPRA, universe, or strategy activity", async () => {
+  const closedAt = zonedDateTimeToEpoch(date, "16:30:00");
+  const client = new FakeRuntimeClient();
+  client.clock = { timestamp: closedAt, isOpen: false };
+  const stockStream = new FakeStockStream();
+  const optionStream = new FakeOptionStream();
+  const recorder = new MemoryRecorder();
+  const runtime = new SpyOptionsTradingRuntime({
+    config: defaultConfig,
+    client,
+    stockStream,
+    optionStream,
+    executionEnabled: true,
+    executionMode: "paper",
+    now: () => closedAt,
+    executionTickMs: 10,
+    recorder,
+  });
+  await runtime.start();
+  const health = runtime.healthState();
+  assert.equal(health.ready, true);
+  assert.equal(health.marketDataIdle, true);
+  assert.equal(health.marketClockState, "market-closed-idle");
+  assert.equal(health.websocketConnected, false);
+  assert.equal(stockStream.connectCalls, 0);
+  assert.equal(optionStream.connectCalls, 0);
+  assert.equal(client.latestQuoteCalls, 0);
+  assert.equal(client.listContractCalls, 0);
+  assert.equal(health.restoredStockEvents, 0);
+  assert.equal(health.strategyStateStatus, "MARKET_CLOSED_IDLE");
+  assert.equal(recorder.events.some((event) => event.type === "strategy_state_recovery"), false);
+  const eventCount = recorder.events.length;
+  await runtime.ingestFeature({ ...bullishFeature(), timestamp: closedAt });
+  assert.equal(recorder.events.length, eventCount);
+  assert.ok(recorder.events.some((event) => event.type === "market_session_idle"));
+  await runtime.close();
+});
+
+test("market close disconnects activity and the next open reconnects automatically", async () => {
+  let decisionTime = now;
+  const client = new FakeRuntimeClient();
+  const stockStream = new FakeStockStream();
+  const optionStream = new FakeOptionStream();
+  const recorder = new MemoryRecorder();
+  const runtime = new SpyOptionsTradingRuntime({
+    config: defaultConfig,
+    client,
+    stockStream,
+    optionStream,
+    executionEnabled: true,
+    executionMode: "paper",
+    now: () => decisionTime,
+    executionTickMs: 10,
+    recorder,
+  });
+  await runtime.start();
+  assert.equal(stockStream.connectCalls, 1);
+  assert.equal(optionStream.connectCalls, 1);
+
+  decisionTime = zonedDateTimeToEpoch(date, "16:00:01");
+  client.clock = { timestamp: decisionTime, isOpen: false };
+  await waitFor(() => runtime.healthState().marketDataIdle === true);
+  await waitFor(() => stockStream.closeCalls > 0 && optionStream.closeCalls > 0);
+  assert.equal(runtime.healthState().websocketConnected, false);
+  assert.equal(runtime.healthState().ready, true);
+  const evaluationCount = recorder.events.filter((event) => event.type === "live_entry_evaluation").length;
+  await runtime.ingestFeature({ ...bullishFeature(), timestamp: decisionTime });
+  assert.equal(recorder.events.filter((event) => event.type === "live_entry_evaluation").length, evaluationCount);
+
+  decisionTime = zonedDateTimeToEpoch("2026-07-23", "09:30:01");
+  client.clock = { timestamp: decisionTime, isOpen: true };
+  await waitFor(() => stockStream.connectCalls === 2 && optionStream.connectCalls === 2);
+  assert.equal(runtime.healthState().marketDataIdle, false);
+  assert.ok(recorder.events.some((event) => event.type === "market_session_resumed"));
+  await runtime.close();
+});
+
 test("end-to-end paper runtime arms SIP/OPRA and routes an eligible signal to a same-day SPY option order", async () => {
   const client = new FakeRuntimeClient();
   const stockStream = new FakeStockStream();
@@ -211,7 +316,8 @@ test("end-to-end paper runtime arms SIP/OPRA and routes an eligible signal to a 
   assert.equal(orderRequest?.data.signalId, selection?.data.signalId);
   const riskRecovery = recorder.events.find((event) => event.type === "daily_risk_state_recovery");
   assert.equal(riskRecovery?.data.restoredEntries, 0);
-  assert.equal(riskRecovery?.data.maxTradesPerDay, defaultConfig.risk.maxTradesPerDay);
+  assert.equal(riskRecovery?.data.activeMaxTradesPerDay, defaultConfig.risk.maxTradesPerDay);
+  assert.equal(riskRecovery?.data.shadowMaxTradesPerDay, defaultConfig.risk.entryQualityMaxTradesPerDay);
   await runtime.close();
   assert.deepEqual(history.priorityChanges.at(-1), []);
 });
@@ -258,13 +364,105 @@ test("restart restoration deduplicates partial entry fills and preserves the dai
   assert.ok(decision.reasons.includes("MAX_DAILY_ENTRIES_REACHED"));
 });
 
-test("paper runtime waits for causal follow-through before submitting an entry", async () => {
-  let decisionTime = now;
+test("restart after six unique fills restores an active shadow entry cap", async () => {
+  const restoredAuditEvents: AuditEvent[] = Array.from({ length: 6 }, (_, index) => ({
+    timestamp: now - (index + 1) * 1_000,
+    marketDate: date,
+    type: "entry_fill",
+    configVersion: "before",
+    data: {
+      signalId: `restart-fill-${index}`,
+      position: {
+        symbol: callSymbol,
+        direction: index % 2 === 0 ? "BULLISH" : "BEARISH",
+        entryTimestamp: now - (index + 1) * 1_000,
+      },
+    },
+  }));
+  const recorder = new MemoryRecorder();
+  const runtime = new SpyOptionsTradingRuntime({
+    config: defaultConfig,
+    client: new FakeRuntimeClient(),
+    stockStream: new FakeStockStream(),
+    optionStream: new FakeOptionStream(),
+    executionEnabled: false,
+    executionMode: "paper",
+    now: () => now,
+    executionTickMs: 60_000,
+    recorder,
+    restoredAuditEvents,
+  });
+  await runtime.start();
+  const recovery = recorder.events.find((event) => event.type === "daily_risk_state_recovery");
+  assert.equal(recovery?.data.restoredEntries, 6);
+  assert.equal(recovery?.data.activeEntryCapReached, false);
+  assert.equal(recovery?.data.shadowEntryCapReached, true);
+  await runtime.close();
+});
+
+test("shadow confirmation observes a pending candidate without delaying the paper order", async () => {
   const client = new FakeRuntimeClient();
   const optionStream = new FakeOptionStream();
   const recorder = new MemoryRecorder();
   const runtime = new SpyOptionsTradingRuntime({
     config: defaultConfig,
+    client,
+    stockStream: new FakeStockStream(),
+    optionStream,
+    executionEnabled: true,
+    executionMode: "paper",
+    now: () => now,
+    executionTickMs: 60_000,
+    recorder,
+  });
+  await runtime.start();
+  await optionStream.quote({
+    symbol: callSymbol, timestamp: now, bidPrice: 1.99, askPrice: 2.01, bidSize: 100, askSize: 100,
+  });
+  await runtime.ingestFeature(bullishFeature());
+  assert.equal(client.requests.length, 1);
+  const evaluation = recorder.events.find((event) => event.type === "live_entry_evaluation");
+  assert.equal(evaluation?.data.decision, "SIGNAL");
+  const shadow = evaluation?.data.shadowEvaluation as Record<string, unknown>;
+  assert.equal(shadow.decision, "NO_SIGNAL");
+  assert.deepEqual(shadow.reasons, ["FOLLOW_THROUGH_PENDING"]);
+  await runtime.close();
+});
+
+test("post-14:30 baseline candidates are labeled research-only before option selection", async () => {
+  const afterCutoff = zonedDateTimeToEpoch(date, "14:30:01");
+  const client = new FakeRuntimeClient();
+  client.clock.timestamp = afterCutoff;
+  const recorder = new MemoryRecorder();
+  const runtime = new SpyOptionsTradingRuntime({
+    config: defaultConfig,
+    client,
+    stockStream: new FakeStockStream(),
+    optionStream: new FakeOptionStream(),
+    executionEnabled: true,
+    executionMode: "paper",
+    now: () => afterCutoff,
+    executionTickMs: 60_000,
+    recorder,
+  });
+  await runtime.start();
+  await runtime.ingestFeature({ ...bullishFeature(), timestamp: afterCutoff });
+  const evaluation = recorder.events.find((event) => event.type === "live_entry_evaluation");
+  assert.equal(evaluation?.data.decision, "RESEARCH_ONLY");
+  assert.equal(evaluation?.data.actionability, "RESEARCH_ONLY");
+  assert.ok((evaluation?.data.reasons as string[]).includes("ZERO_DTE_ENTRY_CUTOFF_PASSED"));
+  assert.equal(recorder.events.some((event) => event.type === "live_signal_selection"), false);
+  assert.equal(client.requests.length, 0);
+  await runtime.close();
+});
+
+test("enforced opt-in waits for causal follow-through before submitting an entry", async () => {
+  let decisionTime = now;
+  const client = new FakeRuntimeClient();
+  const optionStream = new FakeOptionStream();
+  const recorder = new MemoryRecorder();
+  const runtime = new SpyOptionsTradingRuntime({
+    config: enforcedRuntimeConfig,
     client,
     stockStream: new FakeStockStream(),
     optionStream,
@@ -299,7 +497,7 @@ test("paper runtime waits for causal follow-through before submitting an entry",
   await runtime.close();
 });
 
-test("all-entry shadow confirmation is audited but cannot submit an order", async () => {
+test("all confirmation scopes are audited together and cannot submit an order", async () => {
   let decisionTime = now;
   const client = new FakeRuntimeClient();
   const recorder = new MemoryRecorder();
@@ -323,7 +521,9 @@ test("all-entry shadow confirmation is audited but cannot submit an order", asyn
   const latest = evaluations.at(-1)!;
   assert.equal(latest.data.decision, "SKIPPED");
   assert.ok((latest.data.reasons as string[]).includes("EXECUTION_DISABLED"));
-  assert.equal((latest.data.shadowEvaluation as Record<string, unknown>).decision, "SIGNAL");
+  const shadowProfiles = latest.data.shadowEvaluations as Record<string, Record<string, unknown>>;
+  assert.deepEqual(Object.keys(shadowProfiles), ["BULLISH_IMPULSE", "IMPULSE", "ALL"]);
+  assert.equal(shadowProfiles.ALL?.decision, "SIGNAL");
   assert.equal(client.requests.length, 0);
   await runtime.close();
 });

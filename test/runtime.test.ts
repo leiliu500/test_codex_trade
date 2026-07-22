@@ -73,6 +73,23 @@ test("health server exposes liveness while paper-idle readiness is degraded", as
   assert.equal((await dashboardApi.json() as { readiness: string }).readiness, "degraded");
 });
 
+test("market-closed idle is healthy without connected market-data sockets", () => {
+  const state: HealthState = {
+    ready: true,
+    marketDataIdle: true,
+    subscribedOptionContracts: 0,
+    websocketConnected: false,
+    optionWebsocketConnected: false,
+    brokerAvailable: true,
+    marketClockState: "market-closed-idle",
+    openOrderCount: 0,
+    positionsReconciled: true,
+    recorderHealthy: true,
+    killSwitch: false,
+  };
+  assert.equal(healthReadiness(state).status, "ok");
+});
+
 class FakeStockStream implements StockStream {
   handlers: StockStreamHandlers | undefined;
   async connect(handlers: StockStreamHandlers): Promise<void> {

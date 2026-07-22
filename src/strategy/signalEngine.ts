@@ -65,7 +65,8 @@ export class SignalEngine {
     if (!inSessionWindow(feature.timestamp, this.#config.session.entryStart, this.#config.session.entryEnd, this.#config.timeZone)) {
       globalReasons.push("OUTSIDE_ENTRY_WINDOW");
     }
-    if (secondsSinceMidnight(feature.timestamp, this.#config.timeZone) > parseClock(this.#config.options.zeroDteEntryCutoff)) {
+    if (this.#config.signals.entryQualityMode === "ENFORCE" &&
+        secondsSinceMidnight(feature.timestamp, this.#config.timeZone) > parseClock(this.#config.options.zeroDteEntryCutoff)) {
       globalReasons.push("ZERO_DTE_ENTRY_CUTOFF_PASSED");
     }
     if (this.#config.signals.blockWhipsaw && regime.regime === "HIGH_VOL_WHIPSAW") globalReasons.push("WHIPSAW_REGIME_BLOCKED");
@@ -106,7 +107,8 @@ export class SignalEngine {
     });
     const selected = candidates[0]!;
     const directionEvaluations = directions.map(({ signal: _signal, ...direction }) => direction);
-    if (this.#config.signals.followThroughMinSec > 0 && this.#requiresFollowThrough(selected)) {
+    if (this.#config.signals.entryQualityMode === "ENFORCE" &&
+        this.#config.signals.followThroughMinSec > 0 && this.#requiresFollowThrough(selected)) {
       const confirmation = this.#confirmFollowThrough(selected, feature);
       if (!confirmation.confirmed) {
         return { passed: false, reasons: confirmation.reasons, directions: directionEvaluations };
@@ -239,7 +241,8 @@ export class SignalEngine {
       blockedReasons.push("LATE_BULLISH_IMPULSE_REQUIRES_UP_REGIME");
       return undefined;
     }
-    const bullishImpulseCutoffPassed = direction === "BULLISH" &&
+    const bullishImpulseCutoffPassed = this.#config.signals.entryQualityMode === "ENFORCE" &&
+      direction === "BULLISH" &&
       secondsSinceMidnight(f.timestamp, this.#config.timeZone) > parseClock(this.#config.signals.bullishImpulseCutoff);
     if (impulsePassed && bullishImpulseCutoffPassed) {
       blockedReasons.push("BULLISH_IMPULSE_CUTOFF_PASSED");
