@@ -29,12 +29,12 @@ Build and start the paper-safe runtime with Docker Compose:
 ```bash
 docker-compose up --build -d
 docker-compose ps
-curl http://127.0.0.1:8080/live
-curl http://127.0.0.1:8080/ready
+curl http://127.0.0.1:3001/live
+curl http://127.0.0.1:3001/ready
 docker-compose logs -f spy-options-engine
 ```
 
-Compose reads broker credentials from the local `.env` file at runtime and never copies that file into the image. It forces `TRADING_MODE=paper`, enables broker-backed paper orders, consumes SPY quotes/trades from SIP, and consumes executable option quotes from OPRA. `/live` reports process liveness. `/ready` returns 200 only after Alpaca acknowledges both WebSocket feeds, the paper account and options approval are verified, and open orders/positions reconcile safely. It exposes message counters and execution state without exposing credentials. The Alpaca account must have real-time SIP and OPRA entitlement. Set `ENABLE_LIVE_ORDERS=false` to receive SIP without submitting paper orders; set `MARKET_DATA_ENABLED=false` as well for paper-idle mode. Readiness remains degraded in either reduced mode.
+Compose reads broker credentials from the local `.env` file at runtime and never copies that file into the image. It forces `TRADING_MODE=paper`, enables broker-backed paper orders, consumes SPY quotes/trades from SIP, and consumes executable option quotes from OPRA. It also starts PostgreSQL on the private Compose network; the database port is not exposed publicly. `/live` reports process liveness. `/ready` returns 200 only after PostgreSQL, both WebSocket feeds, paper account/options approval, and broker reconciliation are healthy. The Alpaca account must have real-time SIP and OPRA entitlement. Set `ENABLE_LIVE_ORDERS=false` to receive SIP without submitting paper orders; set `MARKET_DATA_ENABLED=false` as well for paper-idle mode. Readiness remains degraded in either reduced mode.
 
 The image is multi-stage, runs as the unprivileged Node user, has a read-only root filesystem in Compose, and does not copy `.env`, credentials, replay data, tests, or development dependencies into the runtime image.
 
@@ -42,6 +42,39 @@ Stop the service without removing application source or local data:
 
 ```bash
 docker-compose down
+```
+
+Do not add `-v` unless you intentionally want to delete the PostgreSQL history volume.
+
+## Trading dashboard and PostgreSQL history
+
+Open the read-only dashboard at:
+
+```text
+http://127.0.0.1:3001/dashboard
+```
+
+The browser polls `/api/dashboard` once per second. It shows every signal entry fired, candidate-selection/order status, broker-confirmed fills, open and completed option trades, realized P&L, win rate, average trade, and profit factor. Dashboard state is reconstructed from PostgreSQL after a service restart.
+
+PostgreSQL persists two indexed histories in the named `spy-options-postgres` volume:
+
+- `market_events`: raw SPY SIP quotes/trades, subscribed OPRA option quotes, option contracts/snapshots, and generated feature snapshots. High-rate records are inserted in batches so quote handling is not blocked by one SQL round trip per event.
+- `audit_events`: signals, selection results, risk decisions, order requests/states/replacements, fills, exits, reconciliation, and execution halts. Critical execution events are inserted durably before processing continues.
+
+Set a strong `POSTGRES_PASSWORD` in `.env` before non-local deployment. Raw OPRA history can be large; monitor the Docker volume and back it up according to your retention requirements.
+
+Export one market date into the engine's replay JSONL format, then backtest it:
+
+```bash
+docker-compose exec -T spy-options-engine \
+  node dist/src/cli/exportPostgresReplay.js 2026-07-22 > spy-2026-07-22.jsonl
+npm run backtest -- spy-2026-07-22.jsonl conservative
+```
+
+Create a database backup without stopping the engine:
+
+```bash
+docker-compose exec -T postgres pg_dump -U spy_options spy_options > spy-options-history.sql
 ```
 
 To replay a mounted event file using the same production image:

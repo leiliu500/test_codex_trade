@@ -7,6 +7,7 @@ import type { StockStream, StockStreamHandlers } from "../src/alpaca/stockStream
 import type { StockQuote, StockTrade } from "../src/types.js";
 import { SpySipReceiver } from "../src/runtime/spySipReceiver.js";
 import { defaultConfig } from "../src/config.js";
+import { TradingDashboardStore } from "../src/ops/tradingDashboard.js";
 
 test("runtime environment is paper-safe and validates the health listener", () => {
   assert.deepEqual(readEnvironment({}), {
@@ -15,15 +16,17 @@ test("runtime environment is paper-safe and validates the health listener", () =
     marketDataEnabled: false,
     stockDataFeed: "sip",
     optionDataFeed: "opra",
+    historyDatabaseEnabled: false,
     killSwitch: false,
     healthHost: "127.0.0.1",
-    healthPort: 8080,
+    healthPort: 3001,
   });
   assert.throws(() => readEnvironment({ HEALTH_PORT: "0" }), /HEALTH_PORT/);
   assert.throws(() => readEnvironment({ HEALTH_PORT: "not-a-port" }), /HEALTH_PORT/);
   assert.throws(() => readEnvironment({ STOCK_DATA_FEED: "iex" }), /hard-limited.*SIP/i);
   assert.throws(() => readEnvironment({ OPTION_DATA_FEED: "indicative" }), /OPRA/i);
   assert.throws(() => readEnvironment({ ENABLE_LIVE_ORDERS: "true" }), /MARKET_DATA_ENABLED/);
+  assert.throws(() => readEnvironment({ HISTORY_DATABASE_ENABLED: "true" }), /DATABASE_URL/);
   assert.throws(() => readEnvironment({ MARKET_DATA_ENABLED: "true" }), /ALPACA_API_KEY/);
   assert.throws(() => readEnvironment({ TRADING_MODE: "live" }), /ENABLE_LIVE_ORDERS/);
   assert.equal(readEnvironment({
@@ -43,7 +46,8 @@ test("health server exposes liveness while paper-idle readiness is degraded", as
     recorderHealthy: true,
     killSwitch: false,
   };
-  const server = startHealthServer(() => state, 0, "127.0.0.1");
+  const dashboard = new TradingDashboardStore();
+  const server = startHealthServer(() => state, 0, "127.0.0.1", () => dashboard.snapshot());
   context.after(() => new Promise<void>((resolve, reject) => {
     server.close((error) => error ? reject(error) : resolve());
   }));
@@ -51,10 +55,16 @@ test("health server exposes liveness while paper-idle readiness is degraded", as
   const address = server.address() as AddressInfo;
   const live = await fetch(`http://127.0.0.1:${address.port}/live`);
   const ready = await fetch(`http://127.0.0.1:${address.port}/ready`);
+  const dashboardPage = await fetch(`http://127.0.0.1:${address.port}/dashboard`);
+  const dashboardApi = await fetch(`http://127.0.0.1:${address.port}/api/dashboard`);
   assert.equal(live.status, 200);
   assert.deepEqual(await live.json(), { status: "alive" });
   assert.equal(ready.status, 503);
   assert.equal((await ready.json() as { status: string }).status, "degraded");
+  assert.equal(dashboardPage.status, 200);
+  assert.match(await dashboardPage.text(), /SPY 0DTE Option Day-Trade Dashboard/);
+  assert.equal(dashboardApi.status, 200);
+  assert.equal((await dashboardApi.json() as { readiness: string }).readiness, "degraded");
 });
 
 class FakeStockStream implements StockStream {

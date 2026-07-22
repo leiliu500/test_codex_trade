@@ -1,4 +1,5 @@
 import { createServer, type Server } from "node:http";
+import { tradingDashboardHtml, type TradingDashboardSnapshot } from "./tradingDashboard.js";
 
 export interface HealthState {
   ready: boolean;
@@ -45,12 +46,35 @@ export function clockDriftMs(providerTimestamp: number, localTimestamp = Date.no
   return Math.abs(localTimestamp - providerTimestamp);
 }
 
-export function startHealthServer(getState: () => HealthState, port = 8080, host = "127.0.0.1"): Server {
+export function startHealthServer(
+  getState: () => HealthState,
+  port = 3001,
+  host = "127.0.0.1",
+  getDashboard?: () => TradingDashboardSnapshot,
+): Server {
   const server = createServer((request, response) => {
     const health = healthReadiness(getState());
+    response.setHeader("x-content-type-options", "nosniff");
+    response.setHeader("cache-control", "no-store");
     if (request.url === "/live") {
       response.writeHead(200, { "content-type": "application/json" });
       response.end(JSON.stringify({ status: "alive" }));
+      return;
+    }
+    if (request.url === "/api/dashboard" && getDashboard) {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify({ ...getDashboard(), readiness: health.status, health: health.checks }));
+      return;
+    }
+    if (request.url === "/dashboard" && getDashboard) {
+      response.setHeader("content-security-policy", "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'");
+      response.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+      response.end(tradingDashboardHtml());
+      return;
+    }
+    if (request.url === "/" && getDashboard) {
+      response.writeHead(302, { location: "/dashboard" });
+      response.end();
       return;
     }
     if (request.url === "/ready") {

@@ -7,6 +7,7 @@ import type {
 } from "../types.js";
 import type { HealthState } from "../ops/healthServer.js";
 import type { AuditRecorder } from "../ops/recorder.js";
+import type { MarketHistorySink, HistoricalMarketEventType } from "../history/types.js";
 import { MemoryRecorder } from "../ops/recorder.js";
 import { SerializedDecisionQueue } from "../execution/tradingEngine.js";
 import { LiveOrderManager, type LiveExecutionSnapshot } from "../execution/liveOrderManager.js";
@@ -16,6 +17,7 @@ import { OptionUniverseManager } from "../options/optionUniverse.js";
 import { SignalEngine } from "../strategy/signalEngine.js";
 import { classifyRegime } from "../strategy/regimeClassifier.js";
 import { SpySipReceiver } from "./spySipReceiver.js";
+import { marketDate } from "../utils/time.js";
 
 export interface SpyOptionsRuntimeClient extends TradingRestClient {
   getLatestSpySipQuote(): Promise<StockQuote>;
@@ -30,6 +32,7 @@ export interface SpyOptionsTradingRuntimeOptions {
   executionMode?: "paper" | "live";
   killSwitch?: boolean;
   recorder?: AuditRecorder;
+  history?: MarketHistorySink;
   now?: () => number;
   executionTickMs?: number;
   onEvent?: (type: string, data: Record<string, unknown>) => void;
@@ -42,6 +45,7 @@ export class SpyOptionsTradingRuntime {
   readonly #client: SpyOptionsRuntimeClient;
   readonly #optionStream: OptionStream;
   readonly #recorder: AuditRecorder;
+  readonly #history: MarketHistorySink | undefined;
   readonly #executionEnabled: boolean;
   readonly #executionMode: "paper" | "live";
   readonly #killSwitch: boolean;
@@ -94,6 +98,7 @@ export class SpyOptionsTradingRuntime {
     this.#universe = new OptionUniverseManager(options.config);
     this.#signals = new SignalEngine(options.config);
     this.#recorder = options.recorder ?? new MemoryRecorder();
+    this.#history = options.history;
     this.#orders = new LiveOrderManager({
       config: options.config,
       client: options.client,
@@ -104,6 +109,7 @@ export class SpyOptionsTradingRuntime {
       stream: options.stockStream,
       now: this.#now,
       onStockQuote: (quote) => this.#onStockQuote(quote),
+      onStockTrade: (trade) => this.#recordHistory("stock_trade", trade.timestamp, trade.symbol, { ...trade }),
       onFeature: (feature) => this.ingestFeature(feature),
       onError: (error) => this.#recordError(error),
     });
@@ -168,6 +174,7 @@ export class SpyOptionsTradingRuntime {
   async ingestFeature(feature: FeatureSnapshot): Promise<void> {
     try {
       await this.#queue.enqueue(async () => {
+        this.#recordHistory("feature_snapshot", feature.timestamp, feature.symbol, { ...feature });
         this.#lastFeature = feature;
         this.#lastSpot = feature.price;
         this.#lastRegime = classifyRegime(feature, this.#config.regimes);
@@ -181,12 +188,18 @@ export class SpyOptionsTradingRuntime {
         const subscribedContracts = this.#contracts.filter((contract) => this.#subscribedSymbols.has(contract.symbol));
         const selection = this.#selector.select(signal, subscribedContracts, this.#book);
         const candidate = selection.selected;
-        this.#emit("live_signal_selection", {
+        const signalEvent = {
           signalId: signal.id,
+          timestamp: signal.timestamp,
           direction: signal.direction,
+          kind: signal.kind,
+          regime: signal.regime,
+          projectedMoveBps: signal.projectedMoveBps,
           candidate: candidate?.symbol ?? null,
           rejectionCounts: selection.rejectionCounts,
-        });
+        };
+        await this.#auditRuntime(signal.timestamp, "live_signal_selection", signalEvent);
+        this.#emit("live_signal_selection", signalEvent);
         if (!candidate) return;
         const quote = this.#book.get(candidate.symbol)?.quote;
         if (!quote) return;
@@ -194,12 +207,17 @@ export class SpyOptionsTradingRuntime {
           timestamp: this.#now(), signal, candidate, quote, killSwitch: this.#killSwitch,
         });
         this.#execution = this.#orders.snapshot();
-        this.#emit("paper_order_submission_result", {
+        const submissionEvent = {
           signalId: signal.id,
+          timestamp: this.#now(),
+          symbol: candidate.symbol,
+          direction: signal.direction,
           submitted: result.submitted,
           reasons: result.reasons,
           brokerOrderId: result.brokerOrder?.id ?? null,
-        });
+        };
+        await this.#auditRuntime(this.#now(), "paper_order_submission_result", submissionEvent);
+        this.#emit("paper_order_submission_result", submissionEvent);
       });
     } catch (error) {
       this.#recordError(error);
@@ -242,6 +260,7 @@ export class SpyOptionsTradingRuntime {
   async #onStockQuote(quote: StockQuote): Promise<void> {
     try {
       await this.#queue.enqueue(async () => {
+        this.#recordHistory("stock_quote", quote.timestamp, quote.symbol, { ...quote });
         this.#lastSpot = (quote.bidPrice + quote.askPrice) / 2;
         await this.#refreshUniverse(this.#lastSpot, this.#now());
       });
@@ -253,6 +272,7 @@ export class SpyOptionsTradingRuntime {
   async #onOptionQuote(quote: OptionQuote): Promise<void> {
     try {
       await this.#queue.enqueue(async () => {
+        this.#recordHistory("option_quote", quote.timestamp, quote.symbol, { ...quote });
         this.#optionQuoteCount += 1;
         this.#lastOptionQuoteTimestamp = quote.timestamp;
         if (!this.#book.updateQuote(quote)) this.#rejectedOptionQuotes += 1;
@@ -267,7 +287,10 @@ export class SpyOptionsTradingRuntime {
     if (!force && !this.#universe.shouldRefresh(timestamp)) return;
     const contracts = await this.#client.listOptionContracts();
     this.#contracts = contracts;
-    for (const contract of contracts) this.#book.upsertContract(contract);
+    for (const contract of contracts) {
+      this.#book.upsertContract(contract);
+      this.#recordHistory("option_contract", timestamp, contract.symbol, { ...contract });
+    }
     const nextSymbols = new Set(this.#universe.refresh(contracts, spot, timestamp));
     const remove = [...this.#subscribedSymbols].filter((symbol) => !nextSymbols.has(symbol));
     const add = [...nextSymbols].filter((symbol) => !this.#subscribedSymbols.has(symbol));
@@ -276,7 +299,10 @@ export class SpyOptionsTradingRuntime {
     this.#subscribedSymbols = nextSymbols;
     if (nextSymbols.size > 0) {
       const snapshots = await this.#client.getOptionSnapshots([...nextSymbols]);
-      for (const snapshot of snapshots) this.#book.updateSnapshot(snapshot);
+      for (const snapshot of snapshots) {
+        this.#book.updateSnapshot(snapshot);
+        this.#recordHistory("option_snapshot", snapshot.timestamp ?? timestamp, snapshot.symbol, { ...snapshot });
+      }
     }
     this.#emit("option_universe_refreshed", {
       contractCount: contracts.length,
@@ -358,6 +384,30 @@ export class SpyOptionsTradingRuntime {
   #recordError(error: unknown): void {
     this.#lastError = error instanceof Error ? error.message : String(error);
     this.#onError?.(error);
+  }
+
+  async #auditRuntime(timestamp: number, type: string, data: Record<string, unknown>): Promise<void> {
+    await this.#recorder.record({
+      timestamp,
+      marketDate: marketDate(timestamp, this.#config.timeZone),
+      type,
+      configVersion: this.#config.version,
+      data,
+    });
+    if (!this.#recorder.healthy()) throw new Error("Runtime audit recorder is unhealthy");
+  }
+
+  #recordHistory(type: HistoricalMarketEventType, providerTimestamp: number, symbol: string, data: Record<string, unknown>): void {
+    if (!this.#history) return;
+    const receivedTimestamp = this.#now();
+    this.#history.recordMarketEvent({
+      type,
+      providerTimestamp,
+      receivedTimestamp,
+      marketDate: marketDate(receivedTimestamp, this.#config.timeZone),
+      symbol,
+      data,
+    });
   }
 
   #emit(type: string, data: Record<string, unknown>): void { this.#onEvent?.(type, data); }

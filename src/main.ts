@@ -7,7 +7,9 @@ import { AlpacaOptionWebSocket } from "./alpaca/optionStream.js";
 import { AlpacaTradingRestClient } from "./alpaca/restClient.js";
 import { SpySipReceiver } from "./runtime/spySipReceiver.js";
 import { SpyOptionsTradingRuntime } from "./runtime/spyOptionsTradingRuntime.js";
-import { JsonLineRecorder } from "./ops/recorder.js";
+import { CompositeRecorder, JsonLineRecorder } from "./ops/recorder.js";
+import { TradingDashboardStore } from "./ops/tradingDashboard.js";
+import { PostgresHistoryStore } from "./history/postgresHistory.js";
 import { JsonLogger } from "./utils/logger.js";
 
 loadDotEnv();
@@ -18,7 +20,27 @@ if (environment.tradingMode === "live") {
   throw new Error("Live mode needs an explicitly supplied TradingRestClient and stream adapters; refusing implicit live startup");
 }
 
-const logger = new JsonLogger([environment.alpacaApiKey ?? "", environment.alpacaApiSecret ?? ""]);
+const logger = new JsonLogger([
+  environment.alpacaApiKey ?? "", environment.alpacaApiSecret ?? "", environment.databaseUrl ?? "",
+]);
+const dashboard = new TradingDashboardStore();
+const history = environment.historyDatabaseEnabled ? new PostgresHistoryStore({
+  connectionString: environment.databaseUrl!,
+  onError: (error) => logger.log("error", "postgres_history_error", {
+    error: error instanceof Error ? error.message : String(error),
+  }),
+}) : undefined;
+if (history) {
+  await history.initialize();
+  const restoredEvents = await history.loadAuditEvents();
+  for (const event of restoredEvents) dashboard.record(event);
+  logger.log("info", "postgres_history_ready", { restoredAuditEvents: restoredEvents.length });
+}
+const auditRecorder = new CompositeRecorder([
+  new JsonLineRecorder((line) => process.stdout.write(line)),
+  dashboard,
+  ...(history ? [history] : []),
+]);
 const idleHealthState: HealthState = {
   ready: false,
   brokerRequired: false,
@@ -28,7 +50,7 @@ const idleHealthState: HealthState = {
   marketClockState: "paper-idle",
   openOrderCount: 0,
   positionsReconciled: true,
-  recorderHealthy: true,
+  recorderHealthy: history?.healthy() ?? true,
   killSwitch: environment.killSwitch,
 };
 const stockStream = environment.marketDataEnabled ? new AlpacaStockWebSocket({
@@ -54,7 +76,8 @@ const tradingRuntime = environment.liveOrdersEnabled && stockStream ? new SpyOpt
   executionEnabled: true,
   executionMode: "paper",
   killSwitch: environment.killSwitch,
-  recorder: new JsonLineRecorder((line) => process.stdout.write(line)),
+  recorder: auditRecorder,
+  ...(history ? { history } : {}),
   onEvent: (type, data) => logger.log("info", type, data),
   onError: (error) => logger.log("error", "spy_options_runtime_error", {
     error: error instanceof Error ? error.message : String(error),
@@ -72,6 +95,7 @@ const server = startHealthServer(
   () => tradingRuntime?.healthState() ?? sipReceiver?.healthState(environment.killSwitch) ?? idleHealthState,
   environment.healthPort,
   environment.healthHost,
+  () => dashboard.snapshot(),
 );
 
 server.on("listening", () => {
@@ -84,6 +108,8 @@ server.on("listening", () => {
     orderSubmission: tradingRuntime ? "alpaca-paper-enabled" : "disabled",
     configVersion: defaultConfig.version,
     health: `http://${environment.healthHost}:${environment.healthPort}`,
+    dashboard: `http://${environment.healthHost}:${environment.healthPort}/dashboard`,
+    historyDatabase: history ? "postgres-ready" : "disabled",
     message: tradingRuntime
       ? "Paper execution runtime is connecting SPY SIP signals, OPRA option quotes, and the Alpaca paper broker."
       : environment.marketDataEnabled
@@ -131,6 +157,7 @@ async function shutdown(signal: NodeJS.Signals): Promise<void> {
   try {
     await tradingRuntime?.close();
     await sipReceiver?.close();
+    await history?.close();
     await new Promise<void>((resolve, reject) => {
       server.close((error) => error ? reject(error) : resolve());
     });

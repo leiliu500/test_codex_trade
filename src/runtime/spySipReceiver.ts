@@ -14,6 +14,7 @@ export interface SpySipReceiverOptions {
   reconnectBaseMs?: number;
   reconnectMaximumMs?: number;
   onStockQuote?: (quote: StockQuote) => void | Promise<void>;
+  onStockTrade?: (trade: StockTrade) => void | Promise<void>;
   onFeature?: (feature: FeatureSnapshot) => void | Promise<void>;
   onError?: (error: unknown) => void;
 }
@@ -30,6 +31,7 @@ export class SpySipReceiver {
   readonly #reconnectBaseMs: number;
   readonly #reconnectMaximumMs: number;
   readonly #onStockQuote: ((quote: StockQuote) => void | Promise<void>) | undefined;
+  readonly #onStockTrade: ((trade: StockTrade) => void | Promise<void>) | undefined;
   readonly #onFeature: ((feature: FeatureSnapshot) => void | Promise<void>) | undefined;
   readonly #onError: ((error: unknown) => void) | undefined;
   readonly #aggregator: SecondAggregator;
@@ -59,6 +61,7 @@ export class SpySipReceiver {
     this.#reconnectBaseMs = options.reconnectBaseMs ?? 1_000;
     this.#reconnectMaximumMs = options.reconnectMaximumMs ?? 30_000;
     this.#onStockQuote = options.onStockQuote;
+    this.#onStockTrade = options.onStockTrade;
     this.#onFeature = options.onFeature;
     this.#onError = options.onError;
     this.#aggregator = new SecondAggregator(options.config.dataQuality);
@@ -166,6 +169,7 @@ export class SpySipReceiver {
         const result = this.#aggregator.ingestTrade(trade);
         if (result.rejected) this.#rejectedCount += 1;
         await this.#handleBars(result.bars);
+        await this.#onStockTrade?.(trade);
       });
     } catch (error) {
       this.#recordError(error);

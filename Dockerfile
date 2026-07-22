@@ -22,7 +22,7 @@ ENV NODE_ENV=production \
     TRADING_MODE=paper \
     ENABLE_LIVE_ORDERS=false \
     HEALTH_HOST=0.0.0.0 \
-    HEALTH_PORT=8080
+    HEALTH_PORT=3001
 WORKDIR /app
 
 COPY --chown=node:node package.json package-lock.json ./
@@ -30,10 +30,10 @@ COPY --chown=node:node --from=production-dependencies /app/node_modules ./node_m
 COPY --chown=node:node --from=build /app/dist ./dist
 
 USER node
-EXPOSE 8080
+EXPOSE 3001
 STOPSIGNAL SIGTERM
 
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-  CMD ["node", "-e", "fetch('http://127.0.0.1:' + (process.env.HEALTH_PORT || '8080') + '/live').then((response) => process.exit(response.ok ? 0 : 1)).catch(() => process.exit(1))"]
+  CMD ["node", "-e", "fetch('http://127.0.0.1:' + (process.env.HEALTH_PORT || '3001') + '/live').then((response) => process.exit(response.ok ? 0 : 1)).catch(() => process.exit(1))"]
 
 CMD ["node", "dist/src/main.js"]

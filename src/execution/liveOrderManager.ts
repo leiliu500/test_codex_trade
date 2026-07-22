@@ -324,11 +324,14 @@ export class LiveOrderManager {
           incrementalQuantity, incrementalPrice, cumulativeQuantity: totalFilled, position: this.#position,
         });
       } else if (this.#position) {
-        const realizedPnl = 100 * incrementalQuantity * (incrementalPrice - this.#position.averageEntryPrice);
+        const exitingPosition = { ...this.#position };
+        const realizedPnl = 100 * incrementalQuantity * (incrementalPrice - exitingPosition.averageEntryPrice);
         this.#risk.recordRealizedPnl(timestamp, realizedPnl);
         this.#position.quantity -= incrementalQuantity;
         await this.#audit(timestamp, "exit_fill", {
           reason: pending.exitReason, incrementalQuantity, incrementalPrice, realizedPnl,
+          symbol: exitingPosition.symbol, direction: exitingPosition.direction,
+          entryTimestamp: exitingPosition.entryTimestamp, averageEntryPrice: exitingPosition.averageEntryPrice,
           remainingQuantity: this.#position.quantity,
         });
         if (this.#position.quantity === 0) this.#position = undefined;
