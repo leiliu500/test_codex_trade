@@ -1,0 +1,8 @@
+{
+  "version": "example-only",
+  "trainingStartDate": "2026-01-02",
+  "trainingEndDate": "2026-03-31",
+  "sourceDataVersion": "replace-me",
+  "parameterHash": "replace-me",
+  "buckets": {}
+}
