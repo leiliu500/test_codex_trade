@@ -158,6 +158,12 @@ test("end-to-end paper runtime arms SIP/OPRA and routes an eligible signal to a 
   assert.equal(evaluation?.data.decision, "SIGNAL");
   assert.equal(evaluation?.data.direction, "BULLISH");
   assert.ok(Array.isArray(evaluation?.data.directions));
+  const selection = recorder.events.find((event) => event.type === "live_signal_selection");
+  assert.equal(selection?.data.candidate, callSymbol);
+  assert.deepEqual(selection?.data.candidateQuote, { timestamp: now, bidPrice: 1.99, askPrice: 2.01 });
+  assert.equal(typeof (selection?.data.candidateMetrics as Record<string, unknown> | undefined)?.spreadPct, "number");
+  const orderRequest = recorder.events.find((event) => event.type === "broker_order_request");
+  assert.equal(orderRequest?.data.signalId, selection?.data.signalId);
   await runtime.close();
   assert.deepEqual(history.priorityChanges.at(-1), []);
 });

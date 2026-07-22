@@ -76,10 +76,14 @@ test("exit manager enforces emergency and price precedence", () => {
   const manager = new ExitManager(defaultConfig);
   const entry = zonedDateTimeToEpoch("2026-07-22", "11:00:00");
   const position: PositionState = { symbol: "OPT", direction: "BULLISH", quantity: 1, averageEntryPrice: 2,
-    entryTimestamp: entry, stopPrice: 1.5, targetPrice: 2.7, highWaterMark: 2 };
+    entryTimestamp: entry, stopPrice: 1.5, targetPrice: 2.7, highWaterMark: 2, lowWaterMark: 2 };
   assert.equal(manager.evaluate({ ...exitContext(position, entry + 1000, 1.4), killSwitch: true }).reason, "KILL_SWITCH");
-  assert.equal(manager.evaluate(exitContext(position, entry + 1000, 1.4)).reason, "HARD_STOP");
-  assert.equal(manager.evaluate(exitContext(position, entry + 1000, 2.8)).reason, "PROFIT_TARGET");
+  const hardStop = manager.evaluate(exitContext(position, entry + 1000, 1.4));
+  assert.equal(hardStop.reason, "HARD_STOP");
+  assert.equal(hardStop.updatedPosition.lowWaterMark, 1.4);
+  const profitTarget = manager.evaluate(exitContext(position, entry + 1000, 2.8));
+  assert.equal(profitTarget.reason, "PROFIT_TARGET");
+  assert.equal(profitTarget.updatedPosition.highWaterMark, 2.8);
   const trailing = { ...position, highWaterMark: 2.5 };
   assert.equal(manager.evaluate(exitContext(trailing, entry + 1000, 2.04)).reason, "TRAILING_STOP");
   assert.equal(manager.evaluate(exitContext(position, entry + defaultConfig.risk.maxHoldSec * 1000, 2)).reason, "MAX_HOLD");
@@ -92,7 +96,7 @@ test("opposite regimes and 8-second trend invalidation exit", () => {
   const manager = new ExitManager(defaultConfig);
   const entry = zonedDateTimeToEpoch("2026-07-22", "11:00:00");
   const position: PositionState = { symbol: "OPT", direction: "BULLISH", quantity: 1, averageEntryPrice: 2,
-    entryTimestamp: entry, stopPrice: 1.5, targetPrice: 2.7, highWaterMark: 2 };
+    entryTimestamp: entry, stopPrice: 1.5, targetPrice: 2.7, highWaterMark: 2, lowWaterMark: 2 };
   const down: RegimeDecision = { regime: "STRONG_DOWN", confidence: 1, reasons: [] };
   assert.equal(manager.evaluate({ ...exitContext(position, entry + 1000, 2), regime: down }).reason, "OPPOSITE_REGIME");
   const feature = { medium: { normalizedSlope: -1 }, price: 499, vwap: { sessionVwap: 500 } } as unknown as FeatureSnapshot;

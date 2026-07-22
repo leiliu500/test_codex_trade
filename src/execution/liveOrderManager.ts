@@ -165,7 +165,9 @@ export class LiveOrderManager {
         quote: request.quote,
       });
       state = this.#orders.submit(state, clock.timestamp);
-      await this.#audit(clock.timestamp, "broker_order_request", { purpose: "ENTRY", order: state });
+      await this.#audit(clock.timestamp, "broker_order_request", {
+        purpose: "ENTRY", signalId: request.signal.id, order: state,
+      });
       const brokerOrder = await this.#submitOrRecover(state, clock.timestamp);
       this.#knownClientOrderIds.add(clientOrderId);
       this.#pending = {
@@ -321,6 +323,7 @@ export class LiveOrderManager {
         this.#position = reconcileEntryExposure(pending.state, pending.direction, timestamp, this.#risk, this.#position);
         if (firstFill) this.#risk.recordEntry(timestamp);
         await this.#audit(timestamp, "entry_fill", {
+          signalId: pending.signalId,
           incrementalQuantity, incrementalPrice, cumulativeQuantity: totalFilled, position: this.#position,
         });
       } else if (this.#position) {
@@ -332,6 +335,7 @@ export class LiveOrderManager {
           reason: pending.exitReason, incrementalQuantity, incrementalPrice, realizedPnl,
           symbol: exitingPosition.symbol, direction: exitingPosition.direction,
           entryTimestamp: exitingPosition.entryTimestamp, averageEntryPrice: exitingPosition.averageEntryPrice,
+          highWaterMark: exitingPosition.highWaterMark, lowWaterMark: exitingPosition.lowWaterMark,
           remainingQuantity: this.#position.quantity,
         });
         if (this.#position.quantity === 0) this.#position = undefined;

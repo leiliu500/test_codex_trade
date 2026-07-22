@@ -9,6 +9,16 @@ export interface DashboardSignal {
   regime: string;
   projectedMoveBps?: number;
   candidate?: string;
+  evaluatedContracts?: number;
+  selectionScore?: number;
+  delta?: number;
+  costMarginBps?: number;
+  requiredMoveBps?: number;
+  decisionQuoteTimestamp?: number;
+  decisionBid?: number;
+  decisionAsk?: number;
+  decisionMid?: number;
+  decisionSpreadPct?: number;
   status: "FIRED" | "NO_ELIGIBLE_OPTION" | "ORDER_SUBMITTED" | "ORDER_BLOCKED";
   brokerOrderId?: string;
   reasons: string[];
@@ -17,22 +27,31 @@ export interface DashboardSignal {
 export interface DashboardOrder {
   clientOrderId: string;
   brokerOrderId?: string;
+  signalId?: string;
   timestamp: number;
   updatedAt: number;
   purpose: "ENTRY" | "EXIT";
   symbol: string;
   side: string;
   quantity: number;
+  initialLimitPrice: number;
   limitPrice: number;
   status: string;
   filledQuantity: number;
   averageFillPrice?: number;
   replacements: number;
+  firstFillTimestamp?: number;
+  completedTimestamp?: number;
+  fillPercentage?: number;
+  firstFillLatencyMs?: number;
+  completionLatencyMs?: number;
+  priceImprovementBps?: number;
   exitReason?: string;
 }
 
 export interface DashboardTrade {
   id: string;
+  signalId?: string;
   symbol: string;
   direction: string;
   entryTimestamp: number;
@@ -50,9 +69,73 @@ export interface DashboardTrade {
   unrealizedReturnPct?: number;
   stopPrice?: number;
   targetPrice?: number;
+  highWaterMark: number;
+  lowWaterMark: number;
+  maxFavorableExcursionPct?: number;
+  maxAdverseExcursionPct?: number;
+  capturePct?: number;
   returnPct?: number;
   exitReason?: string;
   status: "OPEN" | "PARTIAL_EXIT" | "CLOSED";
+}
+
+export interface DashboardEntryQuality {
+  signalId: string;
+  signalTimestamp: number;
+  sessionBucket: string;
+  symbol?: string;
+  direction: string;
+  kind: string;
+  regime: string;
+  projectedMoveBps?: number;
+  status: "NO_OPTION" | "BLOCKED" | "WORKING" | "FILLED" | "OPEN" | "WIN" | "LOSS" | "FLAT";
+  decisionBid?: number;
+  decisionAsk?: number;
+  decisionSpreadPct?: number;
+  selectionScore?: number;
+  costMarginBps?: number;
+  orderTimestamp?: number;
+  firstFillTimestamp?: number;
+  signalToOrderMs?: number;
+  orderToFirstFillMs?: number;
+  signalToFirstFillMs?: number;
+  quantity?: number;
+  filledQuantity?: number;
+  initialLimitPrice?: number;
+  finalLimitPrice?: number;
+  averageFillPrice?: number;
+  entrySlippageBps?: number;
+  priceImprovementBps?: number;
+  replacements?: number;
+  maxFavorableExcursionPct?: number;
+  maxAdverseExcursionPct?: number;
+  realizedPnl?: number;
+  returnPct?: number;
+  capturePct?: number;
+  holdMs?: number;
+  exitReason?: string;
+}
+
+export interface DashboardTuningSummary {
+  signals: number;
+  submitted: number;
+  filled: number;
+  closed: number;
+  fillRate: number;
+  replacementRate: number;
+  avgSignalToOrderMs?: number;
+  avgOrderToFirstFillMs?: number;
+  avgSignalToFirstFillMs?: number;
+  avgEntrySlippageBps?: number;
+  avgDecisionSpreadPct?: number;
+  avgMaxFavorableExcursionPct?: number;
+  avgMaxAdverseExcursionPct?: number;
+  avgCapturePct?: number;
+}
+
+export interface DashboardTuning {
+  summary: DashboardTuningSummary;
+  entries: DashboardEntryQuality[];
 }
 
 export interface DashboardActiveOrder {
@@ -161,6 +244,7 @@ export interface TradingDashboardSnapshot {
   activeOrders: DashboardActiveOrder[];
   decisions: DashboardDecision[];
   liveData: DashboardLiveData;
+  tuning: DashboardTuning;
   signals: DashboardSignal[];
   orders: DashboardOrder[];
   trades: DashboardTrade[];
@@ -168,7 +252,8 @@ export interface TradingDashboardSnapshot {
 
 interface MutableTrade extends Omit<DashboardTrade,
   "remainingQuantity" | "currentBid" | "currentAsk" | "markPrice" | "lastQuoteTimestamp" |
-  "unrealizedPnl" | "unrealizedReturnPct"> {
+  "unrealizedPnl" | "unrealizedReturnPct" | "maxFavorableExcursionPct" |
+  "maxAdverseExcursionPct" | "capturePct"> {
   exitedQuantity: number;
   exitNotional: number;
 }
@@ -238,6 +323,12 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
         if (!previous || timestamp >= previous.timestamp) {
           this.#latestOptionQuotes.set(event.symbol, { timestamp, bidPrice, askPrice });
         }
+        const trade = this.#openTrades.get(event.symbol);
+        if (trade && timestamp >= trade.entryTimestamp) {
+          const mark = (bidPrice + askPrice) / 2;
+          trade.highWaterMark = Math.max(trade.highWaterMark, mark);
+          trade.lowWaterMark = Math.min(trade.lowWaterMark, mark);
+        }
         this.#pruneMap(this.#latestOptionQuotes, 5_000);
       }
     }
@@ -275,6 +366,10 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
     const orders = [...this.#orders.values()];
     const activeOrders = this.#activeOrders(generatedAt, orders);
     const unrealizedPnl = activeOrders.reduce((sum, order) => sum + (order.unrealizedPnl ?? 0), 0);
+    const publicOrders = orders.slice(-250).reverse().map((order) => this.#publicOrder(order, generatedAt));
+    const publicTrades = [...closed, ...this.#openTrades.values()]
+      .slice(-250).reverse().map((trade) => this.#publicTrade(trade));
+    const entryQuality = this.#entryQuality(orders, [...closed, ...this.#openTrades.values()]);
     return {
       startedAt: this.#startedAt,
       generatedAt,
@@ -300,6 +395,10 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
       },
       activeOrders,
       decisions: this.#decisions.slice(0, 100).map(publicDecision),
+      tuning: {
+        summary: tuningSummary(entryQuality),
+        entries: entryQuality,
+      },
       liveData: {
         persistenceEnabled: this.#persistenceEnabled,
         quoteSampleIntervalMs: this.#quoteSampleIntervalMs,
@@ -315,8 +414,8 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
         recentEvents: this.#recentMarketEvents.map((event) => ({ ...event })),
       },
       signals: [...this.#signals.values()].slice(-250).reverse().map((signal) => ({ ...signal, reasons: [...signal.reasons] })),
-      orders: orders.slice(-250).reverse().map((order) => ({ ...order })),
-      trades: [...closed, ...this.#openTrades.values()].slice(-250).reverse().map((trade) => this.#publicTrade(trade)),
+      orders: publicOrders,
+      trades: publicTrades,
     };
   }
 
@@ -456,6 +555,92 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
     return cards.sort((a, b) => (b.entryTimestamp ?? 0) - (a.entryTimestamp ?? 0));
   }
 
+  #publicOrder(order: DashboardOrder, generatedAt: number): DashboardOrder {
+    const fillPercentage = order.quantity > 0 ? 100 * order.filledQuantity / order.quantity : 0;
+    const firstFillLatencyMs = order.firstFillTimestamp === undefined
+      ? undefined : Math.max(0, order.firstFillTimestamp - order.timestamp);
+    const completionLatencyMs = order.completedTimestamp === undefined
+      ? undefined : Math.max(0, order.completedTimestamp - order.timestamp);
+    const priceImprovementBps = order.averageFillPrice === undefined || order.initialLimitPrice <= 0
+      ? undefined
+      : 10_000 * (order.side.toLowerCase() === "sell"
+        ? order.averageFillPrice - order.initialLimitPrice
+        : order.initialLimitPrice - order.averageFillPrice) / order.initialLimitPrice;
+    return {
+      ...order,
+      updatedAt: isWorkingOrder(order) ? Math.max(order.updatedAt, generatedAt) : order.updatedAt,
+      fillPercentage,
+      ...(firstFillLatencyMs !== undefined ? { firstFillLatencyMs } : {}),
+      ...(completionLatencyMs !== undefined ? { completionLatencyMs } : {}),
+      ...(priceImprovementBps !== undefined ? { priceImprovementBps } : {}),
+    };
+  }
+
+  #entryQuality(orders: DashboardOrder[], trades: MutableTrade[]): DashboardEntryQuality[] {
+    const entryOrders = orders.filter((order) => order.purpose === "ENTRY");
+    return [...this.#signals.values()].slice(-500).reverse().map((signal) => {
+      const order = entryOrders.find((candidate) => candidate.signalId === signal.id)
+        ?? entryOrders.find((candidate) => signal.brokerOrderId && candidate.brokerOrderId === signal.brokerOrderId)
+        ?? [...entryOrders].reverse().find((candidate) => candidate.symbol === signal.candidate &&
+          candidate.timestamp >= signal.timestamp && candidate.timestamp - signal.timestamp <= 120_000);
+      const trade = trades.find((candidate) => candidate.signalId === signal.id)
+        ?? [...trades].reverse().find((candidate) => candidate.symbol === signal.candidate &&
+          candidate.entryTimestamp >= signal.timestamp && candidate.entryTimestamp - signal.timestamp <= 180_000);
+      const firstFillTimestamp = order?.firstFillTimestamp ?? trade?.entryTimestamp;
+      const averageFillPrice = trade?.averageEntryPrice ?? order?.averageFillPrice;
+      const excursions = trade ? tradeExcursions(trade) : undefined;
+      const entrySlippageBps = averageFillPrice !== undefined && signal.decisionAsk !== undefined && signal.decisionAsk > 0
+        ? 10_000 * (averageFillPrice - signal.decisionAsk) / signal.decisionAsk : undefined;
+      const priceImprovementBps = averageFillPrice !== undefined && order && order.initialLimitPrice > 0
+        ? 10_000 * (order.initialLimitPrice - averageFillPrice) / order.initialLimitPrice : undefined;
+      let status: DashboardEntryQuality["status"] = signal.candidate ? "BLOCKED" : "NO_OPTION";
+      if (order && isWorkingOrder(order)) status = "WORKING";
+      if (firstFillTimestamp !== undefined) status = "FILLED";
+      if (trade && trade.status !== "CLOSED") status = "OPEN";
+      if (trade?.status === "CLOSED") status = trade.realizedPnl > 0 ? "WIN" : trade.realizedPnl < 0 ? "LOSS" : "FLAT";
+      return {
+        signalId: signal.id,
+        signalTimestamp: signal.timestamp,
+        sessionBucket: sessionBucket(signal.timestamp),
+        ...(signal.candidate ? { symbol: signal.candidate } : {}),
+        direction: signal.direction,
+        kind: signal.kind,
+        regime: signal.regime,
+        ...(signal.projectedMoveBps !== undefined ? { projectedMoveBps: signal.projectedMoveBps } : {}),
+        status,
+        ...(signal.decisionBid !== undefined ? { decisionBid: signal.decisionBid } : {}),
+        ...(signal.decisionAsk !== undefined ? { decisionAsk: signal.decisionAsk } : {}),
+        ...(signal.decisionSpreadPct !== undefined ? { decisionSpreadPct: signal.decisionSpreadPct } : {}),
+        ...(signal.selectionScore !== undefined ? { selectionScore: signal.selectionScore } : {}),
+        ...(signal.costMarginBps !== undefined ? { costMarginBps: signal.costMarginBps } : {}),
+        ...(order ? {
+          orderTimestamp: order.timestamp,
+          signalToOrderMs: Math.max(0, order.timestamp - signal.timestamp),
+          quantity: order.quantity,
+          filledQuantity: order.filledQuantity,
+          initialLimitPrice: order.initialLimitPrice,
+          finalLimitPrice: order.limitPrice,
+          replacements: order.replacements,
+        } : {}),
+        ...(firstFillTimestamp !== undefined ? {
+          firstFillTimestamp,
+          signalToFirstFillMs: Math.max(0, firstFillTimestamp - signal.timestamp),
+          ...(order ? { orderToFirstFillMs: Math.max(0, firstFillTimestamp - order.timestamp) } : {}),
+        } : {}),
+        ...(averageFillPrice !== undefined ? { averageFillPrice } : {}),
+        ...(entrySlippageBps !== undefined ? { entrySlippageBps } : {}),
+        ...(priceImprovementBps !== undefined ? { priceImprovementBps } : {}),
+        ...(excursions ? excursions : {}),
+        ...(trade ? {
+          realizedPnl: trade.realizedPnl,
+          ...(trade.returnPct !== undefined ? { returnPct: trade.returnPct } : {}),
+          ...(trade.exitTimestamp !== undefined ? { holdMs: Math.max(0, trade.exitTimestamp - trade.entryTimestamp) } : {}),
+          ...(trade.exitReason ? { exitReason: trade.exitReason } : {}),
+        } : {}),
+      };
+    });
+  }
+
   #publicTrade(trade: MutableTrade): DashboardTrade {
     const remainingQuantity = Math.max(0, trade.quantity - trade.exitedQuantity);
     const quote = trade.status === "CLOSED" ? undefined : this.#latestOptionQuotes.get(trade.symbol);
@@ -463,8 +648,10 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
     const unrealizedPnl = markPrice === undefined
       ? undefined : 100 * remainingQuantity * (markPrice - trade.averageEntryPrice);
     const openCost = 100 * remainingQuantity * trade.averageEntryPrice;
+    const excursions = tradeExcursions(trade);
     return {
       id: trade.id,
+      ...(trade.signalId ? { signalId: trade.signalId } : {}),
       symbol: trade.symbol,
       direction: trade.direction,
       entryTimestamp: trade.entryTimestamp,
@@ -486,6 +673,9 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
       } : {}),
       ...(trade.stopPrice !== undefined ? { stopPrice: trade.stopPrice } : {}),
       ...(trade.targetPrice !== undefined ? { targetPrice: trade.targetPrice } : {}),
+      highWaterMark: trade.highWaterMark,
+      lowWaterMark: trade.lowWaterMark,
+      ...excursions,
       ...(trade.returnPct !== undefined ? { returnPct: trade.returnPct } : {}),
       ...(trade.exitReason ? { exitReason: trade.exitReason } : {}),
       status: trade.status,
@@ -496,6 +686,16 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
     const id = stringValue(event.data.signalId);
     if (!id) return;
     const candidate = stringValue(event.data.candidate);
+    const metrics = recordValue(event.data.candidateMetrics);
+    const eventQuote = recordValue(event.data.candidateQuote);
+    const liveQuote = candidate ? this.#latestOptionQuotes.get(candidate) : undefined;
+    const decisionBid = numberValue(eventQuote.bidPrice) ?? liveQuote?.bidPrice;
+    const decisionAsk = numberValue(eventQuote.askPrice) ?? liveQuote?.askPrice;
+    const decisionMid = numberValue(metrics.mid) ?? (decisionBid !== undefined && decisionAsk !== undefined
+      ? (decisionBid + decisionAsk) / 2 : undefined);
+    const decisionSpreadPct = numberValue(metrics.spreadPct) ??
+      (decisionBid !== undefined && decisionAsk !== undefined && decisionMid !== undefined && decisionMid > 0
+        ? (decisionAsk - decisionBid) / decisionMid : undefined);
     this.#signals.set(id, {
       id,
       timestamp: numberValue(event.data.timestamp) ?? event.timestamp,
@@ -505,6 +705,19 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
       ...(numberValue(event.data.projectedMoveBps) !== undefined
         ? { projectedMoveBps: numberValue(event.data.projectedMoveBps)! } : {}),
       ...(candidate ? { candidate } : {}),
+      ...(numberValue(event.data.evaluatedContracts) !== undefined
+        ? { evaluatedContracts: numberValue(event.data.evaluatedContracts)! } : {}),
+      ...(numberValue(metrics.score) !== undefined ? { selectionScore: numberValue(metrics.score)! } : {}),
+      ...(numberValue(metrics.delta) !== undefined ? { delta: numberValue(metrics.delta)! } : {}),
+      ...(numberValue(metrics.costMarginBps) !== undefined ? { costMarginBps: numberValue(metrics.costMarginBps)! } : {}),
+      ...(numberValue(metrics.requiredMoveBps) !== undefined ? { requiredMoveBps: numberValue(metrics.requiredMoveBps)! } : {}),
+      ...(numberValue(eventQuote.timestamp) !== undefined
+        ? { decisionQuoteTimestamp: numberValue(eventQuote.timestamp)! }
+        : liveQuote ? { decisionQuoteTimestamp: liveQuote.timestamp } : {}),
+      ...(decisionBid !== undefined ? { decisionBid } : {}),
+      ...(decisionAsk !== undefined ? { decisionAsk } : {}),
+      ...(decisionMid !== undefined ? { decisionMid } : {}),
+      ...(decisionSpreadPct !== undefined ? { decisionSpreadPct } : {}),
       status: candidate ? "FIRED" : "NO_ELIGIBLE_OPTION",
       reasons: [],
     });
@@ -530,15 +743,23 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
     const clientOrderId = stringValue(order.clientOrderId);
     if (!clientOrderId) return;
     const purpose = event.data.purpose === "EXIT" ? "EXIT" : "ENTRY";
+    const symbol = stringValue(order.symbol) ?? "UNKNOWN";
+    const timestamp = numberValue(order.submittedAt) ?? event.timestamp;
+    const signalId = purpose === "ENTRY"
+      ? stringValue(event.data.signalId) ?? this.#matchingSignal(symbol, timestamp)?.id
+      : undefined;
+    const limitPrice = numberValue(order.limitPrice) ?? 0;
     this.#orders.set(clientOrderId, {
       clientOrderId,
-      timestamp: numberValue(order.submittedAt) ?? event.timestamp,
+      ...(signalId ? { signalId } : {}),
+      timestamp,
       updatedAt: event.timestamp,
       purpose,
-      symbol: stringValue(order.symbol) ?? "UNKNOWN",
+      symbol,
       side: stringValue(order.side) ?? "UNKNOWN",
       quantity: numberValue(order.requestedQuantity) ?? 0,
-      limitPrice: numberValue(order.limitPrice) ?? 0,
+      initialLimitPrice: limitPrice,
+      limitPrice,
       status: stringValue(order.status) ?? "SUBMITTED",
       filledQuantity: numberValue(order.filledQuantity) ?? 0,
       ...(positiveNumber(order.averageFillPrice) !== undefined ? { averageFillPrice: positiveNumber(order.averageFillPrice)! } : {}),
@@ -557,13 +778,18 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
     if (!existing) return;
     existing.updatedAt = event.timestamp;
     existing.status = stringValue(broker.status) ?? stringValue(local.status) ?? existing.status;
-    existing.filledQuantity = numberValue(broker.filledQuantity) ?? numberValue(local.filledQuantity) ?? existing.filledQuantity;
+    const filledQuantity = numberValue(broker.filledQuantity) ?? numberValue(local.filledQuantity) ?? existing.filledQuantity;
+    if (existing.filledQuantity === 0 && filledQuantity > 0 && existing.firstFillTimestamp === undefined) {
+      existing.firstFillTimestamp = event.timestamp;
+    }
+    existing.filledQuantity = filledQuantity;
     existing.limitPrice = numberValue(local.limitPrice) ?? existing.limitPrice;
     existing.replacements = numberValue(local.replacements) ?? existing.replacements;
     const brokerOrderId = stringValue(broker.id);
     if (brokerOrderId) existing.brokerOrderId = brokerOrderId;
     const averageFillPrice = positiveNumber(broker.averageFillPrice) ?? positiveNumber(local.averageFillPrice);
     if (averageFillPrice !== undefined) existing.averageFillPrice = averageFillPrice;
+    if (!isWorkingOrder(existing) && existing.completedTimestamp === undefined) existing.completedTimestamp = event.timestamp;
   }
 
   #recordOrderReplacement(event: AuditEvent): void {
@@ -591,21 +817,34 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
     const averageEntryPrice = numberValue(position.averageEntryPrice) ?? numberValue(event.data.incrementalPrice) ?? 0;
     const stopPrice = numberValue(position.stopPrice);
     const targetPrice = numberValue(position.targetPrice);
+    const signalId = stringValue(event.data.signalId)
+      ?? [...this.#orders.values()].reverse().find((order) => order.purpose === "ENTRY" && order.symbol === symbol)?.signalId
+      ?? this.#matchingSignal(symbol, entryTimestamp)?.id;
+    const order = [...this.#orders.values()].reverse().find((candidate) =>
+      candidate.purpose === "ENTRY" && (candidate.signalId === signalId || candidate.symbol === symbol));
+    if (order && order.firstFillTimestamp === undefined) order.firstFillTimestamp = event.timestamp;
+    const highWaterMark = numberValue(position.highWaterMark) ?? averageEntryPrice;
+    const lowWaterMark = numberValue(position.lowWaterMark) ?? averageEntryPrice;
     if (existing) {
       existing.quantity = Math.max(existing.quantity, quantity);
       existing.averageEntryPrice = averageEntryPrice;
       if (stopPrice !== undefined) existing.stopPrice = stopPrice;
       if (targetPrice !== undefined) existing.targetPrice = targetPrice;
+      existing.highWaterMark = Math.max(existing.highWaterMark, highWaterMark);
+      existing.lowWaterMark = Math.min(existing.lowWaterMark, lowWaterMark);
       existing.status = "OPEN";
     } else {
       this.#openTrades.set(symbol, {
         id, symbol,
+        ...(signalId ? { signalId } : {}),
         direction: stringValue(position.direction) ?? "UNKNOWN",
         entryTimestamp,
         quantity,
         averageEntryPrice,
         ...(stopPrice !== undefined ? { stopPrice } : {}),
         ...(targetPrice !== undefined ? { targetPrice } : {}),
+        highWaterMark,
+        lowWaterMark,
         realizedPnl: 0,
         status: "OPEN",
         exitedQuantity: 0,
@@ -626,6 +865,8 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
         entryTimestamp,
         quantity: numberValue(event.data.incrementalQuantity) ?? 0,
         averageEntryPrice: numberValue(event.data.averageEntryPrice) ?? 0,
+        highWaterMark: numberValue(event.data.highWaterMark) ?? numberValue(event.data.averageEntryPrice) ?? 0,
+        lowWaterMark: numberValue(event.data.lowWaterMark) ?? numberValue(event.data.averageEntryPrice) ?? 0,
         realizedPnl: 0,
         status: "OPEN",
         exitedQuantity: 0,
@@ -635,6 +876,10 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
     }
     const quantity = numberValue(event.data.incrementalQuantity) ?? 0;
     const price = numberValue(event.data.incrementalPrice) ?? 0;
+    const highWaterMark = numberValue(event.data.highWaterMark);
+    const lowWaterMark = numberValue(event.data.lowWaterMark);
+    if (highWaterMark !== undefined) trade.highWaterMark = Math.max(trade.highWaterMark, highWaterMark);
+    if (lowWaterMark !== undefined) trade.lowWaterMark = Math.min(trade.lowWaterMark, lowWaterMark);
     trade.exitedQuantity += quantity;
     trade.exitNotional += quantity * price;
     trade.realizedPnl += numberValue(event.data.realizedPnl) ?? 0;
@@ -661,6 +906,79 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
       map.delete(first.value);
     }
   }
+
+  #matchingSignal(symbol: string, timestamp: number): DashboardSignal | undefined {
+    return [...this.#signals.values()].reverse().find((signal) => signal.candidate === symbol &&
+      signal.timestamp <= timestamp && timestamp - signal.timestamp <= 120_000);
+  }
+}
+
+function tradeExcursions(trade: Pick<MutableTrade,
+"averageEntryPrice" | "highWaterMark" | "lowWaterMark" | "status" | "returnPct">): {
+  maxFavorableExcursionPct?: number;
+  maxAdverseExcursionPct?: number;
+  capturePct?: number;
+} {
+  if (!(trade.averageEntryPrice > 0)) return {};
+  const maxFavorableExcursionPct = 100 * (trade.highWaterMark - trade.averageEntryPrice) / trade.averageEntryPrice;
+  const maxAdverseExcursionPct = 100 * (trade.lowWaterMark - trade.averageEntryPrice) / trade.averageEntryPrice;
+  const capturePct = trade.status === "CLOSED" && trade.returnPct !== undefined && maxFavorableExcursionPct > 0
+    ? 100 * trade.returnPct / maxFavorableExcursionPct : undefined;
+  return {
+    maxFavorableExcursionPct,
+    maxAdverseExcursionPct,
+    ...(capturePct !== undefined ? { capturePct } : {}),
+  };
+}
+
+function tuningSummary(entries: DashboardEntryQuality[]): DashboardTuningSummary {
+  const submitted = entries.filter((entry) => entry.orderTimestamp !== undefined);
+  const filled = submitted.filter((entry) => entry.firstFillTimestamp !== undefined);
+  const closed = entries.filter((entry) => ["WIN", "LOSS", "FLAT"].includes(entry.status));
+  const avgSignalToOrderMs = average(entries.map((entry) => entry.signalToOrderMs));
+  const avgOrderToFirstFillMs = average(entries.map((entry) => entry.orderToFirstFillMs));
+  const avgSignalToFirstFillMs = average(entries.map((entry) => entry.signalToFirstFillMs));
+  const avgEntrySlippageBps = average(entries.map((entry) => entry.entrySlippageBps));
+  const avgDecisionSpreadPct = average(entries.map((entry) => entry.decisionSpreadPct));
+  const avgMaxFavorableExcursionPct = average(entries.map((entry) => entry.maxFavorableExcursionPct));
+  const avgMaxAdverseExcursionPct = average(entries.map((entry) => entry.maxAdverseExcursionPct));
+  const avgCapturePct = average(entries.map((entry) => entry.capturePct));
+  return {
+    signals: entries.length,
+    submitted: submitted.length,
+    filled: filled.length,
+    closed: closed.length,
+    fillRate: submitted.length > 0 ? filled.length / submitted.length : 0,
+    replacementRate: submitted.length > 0
+      ? submitted.filter((entry) => (entry.replacements ?? 0) > 0).length / submitted.length : 0,
+    ...(avgSignalToOrderMs !== undefined ? { avgSignalToOrderMs } : {}),
+    ...(avgOrderToFirstFillMs !== undefined ? { avgOrderToFirstFillMs } : {}),
+    ...(avgSignalToFirstFillMs !== undefined ? { avgSignalToFirstFillMs } : {}),
+    ...(avgEntrySlippageBps !== undefined ? { avgEntrySlippageBps } : {}),
+    ...(avgDecisionSpreadPct !== undefined ? { avgDecisionSpreadPct } : {}),
+    ...(avgMaxFavorableExcursionPct !== undefined ? { avgMaxFavorableExcursionPct } : {}),
+    ...(avgMaxAdverseExcursionPct !== undefined ? { avgMaxAdverseExcursionPct } : {}),
+    ...(avgCapturePct !== undefined ? { avgCapturePct } : {}),
+  };
+}
+
+function average(values: Array<number | undefined>): number | undefined {
+  const finite = values.filter((value): value is number => value !== undefined && Number.isFinite(value));
+  return finite.length > 0 ? finite.reduce((sum, value) => sum + value, 0) / finite.length : undefined;
+}
+
+function sessionBucket(timestamp: number): string {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/New_York", hourCycle: "h23", hour: "2-digit", minute: "2-digit",
+  }).formatToParts(timestamp);
+  const hour = Number(parts.find((part) => part.type === "hour")?.value ?? 0);
+  const minute = Number(parts.find((part) => part.type === "minute")?.value ?? 0);
+  const minutes = hour * 60 + minute;
+  if (minutes < 10 * 60) return "09:30–10:00";
+  if (minutes < 11 * 60) return "10:00–11:00";
+  if (minutes < 13 * 60) return "11:00–13:00";
+  if (minutes < 15 * 60) return "13:00–15:00";
+  return "15:00–close";
 }
 
 const DECISION_EVENT_TYPES = new Set([
@@ -810,7 +1128,7 @@ export function tradingDashboardHtml(): string {
   return `<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>SPY 0DTE Trading Dashboard</title><style>
-:root{color-scheme:dark;--bg:#07111f;--panel:#0e1b2e;--line:#20324b;--text:#e7eef9;--muted:#91a4bd;--green:#35d07f;--red:#ff667a;--blue:#58a6ff;--amber:#f5c451}*{box-sizing:border-box}body{margin:0;background:linear-gradient(135deg,#06101c,#0a1830);color:var(--text);font:14px ui-sans-serif,system-ui,sans-serif}main{max-width:1500px;margin:auto;padding:24px}header{display:flex;justify-content:space-between;gap:18px;align-items:center;margin-bottom:18px}h1{font-size:24px;margin:0}h2{font-size:16px;margin:0 0 12px}.sub,.muted{color:var(--muted)}#state{display:flex;align-items:center;gap:8px;font-weight:700;padding:8px 12px;border:1px solid var(--line);border-radius:999px}.pulse-dot{width:9px;height:9px;border-radius:50%;background:currentColor;box-shadow:0 0 0 0 currentColor;animation:pulse 1.8s infinite}@keyframes pulse{70%{box-shadow:0 0 0 7px transparent}}.ok{color:var(--green)}.degraded{color:var(--amber)}.halted{color:var(--red)}.liveness-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(185px,1fr));gap:10px;margin-bottom:18px}.status-card{background:#0b192b;border:1px solid var(--line);border-radius:10px;padding:12px}.status-card .label{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.05em}.status-card strong{display:block;margin:5px 0 3px;font-size:14px}.status-detail{color:var(--muted);font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.tabs{display:flex;gap:5px;border-bottom:1px solid var(--line);margin-bottom:16px}.tab{appearance:none;border:0;border-bottom:2px solid transparent;background:transparent;color:var(--muted);font:inherit;font-weight:700;padding:11px 16px;cursor:pointer}.tab:hover{color:var(--text)}.tab.active{color:var(--blue);border-bottom-color:var(--blue)}.tab-panel{display:none}.tab-panel.active{display:block}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:12px;margin-bottom:18px}.card,.panel{background:rgba(14,27,46,.94);border:1px solid var(--line);border-radius:12px;box-shadow:0 10px 30px #0003}.card{padding:14px}.card .value{font-size:23px;font-weight:750;margin-top:6px}.panel{padding:16px;margin:14px 0;overflow:auto}.live-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(310px,1fr));gap:14px}.live-card{background:linear-gradient(145deg,#12243d,#0b1729);border:1px solid #294262;border-radius:13px;padding:16px;min-width:0;box-shadow:inset 3px 0 0 var(--blue)}.live-card.profit{box-shadow:inset 3px 0 0 var(--green)}.live-card.loss{box-shadow:inset 3px 0 0 var(--red)}.live-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}.live-symbol{font-weight:750;font-size:16px;overflow-wrap:anywhere}.badge,.source{display:inline-block;margin-top:5px;padding:3px 7px;border-radius:999px;background:#58a6ff1c;color:var(--blue);font-size:11px;font-weight:700;letter-spacing:.04em}.source{margin:0}.live-pnl{text-align:right;font-size:22px;font-weight:800}.live-return{text-align:right;font-size:12px;margin-top:3px}.live-fields{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin-top:16px}.live-field span{display:block;color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.04em;margin-bottom:4px}.live-field strong{font-size:14px}.order-strip{border-top:1px solid var(--line);margin-top:15px;padding-top:12px;display:flex;justify-content:space-between;gap:10px;color:var(--muted);font-size:12px}.empty{color:var(--muted);padding:22px;text-align:center;border:1px dashed var(--line);border-radius:10px}.section-note{color:var(--muted);font-size:12px;margin:-6px 0 12px}.decision-reasons{max-width:560px;white-space:normal;line-height:1.45}.outcome{font-weight:750}.outcome.pass{color:var(--green)}.outcome.block{color:var(--amber)}table{border-collapse:collapse;width:100%;min-width:850px}th,td{text-align:left;padding:9px 10px;border-bottom:1px solid var(--line);white-space:nowrap}th{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.04em}tbody tr:hover{background:#ffffff08}.positive{color:var(--green)}.negative{color:var(--red)}@media(max-width:700px){main{padding:14px}header{align-items:flex-start;flex-direction:column}.live-fields{grid-template-columns:repeat(2,minmax(0,1fr))}.tab{padding:10px}}
+:root{color-scheme:dark;--bg:#07111f;--panel:#0e1b2e;--line:#20324b;--text:#e7eef9;--muted:#91a4bd;--green:#35d07f;--red:#ff667a;--blue:#58a6ff;--amber:#f5c451}*{box-sizing:border-box}body{margin:0;background:linear-gradient(135deg,#06101c,#0a1830);color:var(--text);font:14px ui-sans-serif,system-ui,sans-serif}main{max-width:1500px;margin:auto;padding:24px}header{display:flex;justify-content:space-between;gap:18px;align-items:center;margin-bottom:18px}h1{font-size:24px;margin:0}h2{font-size:16px;margin:0 0 12px}.sub,.muted{color:var(--muted)}#state{display:flex;align-items:center;gap:8px;font-weight:700;padding:8px 12px;border:1px solid var(--line);border-radius:999px}.pulse-dot{width:9px;height:9px;border-radius:50%;background:currentColor;box-shadow:0 0 0 0 currentColor;animation:pulse 1.8s infinite}@keyframes pulse{70%{box-shadow:0 0 0 7px transparent}}.ok{color:var(--green)}.degraded{color:var(--amber)}.halted{color:var(--red)}.liveness-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(185px,1fr));gap:10px;margin-bottom:18px}.status-card{background:#0b192b;border:1px solid var(--line);border-radius:10px;padding:12px}.status-card .label{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.05em}.status-card strong{display:block;margin:5px 0 3px;font-size:14px}.status-detail{color:var(--muted);font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.tabs{display:flex;gap:5px;border-bottom:1px solid var(--line);margin-bottom:16px}.tab{appearance:none;border:0;border-bottom:2px solid transparent;background:transparent;color:var(--muted);font:inherit;font-weight:700;padding:11px 16px;cursor:pointer}.tab:hover{color:var(--text)}.tab.active{color:var(--blue);border-bottom-color:var(--blue)}.tab-panel{display:none}.tab-panel.active{display:block}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:12px;margin-bottom:18px}.card,.panel{background:rgba(14,27,46,.94);border:1px solid var(--line);border-radius:12px;box-shadow:0 10px 30px #0003}.card{padding:14px}.card .value{font-size:23px;font-weight:750;margin-top:6px}.panel{padding:16px;margin:14px 0;overflow:auto}.live-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(310px,1fr));gap:14px}.live-card{background:linear-gradient(145deg,#12243d,#0b1729);border:1px solid #294262;border-radius:13px;padding:16px;min-width:0;box-shadow:inset 3px 0 0 var(--blue)}.live-card.profit{box-shadow:inset 3px 0 0 var(--green)}.live-card.loss{box-shadow:inset 3px 0 0 var(--red)}.live-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}.live-symbol{font-weight:750;font-size:16px;overflow-wrap:anywhere}.badge,.source{display:inline-block;margin-top:5px;padding:3px 7px;border-radius:999px;background:#58a6ff1c;color:var(--blue);font-size:11px;font-weight:700;letter-spacing:.04em}.source{margin:0}.live-pnl{text-align:right;font-size:22px;font-weight:800}.live-return{text-align:right;font-size:12px;margin-top:3px}.live-fields{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin-top:16px}.live-field span{display:block;color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.04em;margin-bottom:4px}.live-field strong{font-size:14px}.order-strip{border-top:1px solid var(--line);margin-top:15px;padding-top:12px;display:flex;justify-content:space-between;gap:10px;color:var(--muted);font-size:12px}.empty{color:var(--muted);padding:22px;text-align:center;border:1px dashed var(--line);border-radius:10px}.section-note{color:var(--muted);font-size:12px;margin:-6px 0 12px}.decision-reasons{max-width:560px;white-space:normal;line-height:1.45}.outcome{font-weight:750}.outcome.pass{color:var(--green)}.outcome.block{color:var(--amber)}.tune-controls{display:flex;align-items:end;gap:12px;flex-wrap:wrap;margin-bottom:14px}.tune-control{display:grid;gap:5px}.tune-control label{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.04em}.tune-control select{min-width:150px;background:#0a1728;color:var(--text);border:1px solid var(--line);border-radius:7px;padding:8px 10px}.legend{display:flex;gap:16px;flex-wrap:wrap;color:var(--muted);font-size:11px;margin:8px 0}.quality-status{font-weight:750}.quality-status.WIN,.quality-status.FILLED,.quality-status.OPEN{color:var(--green)}.quality-status.LOSS,.quality-status.BLOCKED{color:var(--red)}.quality-status.WORKING,.quality-status.NO_OPTION{color:var(--amber)}table{border-collapse:collapse;width:100%;min-width:850px}th,td{text-align:left;padding:9px 10px;border-bottom:1px solid var(--line);white-space:nowrap}th{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.04em}tbody tr:hover{background:#ffffff08}.positive{color:var(--green)}.negative{color:var(--red)}@media(max-width:700px){main{padding:14px}header{align-items:flex-start;flex-direction:column}.live-fields{grid-template-columns:repeat(2,minmax(0,1fr))}.tab{padding:10px}.tune-control{width:100%}.tune-control select{width:100%}}
 </style></head><body><main><header><div><h1>SPY 0DTE Option Day-Trade Dashboard</h1><div class="sub">Live SIP signals · OPRA options · Alpaca paper execution · PostgreSQL history</div></div><div id="state"><span class="pulse-dot"></span><span id="stateText">Loading…</span></div></header>
 <section class="liveness-grid" aria-label="System liveness">
 <div class="status-card"><div class="label">Engine heartbeat</div><strong id="engineState">Connecting</strong><div class="status-detail" id="engineDetail">Waiting for dashboard API</div></div>
@@ -820,7 +1138,7 @@ export function tradingDashboardHtml(): string {
 <div class="status-card"><div class="label">Paper broker</div><strong id="brokerState">Checking</strong><div class="status-detail" id="brokerDetail">Verifying execution connection</div></div>
 <div class="status-card"><div class="label">Market clock</div><strong id="marketState">Checking</strong><div class="status-detail" id="marketDetail">Waiting for broker clock</div></div>
 </section>
-<nav class="tabs" aria-label="Dashboard views"><button class="tab active" data-tab="tradingTab" aria-selected="true">Trading</button><button class="tab" data-tab="liveDataTab" aria-selected="false">Live Data</button></nav>
+<nav class="tabs" aria-label="Dashboard views"><button class="tab active" data-tab="tradingTab" aria-selected="true">Trading</button><button class="tab" data-tab="tuningTab" aria-selected="false">Entry &amp; Order Tuning</button><button class="tab" data-tab="liveDataTab" aria-selected="false">Live Data</button></nav>
 <div class="tab-panel active" id="tradingTab">
 <section class="cards">
 <div class="card"><div class="muted">Entries Fired</div><div class="value" id="entries">0</div></div>
@@ -838,6 +1156,28 @@ export function tradingDashboardHtml(): string {
 <section class="panel"><h2>Entries Fired</h2><table><thead><tr><th>Time</th><th>Direction</th><th>Kind</th><th>Regime</th><th>Projected</th><th>Option</th><th>Status</th><th>Reason</th></tr></thead><tbody id="signals"></tbody></table></section>
 <section class="panel"><h2>Orders &amp; Executions</h2><table><thead><tr><th>Time</th><th>Purpose</th><th>Option</th><th>Side</th><th>Qty</th><th>Limit</th><th>Filled</th><th>Avg Fill</th><th>Status</th></tr></thead><tbody id="orders"></tbody></table></section>
 <section class="panel"><h2>Trade Performance</h2><table><thead><tr><th>Entry</th><th>Exit</th><th>Option</th><th>Direction</th><th>Qty</th><th>Entry Px</th><th>Exit Px</th><th>P&amp;L</th><th>Return</th><th>Exit Reason</th><th>Status</th></tr></thead><tbody id="trades"></tbody></table></section>
+</div>
+<div class="tab-panel" id="tuningTab">
+<section class="panel"><h2>Quality Filters</h2><div class="section-note">Compare like-for-like entries before changing thresholds. Small samples are directional evidence, not proof.</div><div class="tune-controls">
+<div class="tune-control"><label for="tuneDirection">Direction</label><select id="tuneDirection"><option value="ALL">All directions</option></select></div>
+<div class="tune-control"><label for="tuneRegime">Regime</label><select id="tuneRegime"><option value="ALL">All regimes</option></select></div>
+<div class="tune-control"><label for="tuneOutcome">Outcome</label><select id="tuneOutcome"><option value="ALL">All outcomes</option></select></div>
+<div class="tune-control"><label for="tuneBreakdown">Break down by</label><select id="tuneBreakdown"><option value="regime">Regime</option><option value="kind">Signal kind</option><option value="direction">Direction</option><option value="sessionBucket">Session time</option></select></div>
+</div><div class="legend"><span>Slippage: positive = paid above decision ask</span><span>Improvement: positive = fill better than submitted limit</span><span>MFE / MAE: best / worst option-mid move observed after entry</span><span>Times use causal audit timestamps</span></div></section>
+<section class="cards">
+<div class="card"><div class="muted">Filtered Signals</div><div class="value" id="tuneSignals">0</div></div>
+<div class="card"><div class="muted">Fill Rate</div><div class="value" id="tuneFillRate">0%</div></div>
+<div class="card"><div class="muted">Signal → Order</div><div class="value" id="tuneSignalOrder">—</div></div>
+<div class="card"><div class="muted">Order → Fill</div><div class="value" id="tuneOrderFill">—</div></div>
+<div class="card"><div class="muted">Entry Slippage</div><div class="value" id="tuneSlippage">—</div></div>
+<div class="card"><div class="muted">Replacement Rate</div><div class="value" id="tuneReplacements">0%</div></div>
+<div class="card"><div class="muted">Average MFE</div><div class="value" id="tuneMfe">—</div></div>
+<div class="card"><div class="muted">Average MAE</div><div class="value" id="tuneMae">—</div></div>
+<div class="card"><div class="muted">Profit Capture</div><div class="value" id="tuneCapture">—</div></div>
+</section>
+<section class="panel"><h2>Entry Timing &amp; Quality</h2><div class="section-note">Trace each strategy signal through option selection, broker timing, execution cost, post-entry excursion, and final outcome.</div><table><thead><tr><th>Signal</th><th>Option / Setup</th><th>Status</th><th>Decision Bid / Ask</th><th>Spread</th><th>Signal → Order</th><th>Order → Fill</th><th>Fill</th><th>Slippage</th><th>Replaces</th><th>MFE</th><th>MAE</th><th>Return / P&amp;L</th><th>Exit</th></tr></thead><tbody id="tuningEntries"></tbody></table></section>
+<section class="panel"><h2>Order Execution Quality</h2><div class="section-note">Initial versus final limits reveal chasing; first-fill and completion time reveal whether passive pricing is too slow.</div><table><thead><tr><th>Submitted</th><th>Purpose</th><th>Option</th><th>Qty</th><th>Initial Limit</th><th>Final Limit</th><th>Average Fill</th><th>Fill %</th><th>First Fill</th><th>Complete</th><th>Improvement</th><th>Replaces</th><th>Status</th></tr></thead><tbody id="tuningOrders"></tbody></table></section>
+<section class="panel"><h2>Setup Comparison</h2><div class="section-note">Use sample count with fill, win, latency, slippage, and excursion together; do not optimize on P&amp;L alone.</div><table><thead><tr><th>Group</th><th>Signals</th><th>Filled</th><th>Fill Rate</th><th>Closed</th><th>Win Rate</th><th>Average P&amp;L</th><th>Average Return</th><th>Avg Slippage</th><th>Order → Fill</th><th>MFE</th><th>MAE</th></tr></thead><tbody id="tuningGroups"></tbody></table></section>
 </div>
 <div class="tab-panel" id="liveDataTab">
 <section class="cards">
@@ -859,10 +1199,21 @@ function renderLiveOrders(items){const root=$('liveOrders');if(!items||items.len
 function setStatus(valueId,detailId,value,detail,level){$(valueId).textContent=value;$(valueId).className=level;$(detailId).textContent=detail}function age(ms){return Number.isFinite(ms)?duration(ms)+' ago':'No events yet'}function storagePolicy(event,live){if(!live.persistenceEnabled)return 'Disabled';if(event.type==='stock_quote'||event.type==='option_quote')return (live.quoteSampleIntervalMs||0)+' ms baseline · active option full';return 'Full retention'}
 function outcomeClass(value){return ['SIGNAL','SELECTED','ALLOWED','SUBMITTED','REQUESTED','FILLED'].includes(value)?'outcome pass':['NO_SIGNAL','NO_ELIGIBLE_OPTION','BLOCKED','SKIPPED'].includes(value)?'outcome block':'outcome'}
 function decisionDetail(item){const details=[...(item.reasons||[])];for(const direction of item.directions||[]){const failedVotes=(direction.votes||[]).filter(v=>!v.passed).map(v=>v.name);const result=direction.passed?'PASS':(direction.reasons||[]).slice(0,6).join(', ');details.push(direction.direction+': '+result+(failedVotes.length?' · failed votes '+failedVotes.join(', '):''))}return details.join(' · ')||'All configured gates passed'}
+const percent=(value,d=1)=>Number.isFinite(value)?num(value,d)+'%':'—',latency=value=>!Number.isFinite(value)?'—':value<1000?Math.round(value)+' ms':value<60000?num(value/1000,2)+' s':duration(value),signedBps=value=>Number.isFinite(value)?(value>0?'+':'')+num(value,1)+' bps':'—';
+function tuneAverage(values){const finite=values.filter(Number.isFinite);return finite.length?finite.reduce((sum,value)=>sum+value,0)/finite.length:undefined}
+function tuneStats(items){const submitted=items.filter(x=>x.orderTimestamp!==undefined),filled=submitted.filter(x=>x.firstFillTimestamp!==undefined),closed=items.filter(x=>['WIN','LOSS','FLAT'].includes(x.status));return{signals:items.length,submitted:submitted.length,filled:filled.length,closed:closed.length,fillRate:submitted.length?filled.length/submitted.length:0,replacementRate:submitted.length?submitted.filter(x=>(x.replacements||0)>0).length/submitted.length:0,winRate:closed.length?closed.filter(x=>x.status==='WIN').length/closed.length:0,avgPnl:tuneAverage(closed.map(x=>x.realizedPnl)),avgReturn:tuneAverage(closed.map(x=>x.returnPct)),avgSignalOrder:tuneAverage(items.map(x=>x.signalToOrderMs)),avgOrderFill:tuneAverage(items.map(x=>x.orderToFirstFillMs)),avgSlippage:tuneAverage(items.map(x=>x.entrySlippageBps)),avgMfe:tuneAverage(items.map(x=>x.maxFavorableExcursionPct)),avgMae:tuneAverage(items.map(x=>x.maxAdverseExcursionPct)),avgCapture:tuneAverage(items.map(x=>x.capturePct))}}
+function updateSelect(id,values,label){const select=$(id),current=select.value,unique=[...new Set(values.filter(Boolean))].sort(),all=document.createElement('option');all.value='ALL';all.textContent=label;select.replaceChildren(all,...unique.map(value=>{const option=document.createElement('option');option.value=value;option.textContent=value.replaceAll('_',' ');return option}));select.value=unique.includes(current)?current:'ALL'}
+let latestTuning={entries:[]},latestQualityOrders=[];
+function renderTuning(tuning,orders){latestTuning=tuning||{entries:[]};latestQualityOrders=orders||[];const all=latestTuning.entries||[];updateSelect('tuneDirection',all.map(x=>x.direction),'All directions');updateSelect('tuneRegime',all.map(x=>x.regime),'All regimes');updateSelect('tuneOutcome',all.map(x=>x.status),'All outcomes');const direction=$('tuneDirection').value,regime=$('tuneRegime').value,outcome=$('tuneOutcome').value,items=all.filter(x=>(direction==='ALL'||x.direction===direction)&&(regime==='ALL'||x.regime===regime)&&(outcome==='ALL'||x.status===outcome)),stats=tuneStats(items);$('tuneSignals').textContent=count(stats.signals);$('tuneFillRate').textContent=percent(100*stats.fillRate);$('tuneSignalOrder').textContent=latency(stats.avgSignalOrder);$('tuneOrderFill').textContent=latency(stats.avgOrderFill);$('tuneSlippage').textContent=signedBps(stats.avgSlippage);$('tuneSlippage').className='value '+(stats.avgSlippage>0?'negative':Number.isFinite(stats.avgSlippage)?'positive':'');$('tuneReplacements').textContent=percent(100*stats.replacementRate);$('tuneMfe').textContent=percent(stats.avgMfe);$('tuneMfe').className='value '+(stats.avgMfe>0?'positive':'');$('tuneMae').textContent=percent(stats.avgMae);$('tuneMae').className='value '+(stats.avgMae<0?'negative':'');$('tuneCapture').textContent=percent(stats.avgCapture);
+rows('tuningEntries',items,[x=>({value:time(x.signalTimestamp)}),x=>({value:(x.symbol||'No option')+' · '+x.direction+' '+x.kind+' · '+x.regime}),x=>({value:x.status,cls:'quality-status '+x.status}),x=>({value:x.decisionBid===undefined?'—':money(x.decisionBid)+' / '+money(x.decisionAsk)}),x=>({value:x.decisionSpreadPct===undefined?'—':percent(100*x.decisionSpreadPct,2)}),x=>({value:latency(x.signalToOrderMs)}),x=>({value:latency(x.orderToFirstFillMs)}),x=>({value:x.averageFillPrice===undefined?'—':money(x.averageFillPrice)}),x=>({value:signedBps(x.entrySlippageBps),cls:x.entrySlippageBps>0?'negative':Number.isFinite(x.entrySlippageBps)?'positive':''}),x=>({value:x.replacements??'—'}),x=>({value:percent(x.maxFavorableExcursionPct),cls:x.maxFavorableExcursionPct>0?'positive':''}),x=>({value:percent(x.maxAdverseExcursionPct),cls:x.maxAdverseExcursionPct<0?'negative':''}),x=>({value:x.returnPct===undefined?'—':percent(x.returnPct)+' / '+money(x.realizedPnl),cls:x.realizedPnl>0?'positive':x.realizedPnl<0?'negative':''}),x=>({value:(x.exitReason||'—')+(x.holdMs===undefined?'':' · '+duration(x.holdMs))})],'No strategy entries match these filters.');
+const ids=new Set(items.map(x=>x.signalId)),filteredOrders=latestQualityOrders.filter(order=>direction==='ALL'&&regime==='ALL'&&outcome==='ALL'||(order.signalId&&ids.has(order.signalId)));rows('tuningOrders',filteredOrders,[x=>({value:time(x.timestamp)}),x=>({value:x.purpose}),x=>({value:x.symbol}),x=>({value:x.filledQuantity+' / '+x.quantity}),x=>({value:money(x.initialLimitPrice)}),x=>({value:money(x.limitPrice)}),x=>({value:x.averageFillPrice===undefined?'—':money(x.averageFillPrice)}),x=>({value:percent(x.fillPercentage)}),x=>({value:latency(x.firstFillLatencyMs)}),x=>({value:latency(x.completionLatencyMs)}),x=>({value:signedBps(x.priceImprovementBps),cls:x.priceImprovementBps>0?'positive':x.priceImprovementBps<0?'negative':''}),x=>({value:x.replacements}),x=>({value:x.status})],'No orders match these filters.');
+const key=$('tuneBreakdown').value,groups=new Map();for(const item of items){const label=item[key]||'UNKNOWN';if(!groups.has(label))groups.set(label,[]);groups.get(label).push(item)}const compared=[...groups.entries()].map(([label,group])=>({label,...tuneStats(group)})).sort((a,b)=>b.signals-a.signals);rows('tuningGroups',compared,[x=>({value:String(x.label).replaceAll('_',' ')}),x=>({value:x.signals}),x=>({value:x.filled}),x=>({value:percent(100*x.fillRate)}),x=>({value:x.closed}),x=>({value:percent(100*x.winRate)}),x=>({value:money(x.avgPnl),cls:x.avgPnl>0?'positive':x.avgPnl<0?'negative':''}),x=>({value:percent(x.avgReturn),cls:x.avgReturn>0?'positive':x.avgReturn<0?'negative':''}),x=>({value:signedBps(x.avgSlippage),cls:x.avgSlippage>0?'negative':x.avgSlippage<0?'positive':''}),x=>({value:latency(x.avgOrderFill)}),x=>({value:percent(x.avgMfe),cls:x.avgMfe>0?'positive':''}),x=>({value:percent(x.avgMae),cls:x.avgMae<0?'negative':''})],'No grouped samples match these filters.')}
 document.querySelectorAll('.tab').forEach(button=>button.addEventListener('click',()=>{document.querySelectorAll('.tab').forEach(tab=>{const active=tab===button;tab.classList.toggle('active',active);tab.setAttribute('aria-selected',String(active))});document.querySelectorAll('.tab-panel').forEach(panel=>panel.classList.toggle('active',panel.id===button.dataset.tab))}));
+['tuneDirection','tuneRegime','tuneOutcome','tuneBreakdown'].forEach(id=>$(id).addEventListener('change',()=>renderTuning(latestTuning,latestQualityOrders)));
 async function refresh(){try{const response=await fetch('/api/dashboard',{cache:'no-store'});if(!response.ok)throw new Error('Dashboard API '+response.status);const data=await response.json(),p=data.performance,h=data.health||{},live=data.liveData||{eventCounts:{},recentEvents:[],totalEvents:0,uptimeMs:0,persistenceEnabled:false,quoteSampleIntervalMs:0,retentionDays:0};$('stateText').textContent=(data.readiness||'unknown').toUpperCase()+' · '+(h.executionMode||'paper');$('state').className=data.readiness||'degraded';setStatus('engineState','engineDetail','LIVE','API heartbeat · uptime '+duration(live.uptimeMs),'ok');setStatus('sipState','sipDetail',h.websocketConnected?'CONNECTED':'DISCONNECTED',count(h.receivedStockQuotes??live.eventCounts.stock_quote)+' quotes · '+age(h.lastStockQuoteAgeMs),h.websocketConnected?'ok':'halted');setStatus('opraState','opraDetail',h.optionWebsocketConnected?'CONNECTED':'DISCONNECTED',count(h.receivedOptionQuotes??live.eventCounts.option_quote)+' quotes · '+age(h.lastOptionQuoteAgeMs),h.optionWebsocketConnected?'ok':'halted');const dbLevel=!live.persistenceEnabled?'degraded':h.recorderHealthy?'ok':'halted',retentionDetail=(live.quoteSampleIntervalMs===0?'full-resolution quotes':live.quoteSampleIntervalMs+' ms quote baseline')+' · '+live.retentionDays+'d raw retention';setStatus('databaseState','databaseDetail',!live.persistenceEnabled?'DISABLED':h.recorderHealthy?'WRITING':'UNHEALTHY',live.persistenceEnabled?retentionDetail:'Persistence is not enabled',dbLevel);setStatus('brokerState','brokerDetail',h.brokerAvailable?'CONNECTED':'UNAVAILABLE',(h.executionMode||'paper').toUpperCase()+' · '+count(h.openOrderCount)+' open order(s)',h.brokerAvailable?'ok':'degraded');setStatus('marketState','marketDetail',String(h.marketClockState||'unknown').replaceAll('-',' ').toUpperCase(),h.positionsReconciled?'Positions reconciled':'Reconciliation required',h.positionsReconciled?'ok':'halted');$('entries').textContent=p.entriesFired;$('entryOrders').textContent=p.entryOrders;$('closedTrades').textContent=p.closedTrades;$('winRate').textContent=(p.winRate*100).toFixed(1)+'%';$('pnl').textContent=money(p.realizedPnl);$('pnl').className='value '+(p.realizedPnl>0?'positive':p.realizedPnl<0?'negative':'');$('openPnl').textContent=money(p.unrealizedPnl);$('openPnl').className='value '+(p.unrealizedPnl>0?'positive':p.unrealizedPnl<0?'negative':'');$('totalPnl').textContent=money(p.totalPnl);$('totalPnl').className='value '+(p.totalPnl>0?'positive':p.totalPnl<0?'negative':'');$('profitFactor').textContent=p.profitFactor===null?'—':num(p.profitFactor);$('openTrades').textContent=p.openTrades;$('subscriptions').textContent=h.subscribedOptionContracts||0;$('feedEvents').textContent=count(live.totalEvents);$('sipQuotes').textContent=count(live.eventCounts.stock_quote);$('sipTrades').textContent=count(live.eventCounts.stock_trade);$('opraQuotes').textContent=count(live.eventCounts.option_quote);$('featureEvents').textContent=count(live.eventCounts.feature_snapshot);$('feedAge').textContent=live.lastEventAgeMs===undefined?'—':duration(live.lastEventAgeMs);renderLiveOrders(data.activeOrders);
 rows('signals',data.signals,[x=>({value:time(x.timestamp)}),x=>({value:x.direction}),x=>({value:x.kind}),x=>({value:x.regime}),x=>({value:num(x.projectedMoveBps)+' bps'}),x=>({value:x.candidate}),x=>({value:x.status}),x=>({value:(x.reasons||[]).join(', ')})]);
 rows('orders',data.orders,[x=>({value:time(x.timestamp)}),x=>({value:x.purpose}),x=>({value:x.symbol}),x=>({value:x.side}),x=>({value:x.quantity}),x=>({value:money(x.limitPrice)}),x=>({value:x.filledQuantity}),x=>({value:x.averageFillPrice?money(x.averageFillPrice):'—'}),x=>({value:x.status})]);
+renderTuning(data.tuning||{entries:[]},data.orders||[]);
 rows('trades',data.trades,[x=>({value:time(x.entryTimestamp)}),x=>({value:time(x.exitTimestamp)}),x=>({value:x.symbol}),x=>({value:x.direction}),x=>({value:x.quantity}),x=>({value:money(x.averageEntryPrice)}),x=>({value:x.averageExitPrice?money(x.averageExitPrice):'—'}),x=>({value:money(x.realizedPnl),cls:x.realizedPnl>0?'positive':x.realizedPnl<0?'negative':''}),x=>({value:x.returnPct===undefined?'—':num(x.returnPct)+'%'}),x=>({value:x.exitReason}),x=>({value:x.status})]);rows('decisions',data.decisions||[],[x=>({value:time(x.timestamp)}),x=>({value:x.stage.replaceAll('_',' ')}),x=>({value:x.outcome.replaceAll('_',' '),cls:outcomeClass(x.outcome)}),x=>({value:x.direction}),x=>({value:x.symbol}),x=>({value:x.summary}),x=>({value:decisionDetail(x),cls:'decision-reasons'})],'No entry evaluations yet. The engine heartbeat above remains active while feature coverage warms up.');rows('feedEventsBody',live.recentEvents||[],[x=>({value:time(x.receivedTimestamp)}),x=>({value:x.channel.replaceAll('_',' ')}),x=>({value:x.type.replaceAll('_',' ')}),x=>({value:x.symbol}),x=>({value:x.summary}),x=>({value:x.latencyMs+' ms'}),x=>({value:storagePolicy(x,live),cls:live.persistenceEnabled?'positive':'muted'})],'No market events received yet. Connection cards above continue to show system liveness.');$('updated').textContent='Updated '+new Date(data.generatedAt).toLocaleString()+' · dashboard refreshes every second';}catch(error){$('stateText').textContent='DASHBOARD ERROR';$('state').className='halted';$('updated').textContent=String(error)}}refresh();setInterval(refresh,1000);
 </script></body></html>`;
 }

@@ -77,6 +77,7 @@ export class RiskManager {
       stopPrice: Math.max(0.01, averageFillPrice * (1 - this.#config.risk.hardOptionStopPct)),
       targetPrice: averageFillPrice * (1 + this.#config.risk.optionProfitTargetPct),
       highWaterMark: averageFillPrice,
+      lowWaterMark: averageFillPrice,
     };
   }
 

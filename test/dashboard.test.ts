@@ -25,6 +25,8 @@ test("dashboard exposes liveness and feed tabs before any entries, orders, or hi
   const html = tradingDashboardHtml();
   assert.match(html, /Engine heartbeat/);
   assert.match(html, /data-tab="liveDataTab"/);
+  assert.match(html, /data-tab="tuningTab"/);
+  assert.match(html, /Entry &amp; Order Tuning/);
   assert.match(html, /Live Feed Into System/);
   assert.match(html, /Entry Evaluations &amp; Decisions/);
 });
@@ -33,13 +35,15 @@ test("dashboard reconstructs fired entries, broker execution, trades, and perfor
   const dashboard = new TradingDashboardStore(timestamp, true);
   dashboard.record(event("live_signal_selection", {
     signalId: "signal-1", timestamp, direction: "BULLISH", kind: "IMPULSE", regime: "STRONG_UP",
-    projectedMoveBps: 8.5, candidate: symbol,
+    projectedMoveBps: 8.5, candidate: symbol, evaluatedContracts: 24,
+    candidateMetrics: { score: 12.5, delta: 0.52, mid: 2, spreadPct: 0.02, costMarginBps: 3.1 },
+    candidateQuote: { timestamp, bidPrice: 1.98, askPrice: 2.02 },
   }));
   dashboard.record(event("broker_order_request", {
-    purpose: "ENTRY",
+    purpose: "ENTRY", signalId: "signal-1",
     order: {
       clientOrderId: "entry-1", symbol, side: "buy", requestedQuantity: 2, filledQuantity: 0,
-      averageFillPrice: 0, limitPrice: 2.01, status: "SUBMITTED", submittedAt: timestamp, replacements: 0,
+      averageFillPrice: 0, limitPrice: 2.01, status: "SUBMITTED", submittedAt: timestamp + 10, replacements: 0,
     },
   }, 10));
   dashboard.record(event("paper_order_submission_result", {
@@ -54,7 +58,7 @@ test("dashboard reconstructs fired entries, broker execution, trades, and perfor
     incrementalQuantity: 2, incrementalPrice: 2, cumulativeQuantity: 2,
     position: {
       symbol, direction: "BULLISH", quantity: 2, averageEntryPrice: 2, entryTimestamp: timestamp,
-      stopPrice: 1.5, targetPrice: 2.7,
+      stopPrice: 1.5, targetPrice: 2.7, highWaterMark: 2, lowWaterMark: 2,
     },
   }, 30));
   dashboard.recordMarketEvent({
@@ -100,7 +104,7 @@ test("dashboard reconstructs fired entries, broker execution, trades, and perfor
   dashboard.record(event("exit_fill", {
     reason: "PROFIT_TARGET", symbol, direction: "BULLISH", entryTimestamp: timestamp,
     averageEntryPrice: 2, incrementalQuantity: 2, incrementalPrice: 2.7,
-    realizedPnl: 140, remainingQuantity: 0,
+    realizedPnl: 140, remainingQuantity: 0, highWaterMark: 2.8, lowWaterMark: 1.8,
   }, 60_100));
   dashboard.record(event("broker_order_state", {
     purpose: "EXIT",
@@ -123,6 +127,25 @@ test("dashboard reconstructs fired entries, broker execution, trades, and perfor
   assert.equal(snapshot.orders.find((order) => order.clientOrderId === "entry-1")?.filledQuantity, 2);
   assert.equal(snapshot.trades[0]?.averageExitPrice, 2.7);
   assert.equal(snapshot.trades[0]?.exitReason, "PROFIT_TARGET");
+  assert.ok(Math.abs((snapshot.trades[0]?.maxFavorableExcursionPct ?? 0) - 40) < 1e-9);
+  assert.ok(Math.abs((snapshot.trades[0]?.maxAdverseExcursionPct ?? 0) + 10) < 1e-9);
+  assert.ok(Math.abs((snapshot.trades[0]?.capturePct ?? 0) - 87.5) < 1e-9);
+  const quality = snapshot.tuning.entries[0];
+  assert.equal(quality?.signalId, "signal-1");
+  assert.equal(quality?.status, "WIN");
+  assert.equal(quality?.signalToOrderMs, 10);
+  assert.equal(quality?.orderToFirstFillMs, 20);
+  assert.equal(quality?.signalToFirstFillMs, 30);
+  assert.ok(Math.abs((quality?.entrySlippageBps ?? 0) + 99.0099009901) < 1e-6);
+  assert.ok(Math.abs((quality?.priceImprovementBps ?? 0) - 49.7512437811) < 1e-6);
+  assert.equal(snapshot.tuning.summary.signals, 1);
+  assert.equal(snapshot.tuning.summary.filled, 1);
+  assert.equal(snapshot.tuning.summary.fillRate, 1);
+  assert.equal(snapshot.orders.find((order) => order.clientOrderId === "entry-1")?.firstFillLatencyMs, 20);
+  assert.equal(snapshot.orders.find((order) => order.clientOrderId === "entry-1")?.completionLatencyMs, 20);
   assert.match(tradingDashboardHtml(), /Orders &amp; Executions/);
   assert.match(tradingDashboardHtml(), /Live Orders/);
+  assert.match(tradingDashboardHtml(), /Entry Timing &amp; Quality/);
+  assert.match(tradingDashboardHtml(), /Order Execution Quality/);
+  assert.match(tradingDashboardHtml(), /Setup Comparison/);
 });

@@ -243,7 +243,8 @@ export class AlpacaTradingRestClient implements TradingRestClient {
       const type = parseOccSymbol(symbol)!.type === "put" ? "BEARISH" : "BULLISH";
       return {
         symbol, direction: type, quantity: Math.abs(Number(item.qty)), averageEntryPrice: price,
-        entryTimestamp: 0, stopPrice: 0, targetPrice: Number.POSITIVE_INFINITY, highWaterMark: price,
+        entryTimestamp: 0, stopPrice: 0, targetPrice: Number.POSITIVE_INFINITY,
+        highWaterMark: price, lowWaterMark: price,
       };
     });
   }

@@ -224,6 +224,7 @@ export class SpyOptionsTradingRuntime {
         const subscribedContracts = this.#contracts.filter((contract) => this.#subscribedSymbols.has(contract.symbol));
         const selection = this.#selector.select(signal, subscribedContracts, this.#book);
         const candidate = selection.selected;
+        const quote = candidate ? this.#book.get(candidate.symbol)?.quote : undefined;
         const signalEvent = {
           signalId: signal.id,
           timestamp: signal.timestamp,
@@ -232,6 +233,22 @@ export class SpyOptionsTradingRuntime {
           regime: signal.regime,
           projectedMoveBps: signal.projectedMoveBps,
           candidate: candidate?.symbol ?? null,
+          candidateMetrics: candidate ? {
+            score: candidate.score,
+            delta: candidate.delta,
+            gamma: candidate.gamma,
+            impliedVolatility: candidate.impliedVolatility,
+            mid: candidate.mid,
+            spreadPct: candidate.spreadPct,
+            equivalentUnderlyingCostBps: candidate.equivalentUnderlyingCostBps,
+            requiredMoveBps: candidate.requiredMoveBps,
+            costMarginBps: candidate.costMarginBps,
+          } : null,
+          candidateQuote: quote ? {
+            timestamp: quote.timestamp,
+            bidPrice: quote.bidPrice,
+            askPrice: quote.askPrice,
+          } : null,
           evaluatedContracts: selection.evaluations.length,
           rejectionCounts: selection.rejectionCounts,
           topCandidates: [...selection.evaluations]
@@ -250,7 +267,6 @@ export class SpyOptionsTradingRuntime {
         await this.#auditRuntime(signal.timestamp, "live_signal_selection", signalEvent);
         this.#emit("live_signal_selection", signalEvent);
         if (!candidate) return;
-        const quote = this.#book.get(candidate.symbol)?.quote;
         if (!quote) return;
         this.#history?.setPrioritySymbols?.(new Set([candidate.symbol]));
         let result;
