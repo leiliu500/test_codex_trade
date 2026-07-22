@@ -54,3 +54,63 @@ test("PostgreSQL history creates schema, batches market data, and durably insert
   assert.equal(store.healthy(), true);
   await store.close();
 });
+
+test("PostgreSQL history samples quote baselines but preserves priority option quotes at full resolution", async () => {
+  const client = new FakeDatabaseClient();
+  const store = new PostgresHistoryStore({
+    connectionString: "postgresql://unused", client, batchSize: 100, flushIntervalMs: 60_000,
+    quoteSampleIntervalMs: 250, retentionDays: 0,
+  });
+  await store.initialize();
+  const quote = (providerTimestamp: number) => ({
+    type: "option_quote" as const,
+    providerTimestamp,
+    receivedTimestamp: providerTimestamp + 1,
+    marketDate: "2026-07-22",
+    symbol: "SPY260722C00500000",
+    data: { bidPrice: 2, askPrice: 2.01 },
+  });
+  store.recordMarketEvent(quote(1_000));
+  store.recordMarketEvent(quote(1_100));
+  store.recordMarketEvent(quote(1_249));
+  store.recordMarketEvent(quote(1_250));
+  store.setPrioritySymbols(new Set(["SPY260722C00500000"]));
+  store.recordMarketEvent(quote(1_251));
+  store.recordMarketEvent(quote(1_252));
+  store.setPrioritySymbols(new Set());
+  store.recordMarketEvent(quote(1_300));
+  store.recordMarketEvent({
+    type: "stock_trade", providerTimestamp: 1_301, receivedTimestamp: 1_302, marketDate: "2026-07-22",
+    symbol: "SPY", data: { price: 500, size: 10 },
+  });
+  await store.flush();
+
+  const marketInsert = client.queries.find((query) => query.text.includes("INSERT INTO market_events"));
+  assert.equal(marketInsert?.values.length, 30);
+  assert.deepEqual(
+    marketInsert?.values.filter((_value, index) => index % 6 === 1),
+    [1_000, 1_250, 1_251, 1_252, 1_301],
+  );
+  await store.close();
+});
+
+test("PostgreSQL history applies bounded age cleanup only when retention is enabled", async () => {
+  const enabledClient = new FakeDatabaseClient();
+  const enabled = new PostgresHistoryStore({
+    connectionString: "postgresql://unused", client: enabledClient, retentionDays: 7,
+    retentionCleanupIntervalMs: 60_000,
+  });
+  await enabled.initialize();
+  const cleanup = enabledClient.queries.find((query) => query.text.includes("DELETE FROM market_events"));
+  assert.deepEqual(cleanup?.values, [7]);
+  assert.match(cleanup?.text ?? "", /LIMIT 100000/);
+  await enabled.close();
+
+  const disabledClient = new FakeDatabaseClient();
+  const disabled = new PostgresHistoryStore({
+    connectionString: "postgresql://unused", client: disabledClient, retentionDays: 0,
+  });
+  await disabled.initialize();
+  assert.equal(disabledClient.queries.some((query) => query.text.includes("DELETE FROM market_events")), false);
+  await disabled.close();
+});

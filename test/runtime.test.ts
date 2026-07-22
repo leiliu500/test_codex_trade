@@ -17,12 +17,16 @@ test("runtime environment is paper-safe and validates the health listener", () =
     stockDataFeed: "sip",
     optionDataFeed: "opra",
     historyDatabaseEnabled: false,
+    historyQuoteSampleMs: 250,
+    historyRetentionDays: 7,
     killSwitch: false,
     healthHost: "127.0.0.1",
     healthPort: 3001,
   });
   assert.throws(() => readEnvironment({ HEALTH_PORT: "0" }), /HEALTH_PORT/);
   assert.throws(() => readEnvironment({ HEALTH_PORT: "not-a-port" }), /HEALTH_PORT/);
+  assert.throws(() => readEnvironment({ MARKET_HISTORY_QUOTE_SAMPLE_MS: "-1" }), /QUOTE_SAMPLE/);
+  assert.throws(() => readEnvironment({ MARKET_HISTORY_RETENTION_DAYS: "3.5" }), /RETENTION_DAYS/);
   assert.throws(() => readEnvironment({ STOCK_DATA_FEED: "iex" }), /hard-limited.*SIP/i);
   assert.throws(() => readEnvironment({ OPTION_DATA_FEED: "indicative" }), /OPRA/i);
   assert.throws(() => readEnvironment({ ENABLE_LIVE_ORDERS: "true" }), /MARKET_DATA_ENABLED/);

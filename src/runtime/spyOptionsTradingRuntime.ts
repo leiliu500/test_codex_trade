@@ -131,6 +131,7 @@ export class SpyOptionsTradingRuntime {
       if (!account.active) throw new Error("Paper broker account is inactive or blocked");
       if (!account.optionsApproved) throw new Error("Paper broker account is not approved for options");
       this.#execution = await this.#orders.initialize(clock.timestamp);
+      this.#synchronizeHistoryPriorities();
       this.#positionsReconciled = true;
       this.#brokerAvailable = true;
       this.#lastSpot = (latestQuote.bidPrice + latestQuote.askPrice) / 2;
@@ -169,6 +170,7 @@ export class SpyOptionsTradingRuntime {
     await Promise.allSettled([this.#stockReceiver.close(), this.#optionStream.close()]);
     await this.#queue.drained();
     this.#optionConnected = false;
+    this.#history?.setPrioritySymbols?.(new Set());
   }
 
   async ingestFeature(feature: FeatureSnapshot): Promise<void> {
@@ -180,10 +182,44 @@ export class SpyOptionsTradingRuntime {
         this.#lastRegime = classifyRegime(feature, this.#config.regimes);
         await this.#refreshUniverse(feature.price, this.#now());
         await this.#tickExecution(this.#now());
-        if (!this.#executionEnabled || this.#killSwitch || this.#execution.halted ||
-            this.#execution.position || this.#execution.pending) return;
+        const runtimeBlocks: string[] = [];
+        if (!this.#executionEnabled) runtimeBlocks.push("EXECUTION_DISABLED");
+        if (this.#killSwitch) runtimeBlocks.push("KILL_SWITCH");
+        if (this.#execution.halted) runtimeBlocks.push("EXECUTION_HALTED");
+        if (this.#execution.position) runtimeBlocks.push("POSITION_ALREADY_OPEN");
+        if (this.#execution.pending) runtimeBlocks.push("ORDER_ALREADY_PENDING");
+        if (runtimeBlocks.length > 0) {
+          await this.#auditRuntime(feature.timestamp, "live_entry_evaluation", {
+            timestamp: feature.timestamp,
+            decision: "SKIPPED",
+            reasons: runtimeBlocks,
+            regime: this.#lastRegime.regime,
+            regimeConfidence: this.#lastRegime.confidence,
+            regimeReasons: this.#lastRegime.reasons,
+            directions: [],
+            feature: entryFeatureSummary(feature),
+          });
+          return;
+        }
 
-        const signal = this.#signals.evaluate(feature, this.#lastRegime);
+        const evaluation = this.#signals.evaluateDetailed(feature, this.#lastRegime);
+        const signal = evaluation.signal;
+        await this.#auditRuntime(feature.timestamp, "live_entry_evaluation", {
+          timestamp: feature.timestamp,
+          decision: signal ? "SIGNAL" : "NO_SIGNAL",
+          reasons: evaluation.reasons,
+          regime: this.#lastRegime.regime,
+          regimeConfidence: this.#lastRegime.confidence,
+          regimeReasons: this.#lastRegime.reasons,
+          directions: evaluation.directions,
+          ...(signal ? {
+            signalId: signal.id,
+            direction: signal.direction,
+            kind: signal.kind,
+            projectedMoveBps: signal.projectedMoveBps,
+          } : {}),
+          feature: entryFeatureSummary(feature),
+        });
         if (!signal) return;
         const subscribedContracts = this.#contracts.filter((contract) => this.#subscribedSymbols.has(contract.symbol));
         const selection = this.#selector.select(signal, subscribedContracts, this.#book);
@@ -196,17 +232,36 @@ export class SpyOptionsTradingRuntime {
           regime: signal.regime,
           projectedMoveBps: signal.projectedMoveBps,
           candidate: candidate?.symbol ?? null,
+          evaluatedContracts: selection.evaluations.length,
           rejectionCounts: selection.rejectionCounts,
+          topCandidates: [...selection.evaluations]
+            .sort((a, b) => (b.score ?? -Infinity) - (a.score ?? -Infinity))
+            .slice(0, 8)
+            .map((evaluation) => ({
+              symbol: evaluation.symbol,
+              eligible: evaluation.eligible,
+              ...(evaluation.score !== undefined ? { score: evaluation.score } : {}),
+              ...(evaluation.delta !== undefined ? { delta: evaluation.delta } : {}),
+              ...(evaluation.spreadPct !== undefined ? { spreadPct: evaluation.spreadPct } : {}),
+              ...(evaluation.costMarginBps !== undefined ? { costMarginBps: evaluation.costMarginBps } : {}),
+              rejectionReasons: evaluation.rejectionReasons,
+            })),
         };
         await this.#auditRuntime(signal.timestamp, "live_signal_selection", signalEvent);
         this.#emit("live_signal_selection", signalEvent);
         if (!candidate) return;
         const quote = this.#book.get(candidate.symbol)?.quote;
         if (!quote) return;
-        const result = await this.#orders.submitEntry({
-          timestamp: this.#now(), signal, candidate, quote, killSwitch: this.#killSwitch,
-        });
-        this.#execution = this.#orders.snapshot();
+        this.#history?.setPrioritySymbols?.(new Set([candidate.symbol]));
+        let result;
+        try {
+          result = await this.#orders.submitEntry({
+            timestamp: this.#now(), signal, candidate, quote, killSwitch: this.#killSwitch,
+          });
+        } finally {
+          this.#execution = this.#orders.snapshot();
+          this.#synchronizeHistoryPriorities();
+        }
         const submissionEvent = {
           signalId: signal.id,
           timestamp: this.#now(),
@@ -367,6 +422,12 @@ export class SpyOptionsTradingRuntime {
       killSwitch: this.#killSwitch,
     });
     this.#synchronizePositionLifecycle();
+    this.#synchronizeHistoryPriorities();
+  }
+
+  #synchronizeHistoryPriorities(): void {
+    const symbol = this.#execution.position?.symbol ?? this.#execution.pending?.order.symbol;
+    this.#history?.setPrioritySymbols?.(symbol ? new Set([symbol]) : new Set());
   }
 
   #synchronizePositionLifecycle(): void {
@@ -411,4 +472,26 @@ export class SpyOptionsTradingRuntime {
   }
 
   #emit(type: string, data: Record<string, unknown>): void { this.#onEvent?.(type, data); }
+}
+
+function entryFeatureSummary(feature: FeatureSnapshot): Record<string, unknown> {
+  return {
+    price: feature.price,
+    dataValid: feature.dataValid,
+    invalidReasons: feature.invalidReasons,
+    spreadBps: feature.spreadBps,
+    quoteAgeMs: feature.quoteAgeMs,
+    fastSlope: feature.fast.normalizedSlope,
+    fastAcceleration: feature.fast.normalizedAcceleration,
+    mediumSlope: feature.medium.normalizedSlope,
+    slowSlope: feature.slow.normalizedSlope,
+    ofi5: feature.ofi5,
+    ofi15: feature.ofi15,
+    efficiency60: feature.efficiency60,
+    sessionVwap: feature.vwap.sessionVwap ?? null,
+    openingRangeComplete: feature.openingRange.complete,
+    nearOpeningHigh: feature.openingRange.nearHigh,
+    nearOpeningLow: feature.openingRange.nearLow,
+    thresholds: feature.thresholds,
+  };
 }

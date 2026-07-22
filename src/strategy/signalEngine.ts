@@ -4,6 +4,21 @@ import { inSessionWindow } from "../utils/time.js";
 import { hashString, stableStringify } from "../utils/statistics.js";
 import { boundedProjectionBps } from "./projection.js";
 
+export interface SignalDirectionEvaluation {
+  direction: Direction;
+  passed: boolean;
+  reasons: string[];
+  votes: SignalVote[];
+  projectedMoveBps?: number;
+}
+
+export interface SignalEvaluation {
+  passed: boolean;
+  signal?: TradeSignal;
+  reasons: string[];
+  directions: SignalDirectionEvaluation[];
+}
+
 export class SignalEngine {
   readonly #config: EngineConfig;
   #lastSignalTimestamp = -Infinity;
@@ -17,36 +32,82 @@ export class SignalEngine {
   }
 
   evaluate(feature: FeatureSnapshot, regime: RegimeDecision): TradeSignal | undefined {
-    if (!feature.dataValid || !feature.openingRange.complete) return undefined;
-    if (!inSessionWindow(feature.timestamp, this.#config.session.entryStart, this.#config.session.entryEnd, this.#config.timeZone)) return undefined;
-    if (this.#config.signals.blockWhipsaw && regime.regime === "HIGH_VOL_WHIPSAW") return undefined;
-    if (feature.timestamp - this.#lastSignalTimestamp < this.#config.signals.minimumSignalIntervalSec * 1000) return undefined;
+    return this.evaluateDetailed(feature, regime).signal;
+  }
 
-    const candidates = (["BULLISH", "BEARISH"] as const)
-      .map((direction) => this.#evaluateDirection(direction, feature, regime))
-      .filter((signal): signal is TradeSignal => signal !== undefined);
-    if (candidates.length === 0) return undefined;
+  evaluateDetailed(feature: FeatureSnapshot, regime: RegimeDecision): SignalEvaluation {
+    const globalReasons: string[] = [];
+    if (!feature.dataValid) globalReasons.push(...(feature.invalidReasons.length > 0 ? feature.invalidReasons : ["FEATURE_DATA_INVALID"]));
+    if (!feature.openingRange.complete) globalReasons.push("OPENING_RANGE_INCOMPLETE");
+    if (!inSessionWindow(feature.timestamp, this.#config.session.entryStart, this.#config.session.entryEnd, this.#config.timeZone)) {
+      globalReasons.push("OUTSIDE_ENTRY_WINDOW");
+    }
+    if (this.#config.signals.blockWhipsaw && regime.regime === "HIGH_VOL_WHIPSAW") globalReasons.push("WHIPSAW_REGIME_BLOCKED");
+    if (feature.timestamp - this.#lastSignalTimestamp < this.#config.signals.minimumSignalIntervalSec * 1000) {
+      globalReasons.push("MINIMUM_SIGNAL_INTERVAL");
+    }
+    if (globalReasons.length > 0) return { passed: false, reasons: globalReasons, directions: [] };
+
+    const directions = (["BULLISH", "BEARISH"] as const).map((direction) => {
+      const reasons: string[] = [];
+      const votes: SignalVote[] = [];
+      const signal = this.#evaluateDirection(direction, feature, regime, reasons, votes);
+      return {
+        direction,
+        passed: signal !== undefined,
+        reasons: signal?.reasons ?? reasons,
+        votes,
+        ...(signal ? { projectedMoveBps: signal.projectedMoveBps, signal } : {}),
+      };
+    });
+    const candidates = directions.flatMap((direction) => direction.signal ? [direction.signal] : []);
+    if (candidates.length === 0) {
+      return {
+        passed: false,
+        reasons: ["NO_DIRECTION_PASSED"],
+        directions: directions.map(({ signal: _signal, ...direction }) => direction),
+      };
+    }
     candidates.sort((a, b) => {
       if (a.kind !== b.kind) return a.kind === "IMPULSE" ? -1 : 1;
       return b.projectedMoveBps - a.projectedMoveBps;
     });
+    const selected = candidates[0]!;
     this.#lastSignalTimestamp = feature.timestamp;
-    return candidates[0];
+    return {
+      passed: true,
+      signal: selected,
+      reasons: selected.reasons,
+      directions: directions.map(({ signal: _signal, ...direction }) => direction),
+    };
   }
 
-  #evaluateDirection(direction: Direction, f: FeatureSnapshot, regime: RegimeDecision): TradeSignal | undefined {
+  #evaluateDirection(
+    direction: Direction,
+    f: FeatureSnapshot,
+    regime: RegimeDecision,
+    blockedReasons: string[],
+    evaluationVotes: SignalVote[],
+  ): TradeSignal | undefined {
     const lastEntry = this.#lastEntries[direction];
-    if (lastEntry !== undefined && f.timestamp - lastEntry < this.#config.signals.sameDirectionCooldownSec * 1000) return undefined;
+    if (lastEntry !== undefined && f.timestamp - lastEntry < this.#config.signals.sameDirectionCooldownSec * 1000) {
+      blockedReasons.push("SAME_DIRECTION_COOLDOWN");
+      return undefined;
+    }
     const s = direction === "BULLISH" ? 1 : -1;
     const sessionVwap = f.vwap.sessionVwap;
-    if (sessionVwap === undefined) return undefined;
-    const structuralGate =
-      s * (f.price - sessionVwap) > 0 &&
-      s * f.medium.normalizedSlope > 0 &&
-      s * f.slow.normalizedSlope > 0 &&
-      (f.efficiency60 >= f.thresholds.efficiency60 ||
-       (f.medium.regression.r2 ?? -Infinity) >= this.#config.signals.minR2Medium);
-    if (!structuralGate) return undefined;
+    if (sessionVwap === undefined) {
+      blockedReasons.push("SESSION_VWAP_UNAVAILABLE");
+      return undefined;
+    }
+    if (!(s * (f.price - sessionVwap) > 0)) blockedReasons.push("PRICE_WRONG_SIDE_OF_SESSION_VWAP");
+    if (!(s * f.medium.normalizedSlope > 0)) blockedReasons.push("MEDIUM_SLOPE_MISALIGNED");
+    if (!(s * f.slow.normalizedSlope > 0)) blockedReasons.push("SLOW_SLOPE_MISALIGNED");
+    if (!(f.efficiency60 >= f.thresholds.efficiency60 ||
+          (f.medium.regression.r2 ?? -Infinity) >= this.#config.signals.minR2Medium)) {
+      blockedReasons.push("TREND_QUALITY_BELOW_THRESHOLD");
+    }
+    if (blockedReasons.length > 0) return undefined;
 
     const projection = boundedProjectionBps(
       f.fast.regression.slopeBpsPerSec ?? 0,
@@ -56,7 +117,10 @@ export class SignalEngine {
       this.#config.signals.projectionAccelerationRvCap,
     );
     const directionalProjection = s * projection.projectedMoveBps;
-    if (!(directionalProjection > 0)) return undefined;
+    if (!(directionalProjection > 0)) {
+      blockedReasons.push("PROJECTED_MOVE_NOT_DIRECTIONAL");
+      return undefined;
+    }
 
     const votes: SignalVote[] = [
       { name: "FAST_SLOPE", passed: s * f.fast.normalizedSlope >= f.thresholds.fastSlope,
@@ -68,6 +132,7 @@ export class SignalEngine {
       { name: "MICROPRICE_DISPLACEMENT", passed: s * f.micropriceDisplacementBps > 0,
         value: s * f.micropriceDisplacementBps, threshold: 0 },
     ];
+    evaluationVotes.push(...votes);
     const or = f.openingRange;
     const memory = this.#config.signals.breakoutMemorySec * 1000;
     const locationGate = direction === "BULLISH"
@@ -88,9 +153,21 @@ export class SignalEngine {
       s * (f.vwap.rollingVwapSlopeBpsPerSec ?? 0) > 0 &&
       s * f.fast.normalizedAcceleration >= this.#config.signals.grindNegativeAccelerationLimit &&
       s * f.ofi15 >= 0;
-    return grind ? this.#makeSignal(direction, "GRIND", directionalProjection, votes, f, regime, [
+    if (grind) return this.#makeSignal(direction, "GRIND", directionalProjection, votes, f, regime, [
       "structural gate passed", "persistent medium/slow slope", "rolling VWAP and OFI aligned", "acceleration within adverse limit",
-    ]) : undefined;
+    ]);
+    if (!locationGate) blockedReasons.push("OPENING_RANGE_LOCATION_NOT_CONFIRMED");
+    if (voteCount < this.#config.signals.impulseVotesRequired) {
+      blockedReasons.push(`IMPULSE_VOTES_${voteCount}_OF_${this.#config.signals.impulseVotesRequired}`);
+    }
+    if (!(s * f.medium.normalizedSlope >= this.#config.signals.grindMediumSlopeScore)) blockedReasons.push("GRIND_MEDIUM_SLOPE");
+    if (!(s * f.slow.normalizedSlope >= this.#config.signals.grindSlowSlopeScore)) blockedReasons.push("GRIND_SLOW_SLOPE");
+    if (!(s * (f.vwap.rollingVwapSlopeBpsPerSec ?? 0) > 0)) blockedReasons.push("GRIND_VWAP_SLOPE");
+    if (!(s * f.fast.normalizedAcceleration >= this.#config.signals.grindNegativeAccelerationLimit)) {
+      blockedReasons.push("GRIND_ACCELERATION");
+    }
+    if (!(s * f.ofi15 >= 0)) blockedReasons.push("GRIND_OFI_15");
+    return undefined;
   }
 
   #makeSignal(

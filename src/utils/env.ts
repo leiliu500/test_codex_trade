@@ -5,6 +5,8 @@ export interface RuntimeEnvironment {
   stockDataFeed: "sip";
   optionDataFeed: "opra";
   historyDatabaseEnabled: boolean;
+  historyQuoteSampleMs: number;
+  historyRetentionDays: number;
   databaseUrl?: string;
   killSwitch: boolean;
   healthHost: string;
@@ -20,10 +22,18 @@ export function readEnvironment(env: NodeJS.ProcessEnv = process.env): RuntimeEn
   const stockDataFeed = env.STOCK_DATA_FEED ?? "sip";
   const optionDataFeed = env.OPTION_DATA_FEED ?? "opra";
   const historyDatabaseEnabled = env.HISTORY_DATABASE_ENABLED === "true";
+  const historyQuoteSampleMs = Number(env.MARKET_HISTORY_QUOTE_SAMPLE_MS ?? "250");
+  const historyRetentionDays = Number(env.MARKET_HISTORY_RETENTION_DAYS ?? "7");
   const healthPort = Number(env.HEALTH_PORT ?? "3001");
   const healthHost = env.HEALTH_HOST?.trim() || "127.0.0.1";
   if (!Number.isInteger(healthPort) || healthPort < 1 || healthPort > 65_535) {
     throw new Error("HEALTH_PORT must be an integer between 1 and 65535");
+  }
+  if (!Number.isInteger(historyQuoteSampleMs) || historyQuoteSampleMs < 0 || historyQuoteSampleMs > 60_000) {
+    throw new Error("MARKET_HISTORY_QUOTE_SAMPLE_MS must be an integer between 0 and 60000");
+  }
+  if (!Number.isInteger(historyRetentionDays) || historyRetentionDays < 0 || historyRetentionDays > 3_650) {
+    throw new Error("MARKET_HISTORY_RETENTION_DAYS must be an integer between 0 and 3650");
   }
   if (stockDataFeed !== "sip") throw new Error("This runtime is hard-limited to the SPY SIP stock-data feed");
   if (optionDataFeed !== "opra") throw new Error("Executable option trading requires the real-time OPRA option-data feed");
@@ -49,6 +59,8 @@ export function readEnvironment(env: NodeJS.ProcessEnv = process.env): RuntimeEn
     stockDataFeed,
     optionDataFeed,
     historyDatabaseEnabled,
+    historyQuoteSampleMs,
+    historyRetentionDays,
     killSwitch: env.KILL_SWITCH === "true",
     healthHost,
     healthPort,

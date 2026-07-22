@@ -125,6 +125,29 @@ test("global gates block stale data, whipsaw, time violations, and cooldown only
   assert.equal(first.evaluate({ ...later, timestamp: later.timestamp + 6_000 }, classifyRegime(later, defaultConfig.regimes)), undefined);
 });
 
+test("detailed signal evaluation reports global and directional block decisions", () => {
+  const base = feature();
+  const invalid = new SignalEngine(defaultConfig).evaluateDetailed(
+    { ...base, dataValid: false, invalidReasons: ["STALE_QUOTE"] },
+    classifyRegime(base, defaultConfig.regimes),
+  );
+  assert.equal(invalid.passed, false);
+  assert.ok(invalid.reasons.includes("STALE_QUOTE"));
+  assert.equal(invalid.directions.length, 0);
+
+  const mixed = {
+    ...base,
+    medium: { ...base.medium, normalizedSlope: -0.2 },
+  };
+  const directional = new SignalEngine(defaultConfig).evaluateDetailed(
+    mixed,
+    classifyRegime(mixed, defaultConfig.regimes),
+  );
+  assert.equal(directional.passed, false);
+  assert.ok(directional.directions.some((item) => item.direction === "BULLISH" &&
+    item.reasons.includes("MEDIUM_SLOPE_MISALIGNED")));
+});
+
 test("option selector rejects wide cost and ranks an eligible liquid contract", () => {
   const f = feature();
   const signal = new SignalEngine(defaultConfig).evaluate(f, classifyRegime(f, defaultConfig.regimes))!;
