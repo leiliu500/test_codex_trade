@@ -37,6 +37,8 @@ docker-compose logs -f spy-options-engine
 
 Compose reads broker credentials from the local `.env` file at runtime and never copies that file into the image. It forces `TRADING_MODE=paper`, enables broker-backed paper orders, consumes SPY quotes/trades from SIP, and consumes executable option quotes from OPRA. It also starts PostgreSQL on the private Compose network; the database port is not exposed publicly. `/live` reports process liveness. `/ready` returns 200 only after PostgreSQL, both WebSocket feeds, paper account/options approval, and broker reconciliation are healthy. The Alpaca account must have real-time SIP and OPRA entitlement. Set `ENABLE_LIVE_ORDERS=false` to receive SIP without submitting paper orders; set `MARKET_DATA_ENABLED=false` as well for paper-idle mode. Readiness remains degraded in either reduced mode.
 
+When the broker clock reports the market closed, the trading runtime enters `market-closed-idle`: SIP and OPRA sockets are disconnected, option subscriptions are cleared, and market history, feature, signal, selection, risk, and order processing stop. The process, dashboard, PostgreSQL connection, and broker reconciliation remain available. A lightweight broker-clock check runs every 30 seconds so market data resumes automatically at the next open; `/ready` remains healthy while this intentional idle state is active.
+
 The image is multi-stage, runs as the unprivileged Node user, has a read-only root filesystem in Compose, and does not copy `.env`, credentials, replay data, tests, or development dependencies into the runtime image.
 
 Stop the service without removing application source or local data:

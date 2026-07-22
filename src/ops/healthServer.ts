@@ -21,6 +21,7 @@ export interface HealthState {
   reconnectAttempt?: number;
   lastStreamError?: string;
   optionWebsocketConnected?: boolean;
+  marketDataIdle?: boolean;
   executionEnabled?: boolean;
   executionMode?: "paper" | "live";
   accountOptionsApproved?: boolean;
@@ -44,7 +45,8 @@ export interface HealthState {
 
 export function healthReadiness(state: HealthState): { status: "ok" | "degraded" | "halted"; checks: HealthState } {
   if (state.killSwitch || !state.positionsReconciled || !state.recorderHealthy) return { status: "halted", checks: state };
-  if (!state.ready || !state.websocketConnected || (state.brokerRequired !== false && !state.brokerAvailable)) {
+  if (!state.ready || (!state.websocketConnected && !state.marketDataIdle) ||
+      (state.brokerRequired !== false && !state.brokerAvailable)) {
     return { status: "degraded", checks: state };
   }
   return { status: "ok", checks: state };

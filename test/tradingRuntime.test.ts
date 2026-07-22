@@ -40,23 +40,35 @@ test("option universe readiness follows the 0DTE cutoff while protecting open ex
 
 class FakeStockStream implements StockStream {
   handlers: StockStreamHandlers | undefined;
+  connectCalls = 0;
+  closeCalls = 0;
   async connect(handlers: StockStreamHandlers): Promise<void> {
+    this.connectCalls += 1;
     this.handlers = handlers;
     handlers.onState?.(true);
   }
-  async close(): Promise<void> { this.handlers?.onState?.(false); }
+  async close(): Promise<void> {
+    this.closeCalls += 1;
+    this.handlers?.onState?.(false);
+  }
 }
 
 class FakeOptionStream implements OptionStream {
   handlers: OptionStreamHandlers | undefined;
   readonly subscribed = new Set<string>();
+  connectCalls = 0;
+  closeCalls = 0;
   async subscribe(symbols: readonly string[]): Promise<void> { for (const symbol of symbols) this.subscribed.add(symbol); }
   async unsubscribe(symbols: readonly string[]): Promise<void> { for (const symbol of symbols) this.subscribed.delete(symbol); }
   async connect(handlers: OptionStreamHandlers): Promise<void> {
+    this.connectCalls += 1;
     this.handlers = handlers;
     handlers.onState?.(true);
   }
-  async close(): Promise<void> { this.handlers?.onState?.(false); }
+  async close(): Promise<void> {
+    this.closeCalls += 1;
+    this.handlers?.onState?.(false);
+  }
   async quote(quote: OptionQuote): Promise<void> { await this.handlers?.onQuote(quote); }
 }
 
@@ -78,12 +90,18 @@ class FakeRuntimeClient implements SpyOptionsRuntimeClient {
     equity: 100_000, optionBuyingPower: 25_000, active: true, optionsApproved: true, killSwitch: false,
   };
   clock = { timestamp: now, isOpen: true };
+  latestQuoteCalls = 0;
+  listContractCalls = 0;
   async getAccount(): Promise<AccountState> { return { ...this.account }; }
   async getMarketClock(): Promise<{ timestamp: number; isOpen: boolean }> { return { ...this.clock }; }
   async getLatestSpySipQuote(): Promise<StockQuote> {
+    this.latestQuoteCalls += 1;
     return { symbol: "SPY", timestamp: now, bidPrice: 500.99, askPrice: 501.01, bidSize: 100, askSize: 100 };
   }
-  async listOptionContracts(): Promise<OptionContract[]> { return [{ ...this.contract }]; }
+  async listOptionContracts(): Promise<OptionContract[]> {
+    this.listContractCalls += 1;
+    return [{ ...this.contract }];
+  }
   async getOptionSnapshots(symbols: readonly string[]): Promise<OptionSnapshot[]> {
     return symbols.map((symbol) => ({
       symbol, timestamp: now - 86_400_000, impliedVolatility: 0.22, greeks: { delta: 0.52, gamma: 0.02 },
@@ -168,6 +186,91 @@ function bearishFeature(timestamp = now, price = 499): FeatureSnapshot {
     },
   };
 }
+
+async function waitFor(predicate: () => boolean, timeoutMs = 1_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() >= deadline) throw new Error("Timed out waiting for runtime state transition");
+    await new Promise<void>((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+test("market-closed startup remains idle without SIP, OPRA, universe, or strategy activity", async () => {
+  const closedAt = zonedDateTimeToEpoch(date, "16:30:00");
+  const client = new FakeRuntimeClient();
+  client.clock = { timestamp: closedAt, isOpen: false };
+  const stockStream = new FakeStockStream();
+  const optionStream = new FakeOptionStream();
+  const recorder = new MemoryRecorder();
+  const runtime = new SpyOptionsTradingRuntime({
+    config: defaultConfig,
+    client,
+    stockStream,
+    optionStream,
+    executionEnabled: true,
+    executionMode: "paper",
+    now: () => closedAt,
+    executionTickMs: 10,
+    recorder,
+  });
+  await runtime.start();
+  const health = runtime.healthState();
+  assert.equal(health.ready, true);
+  assert.equal(health.marketDataIdle, true);
+  assert.equal(health.marketClockState, "market-closed-idle");
+  assert.equal(health.websocketConnected, false);
+  assert.equal(stockStream.connectCalls, 0);
+  assert.equal(optionStream.connectCalls, 0);
+  assert.equal(client.latestQuoteCalls, 0);
+  assert.equal(client.listContractCalls, 0);
+  assert.equal(health.restoredStockEvents, 0);
+  assert.equal(health.strategyStateStatus, "MARKET_CLOSED_IDLE");
+  assert.equal(recorder.events.some((event) => event.type === "strategy_state_recovery"), false);
+  const eventCount = recorder.events.length;
+  await runtime.ingestFeature({ ...bullishFeature(), timestamp: closedAt });
+  assert.equal(recorder.events.length, eventCount);
+  assert.ok(recorder.events.some((event) => event.type === "market_session_idle"));
+  await runtime.close();
+});
+
+test("market close disconnects activity and the next open reconnects automatically", async () => {
+  let decisionTime = now;
+  const client = new FakeRuntimeClient();
+  const stockStream = new FakeStockStream();
+  const optionStream = new FakeOptionStream();
+  const recorder = new MemoryRecorder();
+  const runtime = new SpyOptionsTradingRuntime({
+    config: defaultConfig,
+    client,
+    stockStream,
+    optionStream,
+    executionEnabled: true,
+    executionMode: "paper",
+    now: () => decisionTime,
+    executionTickMs: 10,
+    recorder,
+  });
+  await runtime.start();
+  assert.equal(stockStream.connectCalls, 1);
+  assert.equal(optionStream.connectCalls, 1);
+
+  decisionTime = zonedDateTimeToEpoch(date, "16:00:01");
+  client.clock = { timestamp: decisionTime, isOpen: false };
+  await waitFor(() => runtime.healthState().marketDataIdle === true);
+  await waitFor(() => stockStream.closeCalls > 0 && optionStream.closeCalls > 0);
+  assert.equal(runtime.healthState().websocketConnected, false);
+  assert.equal(runtime.healthState().ready, true);
+  const evaluationCount = recorder.events.filter((event) => event.type === "live_entry_evaluation").length;
+  await runtime.ingestFeature({ ...bullishFeature(), timestamp: decisionTime });
+  assert.equal(recorder.events.filter((event) => event.type === "live_entry_evaluation").length, evaluationCount);
+
+  decisionTime = zonedDateTimeToEpoch("2026-07-23", "09:30:01");
+  client.clock = { timestamp: decisionTime, isOpen: true };
+  await waitFor(() => stockStream.connectCalls === 2 && optionStream.connectCalls === 2);
+  assert.equal(runtime.healthState().marketDataIdle, false);
+  assert.ok(recorder.events.some((event) => event.type === "market_session_resumed"));
+  await runtime.close();
+});
 
 test("end-to-end paper runtime arms SIP/OPRA and routes an eligible signal to a same-day SPY option order", async () => {
   const client = new FakeRuntimeClient();
