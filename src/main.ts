@@ -10,6 +10,7 @@ import { SpyOptionsTradingRuntime } from "./runtime/spyOptionsTradingRuntime.js"
 import { CompositeRecorder, JsonLineRecorder } from "./ops/recorder.js";
 import { TradingDashboardStore } from "./ops/tradingDashboard.js";
 import { PostgresHistoryStore } from "./history/postgresHistory.js";
+import { CompositeMarketHistorySink } from "./history/types.js";
 import { JsonLogger } from "./utils/logger.js";
 
 loadDotEnv();
@@ -38,6 +39,10 @@ if (history) {
 }
 const auditRecorder = new CompositeRecorder([
   new JsonLineRecorder((line) => process.stdout.write(line)),
+  dashboard,
+  ...(history ? [history] : []),
+]);
+const marketHistory = new CompositeMarketHistorySink([
   dashboard,
   ...(history ? [history] : []),
 ]);
@@ -77,7 +82,7 @@ const tradingRuntime = environment.liveOrdersEnabled && stockStream ? new SpyOpt
   executionMode: "paper",
   killSwitch: environment.killSwitch,
   recorder: auditRecorder,
-  ...(history ? { history } : {}),
+  history: marketHistory,
   onEvent: (type, data) => logger.log("info", type, data),
   onError: (error) => logger.log("error", "spy_options_runtime_error", {
     error: error instanceof Error ? error.message : String(error),
