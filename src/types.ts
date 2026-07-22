@@ -252,6 +252,7 @@ export interface PositionState {
   stopPrice: number;
   targetPrice: number;
   highWaterMark: number;
+  lowWaterMark: number;
   invalidSince?: number;
 }
 

@@ -30,10 +30,11 @@ export class ExitManager {
     if (context.killSwitch) return finish("KILL_SWITCH");
     if (isAtOrAfter(context.timestamp, this.#config.session.forceExit, this.#config.timeZone)) return finish("FORCED_SESSION_EXIT");
     if (!quote || context.timestamp - quote.timestamp > this.#config.risk.staleDataEmergencySec * 1000) return finish("STALE_DATA");
+    position.highWaterMark = Math.max(position.highWaterMark, mark!);
+    position.lowWaterMark = Math.min(position.lowWaterMark, mark!);
     if (mark! <= position.stopPrice) return finish("HARD_STOP");
     if (mark! >= position.targetPrice) return finish("PROFIT_TARGET");
 
-    position.highWaterMark = Math.max(position.highWaterMark, mark!);
     if (position.highWaterMark >= position.averageEntryPrice * (1 + this.#config.risk.trailingActivationPct)) {
       const trailingStop = Math.max(
         position.highWaterMark * (1 - this.#config.risk.trailingDrawdownPct),
