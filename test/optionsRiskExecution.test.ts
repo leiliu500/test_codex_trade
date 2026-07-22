@@ -61,8 +61,11 @@ test("risk sizing honors every cap and resets stop/target from actual fill", () 
   const filled = manager.createFilledPosition("SPY260722C00500000", "BULLISH", 5, 2.20, timestamp);
   assert.ok(Math.abs(filled.stopPrice - 1.65) < 1e-12);
   assert.ok(Math.abs(filled.targetPrice - 2.97) < 1e-12);
+  for (let i = 0; i < defaultConfig.risk.maxTradesPerDay - 1; i += 1) manager.recordEntry(timestamp);
+  assert.equal(manager.evaluate({ timestamp, optionMid: 2, hasOpenPosition: false, account: {
+    equity: 100_000, optionBuyingPower: 10_000, active: true, optionsApproved: true, killSwitch: false,
+  } }).allowed, true);
   manager.recordEntry(timestamp);
-  for (let i = 1; i < defaultConfig.risk.maxTradesPerDay; i += 1) manager.recordEntry(timestamp);
   assert.equal(manager.evaluate({ timestamp, optionMid: 2, hasOpenPosition: false, account: {
     equity: 100_000, optionBuyingPower: 10_000, active: true, optionsApproved: true, killSwitch: false,
   } }).allowed, false);
