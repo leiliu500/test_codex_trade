@@ -13,6 +13,9 @@ export interface HealthState {
   receivedOptionQuotes?: number;
   lastOptionQuoteAgeMs?: number;
   completedBars?: number;
+  restoredStockEvents?: number;
+  restoredBars?: number;
+  restorationRejectedEvents?: number;
   rejectedMarketEvents?: number;
   lastFeatureTimestamp?: number;
   reconnectAttempt?: number;
@@ -32,6 +35,11 @@ export interface HealthState {
   positionsReconciled: boolean;
   recorderHealthy: boolean;
   killSwitch: boolean;
+  strategyStateReady?: boolean;
+  strategyStateStatus?: string;
+  strategyStateMarketDate?: string;
+  restoredFeatureBars?: number;
+  strategyRecoveryError?: string;
 }
 
 export function healthReadiness(state: HealthState): { status: "ok" | "degraded" | "halted"; checks: HealthState } {

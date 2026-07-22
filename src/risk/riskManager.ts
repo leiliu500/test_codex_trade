@@ -61,6 +61,14 @@ export class RiskManager {
   recordRealizedPnl(timestamp: number, pnl: number): void { this.#forDate(timestamp).realizedPnl += pnl; }
   state(timestamp: number): Readonly<DailyRiskState> { return { ...this.#forDate(timestamp) }; }
 
+  restoreState(state: DailyRiskState): void {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(state.marketDate) || !Number.isInteger(state.entries) || state.entries < 0 ||
+        !Number.isFinite(state.realizedPnl)) {
+      throw new Error("Invalid restored daily risk state");
+    }
+    this.#daily = { ...state };
+  }
+
   createFilledPosition(
     symbol: string, direction: Direction, quantity: number, averageFillPrice: number, timestamp: number,
   ): PositionState {

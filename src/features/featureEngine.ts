@@ -25,20 +25,27 @@ export class FeatureEngine {
     this.#vwap = new VwapTracker(config);
   }
 
+  restoreCheckpoint(feature: FeatureSnapshot): void {
+    this.#sessionDate = feature.marketDate;
+    this.#openingRange.restore(feature.marketDate, feature.openingRange);
+  }
+
   setPriorClose(close: number): void { this.#priorClose = close > 0 ? close : undefined; }
 
   onBar(bar: SecondBar): FeatureSnapshot | undefined {
     this.#bars.push(bar);
     const keepAfter = bar.timestamp - Math.max(180, this.#config.regression.slowWindowSec + 5) * 1000;
     while (this.#bars[0] && this.#bars[0].timestamp < keepAfter) this.#bars.shift();
-    if (bar.microprice === undefined || bar.mid === undefined) return undefined;
     const date = marketDate(bar.timestamp, this.#config.timeZone);
     if (date !== this.#sessionDate) {
       this.#sessionDate = date;
       this.#sessionOpen = undefined;
     }
     const seconds = secondsSinceMidnight(bar.timestamp, this.#config.timeZone);
-    if (this.#sessionOpen === undefined && seconds >= parseClock(this.#config.session.marketOpen)) this.#sessionOpen = bar.microprice;
+    if (this.#sessionOpen === undefined && bar.microprice !== undefined &&
+        seconds >= parseClock(this.#config.session.marketOpen)) this.#sessionOpen = bar.microprice;
+    const vwap = this.#vwap.update(bar);
+    if (bar.microprice === undefined || bar.mid === undefined) return undefined;
 
     const spread = bar.bidPrice !== undefined && bar.askPrice !== undefined
       ? 10_000 * (bar.askPrice - bar.bidPrice) / bar.mid : Number.POSITIVE_INFINITY;
@@ -58,7 +65,6 @@ export class FeatureEngine {
     const thresholds = this.#calibration.thresholds(bar.timestamp, date);
     const rvPercentile = this.#calibration.rvPercentile(bar.timestamp, date, medium.realizedVolatilityBps);
     const openingRange = this.#openingRange.update(bar.timestamp, bar.microprice);
-    const vwap = this.#vwap.update(bar);
     if (openingRange.bullishBreakoutTimestamp === bar.timestamp) this.#vwap.addAnchor("or_breakout_up", bar.timestamp, bar);
     if (openingRange.bearishBreakoutTimestamp === bar.timestamp) this.#vwap.addAnchor("or_breakout_down", bar.timestamp, bar);
     const qiValues5 = this.#bars.filter((value) => value.timestamp >= bar.timestamp - 5_000 && value.quoteImbalance !== undefined)

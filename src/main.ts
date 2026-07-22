@@ -7,11 +7,13 @@ import { AlpacaOptionWebSocket } from "./alpaca/optionStream.js";
 import { AlpacaTradingRestClient } from "./alpaca/restClient.js";
 import { SpySipReceiver } from "./runtime/spySipReceiver.js";
 import { SpyOptionsTradingRuntime } from "./runtime/spyOptionsTradingRuntime.js";
-import { CompositeRecorder, JsonLineRecorder } from "./ops/recorder.js";
+import { CompositeRecorder, JsonLineRecorder, type AuditEvent } from "./ops/recorder.js";
 import { TradingDashboardStore } from "./ops/tradingDashboard.js";
 import { PostgresHistoryStore } from "./history/postgresHistory.js";
 import { CompositeMarketHistorySink } from "./history/types.js";
 import { JsonLogger } from "./utils/logger.js";
+import { marketDate } from "./utils/time.js";
+import type { FeatureSnapshot } from "./types.js";
 
 loadDotEnv();
 validateConfig(defaultConfig);
@@ -38,11 +40,17 @@ const history = environment.historyDatabaseEnabled ? new PostgresHistoryStore({
     error: error instanceof Error ? error.message : String(error),
   }),
 }) : undefined;
+let restoredEvents: AuditEvent[] = [];
+let restoredFeatureCheckpoint: FeatureSnapshot | undefined;
 if (history) {
   await history.initialize();
-  const restoredEvents = await history.loadAuditEvents();
+  restoredEvents = await history.loadAuditEvents();
+  restoredFeatureCheckpoint = await history.loadLatestRecoveredFeature(marketDate(Date.now(), defaultConfig.timeZone));
   for (const event of restoredEvents) dashboard.record(event);
-  logger.log("info", "postgres_history_ready", { restoredAuditEvents: restoredEvents.length });
+  logger.log("info", "postgres_history_ready", {
+    restoredAuditEvents: restoredEvents.length,
+    recoveredFeatureCheckpoint: restoredFeatureCheckpoint !== undefined,
+  });
 }
 const auditRecorder = new CompositeRecorder([
   new JsonLineRecorder((line) => process.stdout.write(line)),
@@ -90,6 +98,13 @@ const tradingRuntime = environment.liveOrdersEnabled && stockStream ? new SpyOpt
   killSwitch: environment.killSwitch,
   recorder: auditRecorder,
   history: marketHistory,
+  requireStrategyRecovery: true,
+  restoredAuditEvents: restoredEvents,
+  ...(restoredFeatureCheckpoint ? { restoredFeatureCheckpoint } : {}),
+  ...(history ? {
+    loadStockHistory: (date: string, start: number, end: number, quoteStart?: number) =>
+      history.streamStockEvents(date, start, end, quoteStart),
+  } : {}),
   onEvent: (type, data) => logger.log("info", type, data),
   onError: (error) => logger.log("error", "spy_options_runtime_error", {
     error: error instanceof Error ? error.message : String(error),

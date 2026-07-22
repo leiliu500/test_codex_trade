@@ -1,4 +1,5 @@
 import type { AuditEvent } from "../ops/recorder.js";
+import type { FeatureSnapshot } from "../types.js";
 
 export type HistoricalMarketEventType =
   | "stock_quote"
@@ -49,6 +50,11 @@ export interface HistoryStore extends MarketHistorySink {
     timestamp: number;
     data: Record<string, unknown>;
   }>>;
+  streamStockEvents(
+    marketDate: string, startReceivedTimestamp: number, endReceivedTimestamp: number,
+    quoteStartReceivedTimestamp?: number,
+  ): AsyncIterable<readonly HistoricalMarketEvent[]>;
+  loadLatestRecoveredFeature(marketDate: string): Promise<FeatureSnapshot | undefined>;
   flush(): Promise<void>;
   close(): Promise<void>;
 }

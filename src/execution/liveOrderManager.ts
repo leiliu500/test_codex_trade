@@ -9,6 +9,7 @@ import { validateOptionQuote } from "../features/quoteSanitizer.js";
 import { sameDaySpyOptionContractReasons } from "../options/tradingInvariants.js";
 import { ExitManager } from "../risk/exitManager.js";
 import { RiskManager } from "../risk/riskManager.js";
+import type { DailyRiskState } from "../risk/riskManager.js";
 import type { AuditRecorder } from "../ops/recorder.js";
 import { MemoryRecorder } from "../ops/recorder.js";
 import { marketDate } from "../utils/time.js";
@@ -68,6 +69,7 @@ export interface LiveOrderManagerOptions {
   recorder?: AuditRecorder;
   restoredPosition?: PositionState;
   knownClientOrderIds?: ReadonlySet<string>;
+  restoredRiskState?: DailyRiskState;
 }
 
 const ACTIVE_BROKER_STATUSES = new Set([
@@ -100,6 +102,7 @@ export class LiveOrderManager {
     this.#recorder = options.recorder ?? new MemoryRecorder();
     this.#orders = new OrderExecutor(options.config);
     this.#risk = new RiskManager(options.config);
+    if (options.restoredRiskState) this.#risk.restoreState(options.restoredRiskState);
     this.#exits = new ExitManager(options.config);
     this.#position = options.restoredPosition ? { ...options.restoredPosition } : undefined;
     this.#knownClientOrderIds = new Set(options.knownClientOrderIds ?? []);

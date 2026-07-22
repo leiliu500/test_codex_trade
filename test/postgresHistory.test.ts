@@ -114,3 +114,33 @@ test("PostgreSQL history applies bounded age cleanup only when retention is enab
   assert.equal(disabledClient.queries.some((query) => query.text.includes("DELETE FROM market_events")), false);
   await disabled.close();
 });
+
+test("PostgreSQL history streams current-session SIP events in bounded pages", async () => {
+  let page = 0;
+  const rows = Array.from({ length: 101 }, (_unused, index) => ({
+    id: index + 1,
+    event_type: index % 2 === 0 ? "stock_quote" : "stock_trade",
+    received_timestamp: 1_000 + index,
+    provider_timestamp: 900 + index,
+    market_date: "2026-07-22",
+    symbol: "SPY",
+    data: index % 2 === 0
+      ? { symbol: "SPY", timestamp: 900 + index, bidPrice: 500, askPrice: 500.01, bidSize: 1, askSize: 1 }
+      : { symbol: "SPY", timestamp: 900 + index, price: 500, size: 1 },
+  }));
+  const client: DatabaseClient = {
+    async query<R extends QueryResultRow = QueryResultRow>(text: string, values: readonly unknown[] = []) {
+      assert.match(text, /received_timestamp >= \$2/);
+      assert.deepEqual(values.slice(0, 3), ["2026-07-22", 1_000, 2_000]);
+      const resultRows = page++ === 0 ? rows.slice(0, 100) : rows.slice(100);
+      return { command: "SELECT", rowCount: resultRows.length, oid: 0, fields: [], rows: resultRows as unknown as R[] };
+    },
+  };
+  const store = new PostgresHistoryStore({ connectionString: "postgresql://unused", client });
+  const streamed = [];
+  for await (const batch of store.streamStockEvents("2026-07-22", 1_000, 2_000, undefined, 100)) streamed.push(...batch);
+  assert.equal(streamed.length, 101);
+  assert.equal(page, 2);
+  assert.equal(streamed[0]?.providerTimestamp, 900);
+  assert.equal(streamed.at(-1)?.type, "stock_quote");
+});

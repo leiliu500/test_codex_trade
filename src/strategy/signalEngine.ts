@@ -19,6 +19,11 @@ export interface SignalEvaluation {
   directions: SignalDirectionEvaluation[];
 }
 
+export interface RestoredSignalState {
+  lastSignalTimestamp?: number;
+  lastEntries?: Partial<Record<Direction, number>>;
+}
+
 export class SignalEngine {
   readonly #config: EngineConfig;
   #lastSignalTimestamp = -Infinity;
@@ -28,7 +33,17 @@ export class SignalEngine {
 
   /** Cooldown begins on an actual entry, never on a rejected candidate. */
   recordEntry(direction: Direction, timestamp: number): void {
-    this.#lastEntries[direction] = timestamp;
+    this.#lastEntries[direction] = Math.max(this.#lastEntries[direction] ?? -Infinity, timestamp);
+  }
+
+  restoreState(state: RestoredSignalState): void {
+    if (state.lastSignalTimestamp !== undefined && Number.isFinite(state.lastSignalTimestamp)) {
+      this.#lastSignalTimestamp = Math.max(this.#lastSignalTimestamp, state.lastSignalTimestamp);
+    }
+    for (const direction of ["BULLISH", "BEARISH"] as const) {
+      const timestamp = state.lastEntries?.[direction];
+      if (timestamp !== undefined && Number.isFinite(timestamp)) this.recordEntry(direction, timestamp);
+    }
   }
 
   evaluate(feature: FeatureSnapshot, regime: RegimeDecision): TradeSignal | undefined {

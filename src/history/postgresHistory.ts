@@ -1,5 +1,6 @@
 import { Pool, type QueryResult, type QueryResultRow } from "pg";
 import type { AuditEvent, AuditRecorder } from "../ops/recorder.js";
+import type { FeatureSnapshot } from "../types.js";
 import type { HistoricalMarketEvent, HistoryStore } from "./types.js";
 
 export interface DatabaseClient {
@@ -33,6 +34,18 @@ interface ReplayRow extends QueryResultRow {
   received_timestamp: string | number;
   data: Record<string, unknown>;
 }
+
+interface StockHistoryRow extends QueryResultRow {
+  id: string | number;
+  event_type: "stock_quote" | "stock_trade";
+  received_timestamp: string | number;
+  provider_timestamp: string | number;
+  market_date: string | Date;
+  symbol: string;
+  data: Record<string, unknown>;
+}
+
+interface FeatureRow extends QueryResultRow { data: FeatureSnapshot }
 
 const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS market_events (
@@ -326,6 +339,72 @@ export class PostgresHistoryStore implements HistoryStore, AuditRecorder {
       timestamp: Number(row.received_timestamp),
       data: row.data,
     }));
+  }
+
+  async *streamStockEvents(
+    marketDate: string,
+    startReceivedTimestamp: number,
+    endReceivedTimestamp: number,
+    quoteStartReceivedTimestamp?: number,
+    batchSize = 20_000,
+  ): AsyncIterable<readonly HistoricalMarketEvent[]> {
+    if (!(endReceivedTimestamp >= startReceivedTimestamp)) return;
+    const boundedBatchSize = Math.max(100, Math.min(50_000, Math.floor(batchSize)));
+    let afterId = 0;
+    while (true) {
+      const quoteFilter = quoteStartReceivedTimestamp === undefined
+        ? "" : "AND (event_type = 'stock_trade' OR received_timestamp >= $6)";
+      const result = await this.#client.query<StockHistoryRow>(
+        `SELECT id, event_type, received_timestamp, provider_timestamp, market_date, symbol, data
+         FROM market_events
+         WHERE market_date = $1
+           AND event_type IN ('stock_quote','stock_trade')
+           AND received_timestamp >= $2
+           AND received_timestamp <= $3
+           AND id > $4
+           ${quoteFilter}
+         ORDER BY id ASC
+         LIMIT $5`,
+        [marketDate, startReceivedTimestamp, endReceivedTimestamp, afterId, boundedBatchSize,
+          ...(quoteStartReceivedTimestamp !== undefined ? [quoteStartReceivedTimestamp] : [])],
+      );
+      if (result.rows.length === 0) return;
+      const events = result.rows.map((row) => {
+        afterId = Number(row.id);
+        return {
+          type: row.event_type,
+          providerTimestamp: Number(row.provider_timestamp),
+          receivedTimestamp: Number(row.received_timestamp),
+          marketDate: formatDatabaseDate(row.market_date),
+          symbol: row.symbol,
+          data: row.data,
+        } satisfies HistoricalMarketEvent;
+      });
+      yield events;
+      if (result.rows.length < boundedBatchSize) return;
+    }
+  }
+
+  async loadLatestRecoveredFeature(marketDate: string): Promise<FeatureSnapshot | undefined> {
+    const result = await this.#client.query<FeatureRow>(
+      `WITH recovery AS (
+         SELECT MAX(event_timestamp) AS recovered_at
+         FROM audit_events
+         WHERE market_date = $1
+           AND event_type = 'strategy_state_recovery'
+           AND data->>'ready' = 'true'
+       )
+       SELECT market_events.data
+       FROM market_events CROSS JOIN recovery
+       WHERE market_events.market_date = $1
+         AND market_events.event_type = 'feature_snapshot'
+         AND recovery.recovered_at IS NOT NULL
+         AND market_events.received_timestamp >= recovery.recovered_at
+       ORDER BY market_events.id DESC
+       LIMIT 1`,
+      [marketDate],
+    );
+    return result.rows[0]?.data;
   }
 
   async close(): Promise<void> {

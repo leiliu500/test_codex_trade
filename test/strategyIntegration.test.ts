@@ -9,6 +9,7 @@ import { classifyTrendPhase } from "../src/strategy/trendPhase.js";
 import { OptionBook } from "../src/options/optionBook.js";
 import { OptionSelector } from "../src/options/optionSelector.js";
 import { FeatureEngine } from "../src/features/featureEngine.js";
+import { OpeningRangeTracker } from "../src/features/openingRange.js";
 import { zonedDateTimeToEpoch } from "../src/utils/time.js";
 
 function windowMetric(windowSec: number, slope: number, acceleration: number, normalizedSlope: number, normalizedAcceleration: number): WindowMetrics {
@@ -123,6 +124,64 @@ test("global gates block stale data, whipsaw, time violations, and cooldown only
   assert.ok(first.evaluate(later, classifyRegime(later, defaultConfig.regimes)));
   first.recordEntry("BULLISH", later.timestamp);
   assert.equal(first.evaluate({ ...later, timestamp: later.timestamp + 6_000 }, classifyRegime(later, defaultConfig.regimes)), undefined);
+});
+
+test("opening range cannot become complete from a late-started partial session", () => {
+  const tracker = new OpeningRangeTracker(defaultConfig);
+  tracker.update(zonedDateTimeToEpoch("2026-07-22", "10:06:53"), 501);
+  tracker.update(zonedDateTimeToEpoch("2026-07-22", "10:14:59"), 502);
+  const state = tracker.update(zonedDateTimeToEpoch("2026-07-22", "10:15:00"), 501.5);
+  assert.equal(state.complete, false);
+});
+
+test("restored entry and signal timestamps preserve restart cooldowns", () => {
+  const base = feature();
+  const engine = new SignalEngine(defaultConfig);
+  engine.restoreState({
+    lastSignalTimestamp: base.timestamp - 1_000,
+    lastEntries: { BULLISH: base.timestamp - 1_000 },
+  });
+  const evaluation = engine.evaluateDetailed(base, classifyRegime(base, defaultConfig.regimes));
+  assert.ok(evaluation.reasons.includes("MINIMUM_SIGNAL_INTERVAL"));
+});
+
+test("feature checkpoint restores exact opening range while trade-only history rebuilds session VWAP", () => {
+  const checkpoint = feature();
+  const engine = new FeatureEngine(defaultConfig);
+  engine.restoreCheckpoint(checkpoint);
+  const tradeOnlyTimestamp = zonedDateTimeToEpoch("2026-07-22", "10:18:00");
+  assert.equal(engine.onBar({
+    timestamp: tradeOnlyTimestamp,
+    quoteCount: 0,
+    quoteAgeMs: Number.POSITIVE_INFINITY,
+    ofiRaw: 0,
+    depthSum: 0,
+    depthEventCount: 0,
+    tradeVolume: 100,
+    tradeVwap: 500,
+  }), undefined);
+  const restored = engine.onBar({
+    timestamp: tradeOnlyTimestamp + 1_000,
+    microprice: 501,
+    mid: 501,
+    quoteImbalance: 0,
+    micropriceDisplacementBps: 0,
+    bidPrice: 500.99,
+    askPrice: 501.01,
+    bidSize: 100,
+    askSize: 100,
+    quoteCount: 1,
+    quoteAgeMs: 0,
+    ofiRaw: 0,
+    depthSum: 200,
+    depthEventCount: 1,
+    tradeVolume: 100,
+    tradeVwap: 502,
+  });
+  assert.equal(restored?.openingRange.complete, true);
+  assert.equal(restored?.openingRange.high, checkpoint.openingRange.high);
+  assert.equal(restored?.openingRange.low, checkpoint.openingRange.low);
+  assert.equal(restored?.vwap.sessionVwap, 501);
 });
 
 test("detailed signal evaluation reports global and directional block decisions", () => {

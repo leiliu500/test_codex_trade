@@ -167,3 +167,34 @@ test("end-to-end paper runtime arms SIP/OPRA and routes an eligible signal to a 
   await runtime.close();
   assert.deepEqual(history.priorityChanges.at(-1), []);
 });
+
+test("paper runtime fails closed when current-session SIP recovery is unavailable", async () => {
+  const client = new FakeRuntimeClient();
+  const optionStream = new FakeOptionStream();
+  const recorder = new MemoryRecorder();
+  const runtime = new SpyOptionsTradingRuntime({
+    config: defaultConfig,
+    client,
+    stockStream: new FakeStockStream(),
+    optionStream,
+    executionEnabled: true,
+    executionMode: "paper",
+    requireStrategyRecovery: true,
+    now: () => now,
+    executionTickMs: 60_000,
+    recorder,
+  });
+  await runtime.start();
+  assert.equal(runtime.healthState().strategyStateReady, false);
+  assert.equal(runtime.healthState().strategyStateStatus, "HISTORY_UNAVAILABLE");
+  assert.equal(runtime.healthState().ready, false);
+  await optionStream.quote({
+    symbol: callSymbol, timestamp: now, bidPrice: 1.99, askPrice: 2.01, bidSize: 100, askSize: 100,
+  });
+  await runtime.ingestFeature(bullishFeature());
+  assert.equal(client.requests.length, 0);
+  const evaluation = recorder.events.find((event) => event.type === "live_entry_evaluation");
+  assert.equal(evaluation?.data.decision, "SKIPPED");
+  assert.deepEqual(evaluation?.data.reasons, ["STRATEGY_STATE_NOT_READY"]);
+  await runtime.close();
+});

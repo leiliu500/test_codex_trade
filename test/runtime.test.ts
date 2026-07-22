@@ -8,6 +8,8 @@ import type { StockQuote, StockTrade } from "../src/types.js";
 import { SpySipReceiver } from "../src/runtime/spySipReceiver.js";
 import { defaultConfig } from "../src/config.js";
 import { TradingDashboardStore } from "../src/ops/tradingDashboard.js";
+import type { HistoricalMarketEvent } from "../src/history/types.js";
+import { zonedDateTimeToEpoch } from "../src/utils/time.js";
 
 test("runtime environment is paper-safe and validates the health listener", () => {
   assert.deepEqual(readEnvironment({}), {
@@ -109,5 +111,76 @@ test("SPY SIP receiver serializes quotes and trades into completed feature bars"
   assert.equal(health.completedBars, 1);
   assert.equal(health.lastFeatureTimestamp, start + 1_000);
   assert.equal(health.brokerAvailable, false);
+  await receiver.close();
+});
+
+test("SPY SIP receiver restores complete opening range and VWAP without emitting live callbacks", async () => {
+  const stream = new FakeStockStream();
+  const start = zonedDateTimeToEpoch("2026-07-22", "09:30:00");
+  const end = zonedDateTimeToEpoch("2026-07-22", "10:20:00");
+  let callbackFeatures = 0;
+  const receiver = new SpySipReceiver({
+    config: defaultConfig,
+    stream,
+    now: () => end,
+    flushIntervalMs: 60_000,
+    onFeature: () => { callbackFeatures += 1; },
+  });
+  const events: HistoricalMarketEvent[] = [];
+  for (let timestamp = start; timestamp <= end; timestamp += 1_000) {
+    const price = 500 + 0.001 * ((timestamp - start) / 1_000);
+    events.push({
+      type: "stock_quote", providerTimestamp: timestamp + 100, receivedTimestamp: timestamp + 110,
+      marketDate: "2026-07-22", symbol: "SPY",
+      data: { symbol: "SPY", timestamp: timestamp + 100, bidPrice: price - 0.005, askPrice: price + 0.005,
+        bidSize: 100, askSize: 100 },
+    }, {
+      type: "stock_trade", providerTimestamp: timestamp + 200, receivedTimestamp: timestamp + 210,
+      marketDate: "2026-07-22", symbol: "SPY",
+      data: { symbol: "SPY", timestamp: timestamp + 200, price, size: 100 },
+    });
+  }
+  const summary = await receiver.restore(events);
+  assert.equal(summary.events, events.length);
+  assert.ok((summary.bars ?? 0) >= 3_000);
+  assert.equal(summary.latestFeature?.openingRange.complete, true);
+  assert.ok(summary.latestFeature?.vwap.sessionVwap !== undefined);
+  assert.equal(callbackFeatures, 0);
+  assert.equal(receiver.healthState().restoredStockEvents, events.length);
+  assert.equal(receiver.healthState().receivedStockTrades, 0);
+  await receiver.start();
+  await receiver.close();
+});
+
+test("SPY SIP receiver buffers live events during restoration and suppresses stale catch-up decisions", async () => {
+  const stream = new FakeStockStream();
+  const start = zonedDateTimeToEpoch("2026-07-22", "10:20:00");
+  let featureCallbacks = 0;
+  const receiver = new SpySipReceiver({
+    config: defaultConfig,
+    stream,
+    now: () => start + 3_000,
+    flushIntervalMs: 60_000,
+    onFeature: () => { featureCallbacks += 1; },
+  });
+  await receiver.startBuffered();
+  await stream.quote({
+    symbol: "SPY", timestamp: start + 100, bidPrice: 500, askPrice: 500.01, bidSize: 100, askSize: 100,
+  });
+  await stream.trade({ symbol: "SPY", timestamp: start + 200, price: 500.005, size: 10 });
+  await stream.quote({
+    symbol: "SPY", timestamp: start + 1_100, bidPrice: 500.01, askPrice: 500.02, bidSize: 100, askSize: 100,
+  });
+  assert.equal(receiver.healthState().receivedStockQuotes, 0);
+  const catchup = await receiver.activate();
+  assert.equal(catchup.events, 3);
+  assert.equal(catchup.bars, 1);
+  assert.equal(featureCallbacks, 0);
+  assert.equal(receiver.healthState().receivedStockQuotes, 2);
+  assert.equal(receiver.healthState().completedBars, 1);
+  await stream.quote({
+    symbol: "SPY", timestamp: start + 2_100, bidPrice: 500.02, askPrice: 500.03, bidSize: 100, askSize: 100,
+  });
+  assert.equal(featureCallbacks, 1);
   await receiver.close();
 });
