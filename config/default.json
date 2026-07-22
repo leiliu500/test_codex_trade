@@ -1,5 +1,5 @@
 {
-  "version": "spy-0dte-day-only-1",
+  "version": "spy-0dte-day-only-2",
   "symbol": "SPY",
   "timeZone": "America/New_York",
   "session": {
@@ -49,6 +49,8 @@
     "costMultiplier": 1.75,
     "sameDirectionCooldownSec": 600,
     "minimumSignalIntervalSec": 5,
+    "lateBullishImpulseStart": "12:45:00",
+    "lateBullishImpulseRequiresUpRegime": true,
     "blockWhipsaw": true
   },
   "regimes": {

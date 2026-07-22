@@ -1,6 +1,6 @@
 import type { EngineConfig } from "../config.js";
 import type { Direction, FeatureSnapshot, RegimeDecision, SignalVote, TradeSignal } from "../types.js";
-import { inSessionWindow } from "../utils/time.js";
+import { inSessionWindow, parseClock, secondsSinceMidnight } from "../utils/time.js";
 import { hashString, stableStringify } from "../utils/statistics.js";
 import { boundedProjectionBps } from "./projection.js";
 
@@ -156,7 +156,17 @@ export class SignalEngine {
       : or.nearLow || f.price <= or.low! || or.bearishRetest ||
         (or.bearishBreakoutTimestamp !== undefined && f.timestamp - or.bearishBreakoutTimestamp <= memory);
     const voteCount = votes.filter((vote) => vote.passed).length;
-    if (locationGate && voteCount >= this.#config.signals.impulseVotesRequired) {
+    const impulsePassed = locationGate && voteCount >= this.#config.signals.impulseVotesRequired;
+    const lateBullishImpulseNeedsConfirmation =
+      this.#config.signals.lateBullishImpulseRequiresUpRegime &&
+      direction === "BULLISH" &&
+      secondsSinceMidnight(f.timestamp, this.#config.timeZone) >= parseClock(this.#config.signals.lateBullishImpulseStart) &&
+      regime.regime !== "STRONG_UP" && regime.regime !== "GRIND_UP";
+    if (impulsePassed && lateBullishImpulseNeedsConfirmation) {
+      blockedReasons.push("LATE_BULLISH_IMPULSE_REQUIRES_UP_REGIME");
+      return undefined;
+    }
+    if (impulsePassed) {
       return this.#makeSignal(direction, "IMPULSE", directionalProjection, votes, f, regime, [
         "structural gate passed", "opening-range break/proximity/retest", `${voteCount}/4 impulse votes passed`,
       ]);

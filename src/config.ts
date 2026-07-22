@@ -52,6 +52,8 @@ export interface EngineConfig {
     costMultiplier: number;
     sameDirectionCooldownSec: number;
     minimumSignalIntervalSec: number;
+    lateBullishImpulseStart: string;
+    lateBullishImpulseRequiresUpRegime: boolean;
     blockWhipsaw: boolean;
   };
   regimes: {
@@ -162,10 +164,14 @@ export function validateConfig(config: EngineConfig): void {
     throw new Error("Trailing profit floor must be below trailing activation");
   }
   const entryStart = parseClock(config.session.entryStart);
+  const lateBullishImpulseStart = parseClock(config.signals.lateBullishImpulseStart);
   const zeroDteCutoff = parseClock(config.options.zeroDteEntryCutoff);
   const entryEnd = parseClock(config.session.entryEnd);
   const forceExit = parseClock(config.session.forceExit);
   if (!(entryStart < zeroDteCutoff && zeroDteCutoff <= entryEnd && entryEnd < forceExit && forceExit < parseClock("16:00:00"))) {
     throw new Error("Day-trade timing requires entryStart < 0DTE cutoff <= entryEnd < forceExit < 16:00 ET");
+  }
+  if (!(entryStart <= lateBullishImpulseStart && lateBullishImpulseStart <= entryEnd)) {
+    throw new Error("Late bullish impulse confirmation must begin inside the entry window");
   }
 }

@@ -93,6 +93,28 @@ test("clean bullish/bearish opening-range impulses mirror direction", () => {
   }
 });
 
+test("late bullish impulses require an established up regime without blocking bearish impulses", () => {
+  const lateBullish = {
+    ...feature(1),
+    timestamp: zonedDateTimeToEpoch("2026-07-22", "12:49:00"),
+    vwap: { ...feature(1).vwap, rollingVwapSlopeBpsPerSec: -0.01 },
+  };
+  const unclassified: RegimeDecision = { regime: "UNCLASSIFIED", confidence: 0, reasons: [] };
+  const blocked = new SignalEngine(defaultConfig).evaluateDetailed(lateBullish, unclassified);
+  assert.equal(blocked.signal, undefined);
+  assert.ok(blocked.directions.find((item) => item.direction === "BULLISH")?.reasons
+    .includes("LATE_BULLISH_IMPULSE_REQUIRES_UP_REGIME"));
+
+  const confirmed: RegimeDecision = { regime: "STRONG_UP", confidence: 1, reasons: [] };
+  assert.equal(new SignalEngine(defaultConfig).evaluate(lateBullish, confirmed)?.kind, "IMPULSE");
+
+  const lateBearish = {
+    ...feature(-1),
+    timestamp: zonedDateTimeToEpoch("2026-07-22", "12:49:00"),
+  };
+  assert.equal(new SignalEngine(defaultConfig).evaluate(lateBearish, unclassified)?.direction, "BEARISH");
+});
+
 test("steady grind passes with acceleration near zero, but excessive adverse acceleration blocks", () => {
   const base = feature();
   const grindFeature: FeatureSnapshot = {
@@ -224,6 +246,32 @@ test("option selector rejects wide cost and ranks an eligible liquid contract", 
   assert.ok(selection.evaluations.find((item) => item.symbol === bad.symbol)!.rejectionReasons.includes("QUOTE_SPREAD_TOO_WIDE"));
   const laterDated = { ...good, symbol: "SPY260724C00501000", expirationDate: "2026-07-24" };
   assert.ok(new OptionSelector(defaultConfig).evaluate(laterDated, undefined, signal).rejectionReasons.includes("NOT_SAME_DAY_EXPIRATION"));
+});
+
+test("option selection uses an explicit causal decision timestamp", () => {
+  const f = feature();
+  const signal = new SignalEngine(defaultConfig).evaluate(f, classifyRegime(f, defaultConfig.regimes))!;
+  const contract: OptionContract = {
+    symbol: "SPY260722C00501000", underlying: "SPY", expirationDate: "2026-07-22",
+    strike: 501, type: "call", active: true, tradable: true,
+  };
+  const book = new OptionBook();
+  book.upsertContract(contract);
+  book.updateQuote({
+    symbol: contract.symbol, timestamp: signal.timestamp + 100,
+    bidPrice: 1.99, askPrice: 2.01, bidSize: 100, askSize: 100,
+  });
+  book.updateSnapshot({
+    symbol: contract.symbol, timestamp: signal.timestamp,
+    impliedVolatility: 0.22, greeks: { delta: 0.52, gamma: 0.02 }, dailyVolume: 1000, openInterest: 5000,
+  });
+  const selector = new OptionSelector(defaultConfig);
+  const replayPinned = selector.select(signal, [contract], book);
+  assert.equal(replayPinned.selected, undefined);
+  assert.ok(replayPinned.evaluations[0]?.rejectionReasons.includes("QUOTE_FUTURE_QUOTE"));
+
+  const liveDecision = selector.select(signal, [contract], book, signal.timestamp + 200);
+  assert.equal(liveDecision.selected?.symbol, contract.symbol);
 });
 
 test("feature engine produces causal valid 10/30/120-second state after coverage", () => {
