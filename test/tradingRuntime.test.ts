@@ -5,7 +5,7 @@ import type { BrokerOrder, BrokerOrderRequest } from "../src/alpaca/restClient.j
 import type { StockStream, StockStreamHandlers } from "../src/alpaca/stockStream.js";
 import type { OptionStream, OptionStreamHandlers } from "../src/alpaca/optionStream.js";
 import type { SpyOptionsRuntimeClient } from "../src/runtime/spyOptionsTradingRuntime.js";
-import { SpyOptionsTradingRuntime } from "../src/runtime/spyOptionsTradingRuntime.js";
+import { optionUniverseRequired, SpyOptionsTradingRuntime } from "../src/runtime/spyOptionsTradingRuntime.js";
 import type {
   AccountState, FeatureSnapshot, OptionContract, OptionQuote, OptionSnapshot, PositionState, StockQuote,
   WindowMetrics,
@@ -17,6 +17,18 @@ import { MemoryRecorder } from "../src/ops/recorder.js";
 const date = "2026-07-22";
 const now = zonedDateTimeToEpoch(date, "10:20:00");
 const callSymbol = "SPY260722C00501000";
+
+test("option universe readiness follows the 0DTE cutoff while protecting open exposure", () => {
+  const beforeCutoff = zonedDateTimeToEpoch(date, "14:29:59");
+  const atCutoff = zonedDateTimeToEpoch(date, "14:30:00");
+  const afterCutoff = zonedDateTimeToEpoch(date, "14:30:01");
+
+  assert.equal(optionUniverseRequired(beforeCutoff, true, false, defaultConfig), true);
+  assert.equal(optionUniverseRequired(atCutoff, true, false, defaultConfig), true);
+  assert.equal(optionUniverseRequired(afterCutoff, true, false, defaultConfig), false);
+  assert.equal(optionUniverseRequired(afterCutoff, true, true, defaultConfig), true);
+  assert.equal(optionUniverseRequired(beforeCutoff, false, true, defaultConfig), false);
+});
 
 class FakeStockStream implements StockStream {
   handlers: StockStreamHandlers | undefined;

@@ -47,6 +47,15 @@ export interface SpyOptionsTradingRuntimeOptions {
   restoredFeatureCheckpoint?: FeatureSnapshot;
 }
 
+export function optionUniverseRequired(
+  now: number, marketOpen: boolean, hasOptionExposure: boolean, config: EngineConfig,
+): boolean {
+  return marketOpen && (
+    hasOptionExposure ||
+    secondsSinceMidnight(now, config.timeZone) <= parseClock(config.options.zeroDteEntryCutoff)
+  );
+}
+
 /** End-to-end, serialized SPY 0DTE option execution runtime. */
 export class SpyOptionsTradingRuntime {
   readonly #config: EngineConfig;
@@ -350,7 +359,9 @@ export class SpyOptionsTradingRuntime {
     const stock = this.#stockReceiver.healthState(this.#killSwitch);
     const brokerReady = !this.#executionEnabled || (this.#brokerAvailable && this.#positionsReconciled && this.#account?.optionsApproved === true);
     const streamsReady = stock.websocketConnected && this.#optionConnected;
-    const universeReady = this.#subscribedSymbols.size > 0 || !this.#marketOpen;
+    const hasOptionExposure = this.#execution.position !== undefined || this.#execution.pending !== undefined;
+    const universeReady = this.#subscribedSymbols.size > 0 ||
+      !optionUniverseRequired(this.#now(), this.#marketOpen, hasOptionExposure, this.#config);
     const strategyReady = !this.#executionEnabled || !this.#marketOpen || this.#strategyStateReady;
     return {
       ...stock,
