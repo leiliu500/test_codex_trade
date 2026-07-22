@@ -28,3 +28,12 @@ export class JsonLineRecorder implements AuditRecorder {
   }
   healthy(): boolean { return this.#healthy; }
 }
+
+export class CompositeRecorder implements AuditRecorder {
+  readonly #recorders: readonly AuditRecorder[];
+  constructor(recorders: readonly AuditRecorder[]) { this.#recorders = recorders; }
+  async record(event: AuditEvent): Promise<void> {
+    await Promise.all(this.#recorders.map((recorder) => recorder.record(event)));
+  }
+  healthy(): boolean { return this.#recorders.every((recorder) => recorder.healthy()); }
+}

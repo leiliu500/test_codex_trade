@@ -4,6 +4,8 @@ export interface RuntimeEnvironment {
   marketDataEnabled: boolean;
   stockDataFeed: "sip";
   optionDataFeed: "opra";
+  historyDatabaseEnabled: boolean;
+  databaseUrl?: string;
   killSwitch: boolean;
   healthHost: string;
   healthPort: number;
@@ -17,7 +19,8 @@ export function readEnvironment(env: NodeJS.ProcessEnv = process.env): RuntimeEn
   const marketDataEnabled = env.MARKET_DATA_ENABLED === "true";
   const stockDataFeed = env.STOCK_DATA_FEED ?? "sip";
   const optionDataFeed = env.OPTION_DATA_FEED ?? "opra";
-  const healthPort = Number(env.HEALTH_PORT ?? "8080");
+  const historyDatabaseEnabled = env.HISTORY_DATABASE_ENABLED === "true";
+  const healthPort = Number(env.HEALTH_PORT ?? "3001");
   const healthHost = env.HEALTH_HOST?.trim() || "127.0.0.1";
   if (!Number.isInteger(healthPort) || healthPort < 1 || healthPort > 65_535) {
     throw new Error("HEALTH_PORT must be an integer between 1 and 65535");
@@ -26,6 +29,9 @@ export function readEnvironment(env: NodeJS.ProcessEnv = process.env): RuntimeEn
   if (optionDataFeed !== "opra") throw new Error("Executable option trading requires the real-time OPRA option-data feed");
   if (liveOrdersEnabled && !marketDataEnabled) {
     throw new Error("Broker order execution requires MARKET_DATA_ENABLED=true");
+  }
+  if (historyDatabaseEnabled && !env.DATABASE_URL) {
+    throw new Error("HISTORY_DATABASE_ENABLED=true requires DATABASE_URL");
   }
   if (tradingMode === "live" && !liveOrdersEnabled) {
     throw new Error("Live mode requires ENABLE_LIVE_ORDERS=true; paper mode is the safe default");
@@ -42,11 +48,13 @@ export function readEnvironment(env: NodeJS.ProcessEnv = process.env): RuntimeEn
     marketDataEnabled,
     stockDataFeed,
     optionDataFeed,
+    historyDatabaseEnabled,
     killSwitch: env.KILL_SWITCH === "true",
     healthHost,
     healthPort,
     ...(env.ALPACA_API_KEY ? { alpacaApiKey: env.ALPACA_API_KEY } : {}),
     ...(env.ALPACA_API_SECRET ? { alpacaApiSecret: env.ALPACA_API_SECRET } : {}),
+    ...(env.DATABASE_URL ? { databaseUrl: env.DATABASE_URL } : {}),
   };
 }
 

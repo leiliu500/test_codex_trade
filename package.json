@@ -21,19 +21,22 @@
     "backtest": "tsx src/cli/backtest.ts",
     "calibrate": "tsx src/cli/calibrate.ts",
     "demo": "tsx src/cli/generateDemoReplay.ts",
-    "test:historical": "tsx src/cli/historicalSignalTest.ts"
+    "test:historical": "tsx src/cli/historicalSignalTest.ts",
+    "export:history": "tsx src/cli/exportPostgresReplay.ts"
   },
   "engines": {
     "node": ">=20"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
+    "@types/pg": "^8.20.0",
     "@types/ws": "^8.18.1",
     "tsx": "^4.19.2",
     "typescript": "^5.7.2"
   },
   "dependencies": {
     "@msgpack/msgpack": "^3.1.3",
+    "pg": "^8.22.0",
     "ws": "^8.21.1"
   }
 }
