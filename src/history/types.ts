@@ -22,6 +22,19 @@ export interface MarketHistorySink {
   healthy(): boolean;
 }
 
+/** Fan-out sink used to feed both durable history and live read models. */
+export class CompositeMarketHistorySink implements MarketHistorySink {
+  readonly #sinks: readonly MarketHistorySink[];
+
+  constructor(sinks: readonly MarketHistorySink[]) { this.#sinks = sinks; }
+
+  recordMarketEvent(event: HistoricalMarketEvent): void {
+    for (const sink of this.#sinks) sink.recordMarketEvent(event);
+  }
+
+  healthy(): boolean { return this.#sinks.every((sink) => sink.healthy()); }
+}
+
 export interface HistoryStore extends MarketHistorySink {
   initialize(): Promise<void>;
   record(event: AuditEvent): void | Promise<void>;

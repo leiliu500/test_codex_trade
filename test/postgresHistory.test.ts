@@ -29,10 +29,28 @@ test("PostgreSQL history creates schema, batches market data, and durably insert
   await store.record({
     timestamp: 14, marketDate: "2026-07-22", type: "entry_fill", configVersion: "test", data: { quantity: 1 },
   });
+  await store.record({
+    timestamp: 15, marketDate: "2026-07-22", type: "broker_order_request", configVersion: "test",
+    data: {
+      purpose: "ENTRY",
+      order: {
+        clientOrderId: "entry-1", symbol: "SPY260722C00500000", side: "buy",
+        requestedQuantity: 2, filledQuantity: 0, averageFillPrice: 0, limitPrice: 2.01,
+        status: "SUBMITTED", submittedAt: 15, replacements: 0,
+      },
+    },
+  });
   assert.ok(client.queries.some((query) => query.text.includes("CREATE TABLE IF NOT EXISTS market_events")));
+  assert.ok(client.queries.some((query) => query.text.includes("CREATE TABLE IF NOT EXISTS order_lifecycle_events")));
   const marketInsert = client.queries.find((query) => query.text.includes("INSERT INTO market_events"));
   assert.equal(marketInsert?.values.length, 12);
   assert.ok(client.queries.some((query) => query.text.includes("INSERT INTO audit_events")));
+  const lifecycleEvent = client.queries.find((query) => query.text.includes("INSERT INTO order_lifecycle_events"));
+  assert.equal(lifecycleEvent?.values[3], "entry-1");
+  assert.equal(lifecycleEvent?.values[5], "ENTRY");
+  const lifecycleCurrent = client.queries.find((query) => query.text.includes("INSERT INTO order_lifecycle\n"));
+  assert.equal(lifecycleCurrent?.values[0], "entry-1");
+  assert.equal(lifecycleCurrent?.values[9], "SUBMITTED");
   assert.equal(store.healthy(), true);
   await store.close();
 });

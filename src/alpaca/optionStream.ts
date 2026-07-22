@@ -136,7 +136,9 @@ export class AlpacaOptionWebSocket implements OptionStream {
 export function adaptAlpacaOptionQuote(raw: Record<string, unknown>): OptionQuote {
   const quote = {
     symbol: raw.S,
-    timestamp: typeof raw.t === "string" ? Date.parse(raw.t) : raw.t,
+    // MsgPack timestamp extensions are decoded to Date instances even though
+    // Alpaca documents the logical field as an RFC-3339 string.
+    timestamp: raw.t instanceof Date ? raw.t.getTime() : typeof raw.t === "string" ? Date.parse(raw.t) : raw.t,
     bidPrice: raw.bp,
     askPrice: raw.ap,
     bidSize: raw.bs,

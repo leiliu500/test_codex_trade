@@ -59,7 +59,67 @@ CREATE INDEX IF NOT EXISTS audit_events_date_type_id_idx
   ON audit_events (market_date, event_type, id);
 CREATE INDEX IF NOT EXISTS audit_events_timestamp_idx
   ON audit_events (event_timestamp, id);
+
+CREATE TABLE IF NOT EXISTS order_lifecycle (
+  client_order_id TEXT PRIMARY KEY,
+  broker_order_id TEXT,
+  purpose TEXT NOT NULL,
+  symbol TEXT NOT NULL,
+  side TEXT NOT NULL,
+  requested_quantity INTEGER NOT NULL,
+  filled_quantity INTEGER NOT NULL,
+  average_fill_price DOUBLE PRECISION,
+  limit_price DOUBLE PRECISION NOT NULL,
+  status TEXT NOT NULL,
+  replacements INTEGER NOT NULL,
+  exit_reason TEXT,
+  first_seen_timestamp BIGINT NOT NULL,
+  updated_timestamp BIGINT NOT NULL,
+  market_date DATE,
+  data JSONB NOT NULL
+);
+CREATE INDEX IF NOT EXISTS order_lifecycle_symbol_updated_idx
+  ON order_lifecycle (symbol, updated_timestamp DESC);
+CREATE INDEX IF NOT EXISTS order_lifecycle_status_updated_idx
+  ON order_lifecycle (status, updated_timestamp DESC);
+
+CREATE TABLE IF NOT EXISTS order_lifecycle_events (
+  id BIGSERIAL PRIMARY KEY,
+  event_timestamp BIGINT NOT NULL,
+  market_date DATE,
+  event_type TEXT NOT NULL,
+  client_order_id TEXT NOT NULL,
+  broker_order_id TEXT,
+  purpose TEXT NOT NULL,
+  symbol TEXT NOT NULL,
+  status TEXT NOT NULL,
+  filled_quantity INTEGER NOT NULL,
+  average_fill_price DOUBLE PRECISION,
+  limit_price DOUBLE PRECISION NOT NULL,
+  replacements INTEGER NOT NULL,
+  data JSONB NOT NULL
+);
+CREATE INDEX IF NOT EXISTS order_lifecycle_events_client_timestamp_idx
+  ON order_lifecycle_events (client_order_id, event_timestamp, id);
+CREATE INDEX IF NOT EXISTS order_lifecycle_events_symbol_timestamp_idx
+  ON order_lifecycle_events (symbol, event_timestamp DESC);
 `;
+
+interface NormalizedOrderLifecycle {
+  clientOrderId: string;
+  brokerOrderId?: string;
+  purpose: "ENTRY" | "EXIT";
+  symbol: string;
+  side: string;
+  requestedQuantity: number;
+  filledQuantity: number;
+  averageFillPrice?: number;
+  limitPrice: number;
+  status: string;
+  replacements: number;
+  exitReason?: string;
+  firstSeenTimestamp: number;
+}
 
 /** Persistent, batched market history plus synchronous execution audit storage. */
 export class PostgresHistoryStore implements HistoryStore, AuditRecorder {
@@ -116,11 +176,80 @@ export class PostgresHistoryStore implements HistoryStore, AuditRecorder {
         [event.timestamp, event.marketDate ?? null, event.type, event.configVersion,
           event.calibrationVersion ?? null, JSON.stringify(event.data)],
       );
+      const lifecycle = normalizedOrderLifecycle(event);
+      if (lifecycle) await this.#recordOrderLifecycle(event, lifecycle);
       this.#auditHealthy = true;
     } catch (error) {
       this.#recordError(error, "audit");
       throw error;
     }
+  }
+
+  async #recordOrderLifecycle(event: AuditEvent, order: NormalizedOrderLifecycle): Promise<void> {
+    const values = [
+      event.timestamp,
+      event.marketDate ?? null,
+      event.type,
+      order.clientOrderId,
+      order.brokerOrderId ?? null,
+      order.purpose,
+      order.symbol,
+      order.status,
+      order.filledQuantity,
+      order.averageFillPrice ?? null,
+      order.limitPrice,
+      order.replacements,
+      JSON.stringify(event.data),
+    ];
+    await this.#client.query(
+      `INSERT INTO order_lifecycle_events
+        (event_timestamp, market_date, event_type, client_order_id, broker_order_id, purpose, symbol,
+         status, filled_quantity, average_fill_price, limit_price, replacements, data)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb)`,
+      values,
+    );
+    await this.#client.query(
+      `INSERT INTO order_lifecycle
+        (client_order_id, broker_order_id, purpose, symbol, side, requested_quantity, filled_quantity,
+         average_fill_price, limit_price, status, replacements, exit_reason, first_seen_timestamp,
+         updated_timestamp, market_date, data)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16::jsonb)
+       ON CONFLICT (client_order_id) DO UPDATE SET
+         broker_order_id = COALESCE(EXCLUDED.broker_order_id, order_lifecycle.broker_order_id),
+         purpose = EXCLUDED.purpose,
+         symbol = EXCLUDED.symbol,
+         side = EXCLUDED.side,
+         requested_quantity = EXCLUDED.requested_quantity,
+         filled_quantity = EXCLUDED.filled_quantity,
+         average_fill_price = COALESCE(EXCLUDED.average_fill_price, order_lifecycle.average_fill_price),
+         limit_price = EXCLUDED.limit_price,
+         status = EXCLUDED.status,
+         replacements = EXCLUDED.replacements,
+         exit_reason = COALESCE(EXCLUDED.exit_reason, order_lifecycle.exit_reason),
+         first_seen_timestamp = LEAST(EXCLUDED.first_seen_timestamp, order_lifecycle.first_seen_timestamp),
+         updated_timestamp = EXCLUDED.updated_timestamp,
+         market_date = COALESCE(EXCLUDED.market_date, order_lifecycle.market_date),
+         data = EXCLUDED.data
+       WHERE order_lifecycle.updated_timestamp <= EXCLUDED.updated_timestamp`,
+      [
+        order.clientOrderId,
+        order.brokerOrderId ?? null,
+        order.purpose,
+        order.symbol,
+        order.side,
+        order.requestedQuantity,
+        order.filledQuantity,
+        order.averageFillPrice ?? null,
+        order.limitPrice,
+        order.status,
+        order.replacements,
+        order.exitReason ?? null,
+        order.firstSeenTimestamp,
+        event.timestamp,
+        event.marketDate ?? null,
+        JSON.stringify(event.data),
+      ],
+    );
   }
 
   healthy(): boolean { return this.#marketHealthy && this.#auditHealthy && !this.#closed; }
@@ -224,4 +353,45 @@ export class PostgresHistoryStore implements HistoryStore, AuditRecorder {
 function formatDatabaseDate(value: string | Date): string {
   if (typeof value === "string") return value.slice(0, 10);
   return value.toISOString().slice(0, 10);
+}
+
+function normalizedOrderLifecycle(event: AuditEvent): NormalizedOrderLifecycle | undefined {
+  if (!["broker_order_request", "broker_order_state", "broker_order_replaced"].includes(event.type)) return undefined;
+  const local = event.type === "broker_order_request"
+    ? objectValue(event.data.order) : objectValue(event.data.localOrder);
+  const broker = event.type === "broker_order_state"
+    ? objectValue(event.data.broker) : event.type === "broker_order_replaced"
+      ? objectValue(event.data.replacement) : {};
+  const clientOrderId = textValue(local.clientOrderId) ?? textValue(broker.clientOrderId);
+  if (!clientOrderId) return undefined;
+  const averageFillPrice = finiteNumber(broker.averageFillPrice) ?? finiteNumber(local.averageFillPrice);
+  const brokerOrderId = textValue(broker.id);
+  const exitReason = textValue(event.data.reason);
+  return {
+    clientOrderId,
+    ...(brokerOrderId ? { brokerOrderId } : {}),
+    purpose: event.data.purpose === "EXIT" ? "EXIT" : "ENTRY",
+    symbol: textValue(local.symbol) ?? textValue(broker.symbol) ?? "UNKNOWN",
+    side: textValue(local.side) ?? "UNKNOWN",
+    requestedQuantity: finiteNumber(local.requestedQuantity) ?? 0,
+    filledQuantity: finiteNumber(broker.filledQuantity) ?? finiteNumber(local.filledQuantity) ?? 0,
+    ...(averageFillPrice !== undefined && averageFillPrice > 0 ? { averageFillPrice } : {}),
+    limitPrice: finiteNumber(local.limitPrice) ?? 0,
+    status: textValue(broker.status) ?? textValue(local.status) ?? "UNKNOWN",
+    replacements: finiteNumber(local.replacements) ?? 0,
+    ...(exitReason ? { exitReason } : {}),
+    firstSeenTimestamp: finiteNumber(local.submittedAt) ?? event.timestamp,
+  };
+}
+
+function objectValue(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
+}
+
+function textValue(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function finiteNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }

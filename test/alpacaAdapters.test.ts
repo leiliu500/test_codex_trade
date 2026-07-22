@@ -16,6 +16,10 @@ test("Alpaca market-data boundary maps official compact schemas", () => {
   const option = adaptAlpacaOptionQuote({ T: "q", S: "SPY260724C00500000", t: time, bp: 1, ap: 1.02, bs: 20, as: 30 });
   assert.equal(option.askPrice, 1.02);
   assert.ok(Number.isFinite(option.timestamp));
+  const msgpackOption = adaptAlpacaOptionQuote({
+    T: "q", S: "SPY260724C00500000", t: new Date(time), bp: 1, ap: 1.02, bs: 20, as: 30,
+  });
+  assert.equal(msgpackOption.timestamp, Date.parse(time));
 });
 
 test("concrete Alpaca REST adapter uses paper-safe v2 option/order/account mappings", async () => {
