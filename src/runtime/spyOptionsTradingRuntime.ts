@@ -271,12 +271,14 @@ export class SpyOptionsTradingRuntime {
         });
         if (!signal) return;
         const subscribedContracts = this.#contracts.filter((contract) => this.#subscribedSymbols.has(contract.symbol));
-        const selection = this.#selector.select(signal, subscribedContracts, this.#book);
+        const decisionTimestamp = this.#now();
+        const selection = this.#selector.select(signal, subscribedContracts, this.#book, decisionTimestamp);
         const candidate = selection.selected;
         const quote = candidate ? this.#book.get(candidate.symbol)?.quote : undefined;
         const signalEvent = {
           signalId: signal.id,
           timestamp: signal.timestamp,
+          decisionTimestamp,
           direction: signal.direction,
           kind: signal.kind,
           regime: signal.regime,

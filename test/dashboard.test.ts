@@ -92,6 +92,10 @@ test("dashboard reconstructs fired entries, broker execution, trades, and perfor
     candidateMetrics: { score: 12.5, delta: 0.52, mid: 2, spreadPct: 0.02, costMarginBps: 3.1 },
     candidateQuote: { timestamp, bidPrice: 1.98, askPrice: 2.02 },
   }));
+  dashboard.record(event("risk_decision", {
+    signalId: "signal-1",
+    risk: { allowed: true, reasons: [], quantity: 2, stopPrice: 1.5, targetPrice: 2.7 },
+  }, 5));
   dashboard.record(event("broker_order_request", {
     purpose: "ENTRY", signalId: "signal-1",
     order: {
@@ -166,6 +170,10 @@ test("dashboard reconstructs fired entries, broker execution, trades, and perfor
   }, 60_110));
 
   const snapshot = dashboard.snapshot();
+  assert.equal(snapshot.performance.signalsFired, 1);
+  assert.equal(snapshot.performance.optionsSelected, 1);
+  assert.equal(snapshot.performance.riskAllowed, 1);
+  assert.equal(snapshot.performance.riskBlocked, 0);
   assert.equal(snapshot.performance.entriesFired, 1);
   assert.equal(snapshot.performance.entryOrders, 1);
   assert.equal(snapshot.performance.exitOrders, 1);
@@ -201,4 +209,74 @@ test("dashboard reconstructs fired entries, broker execution, trades, and perfor
   assert.match(tradingDashboardHtml(), /Entry Timing &amp; Quality/);
   assert.match(tradingDashboardHtml(), /Order Execution Quality/);
   assert.match(tradingDashboardHtml(), /Setup Comparison/);
+  assert.match(tradingDashboardHtml(), /Signal → Trade Funnel/);
+  assert.match(tradingDashboardHtml(), /Winner Profit Capture/);
+});
+
+test("dashboard exposes the full signal funnel and excludes losses from profit capture", () => {
+  const dashboard = new TradingDashboardStore(timestamp, true);
+  dashboard.record(event("live_signal_selection", {
+    signalId: "no-option", timestamp, direction: "BULLISH", kind: "IMPULSE", regime: "STRONG_UP",
+    projectedMoveBps: 0.4, candidate: null, evaluatedContracts: 24,
+  }));
+  dashboard.record(event("live_signal_selection", {
+    signalId: "risk-blocked", timestamp: timestamp + 1_000, direction: "BULLISH", kind: "IMPULSE",
+    regime: "STRONG_UP", projectedMoveBps: 1, candidate: symbol, evaluatedContracts: 24,
+  }, 1_000));
+  dashboard.record(event("risk_decision", {
+    signalId: "risk-blocked",
+    risk: { allowed: false, reasons: ["MAX_DAILY_ENTRIES_REACHED"], quantity: 0 },
+  }, 1_010));
+  dashboard.record(event("live_signal_selection", {
+    signalId: "risk-allowed", timestamp: timestamp + 2_000, direction: "BULLISH", kind: "IMPULSE",
+    regime: "STRONG_UP", projectedMoveBps: 1, candidate: symbol, evaluatedContracts: 24,
+  }, 2_000));
+  dashboard.record(event("risk_decision", {
+    signalId: "risk-allowed", risk: { allowed: true, reasons: [], quantity: 1 },
+  }, 2_010));
+
+  let snapshot = dashboard.snapshot();
+  assert.equal(snapshot.performance.signalsFired, 3);
+  assert.equal(snapshot.performance.optionsSelected, 2);
+  assert.equal(snapshot.performance.riskAllowed, 1);
+  assert.equal(snapshot.performance.riskBlocked, 1);
+  assert.equal(snapshot.signals.find((signal) => signal.id === "risk-blocked")?.status, "ORDER_BLOCKED");
+
+  dashboard.record(event("entry_fill", {
+    position: {
+      symbol, direction: "BULLISH", quantity: 1, averageEntryPrice: 2,
+      entryTimestamp: timestamp + 2_100, highWaterMark: 2, lowWaterMark: 2,
+    },
+  }, 2_100));
+  dashboard.recordMarketEvent({
+    type: "option_quote", providerTimestamp: timestamp + 2_200, receivedTimestamp: timestamp + 2_201,
+    marketDate: "2026-07-22", symbol,
+    data: { symbol, timestamp: timestamp + 2_200, bidPrice: 2.09, askPrice: 2.11, bidSize: 50, askSize: 50 },
+  });
+  dashboard.record(event("exit_fill", {
+    reason: "TREND_INVALIDATION", symbol, direction: "BULLISH", entryTimestamp: timestamp + 2_100,
+    averageEntryPrice: 2, incrementalQuantity: 1, incrementalPrice: 1.9,
+    realizedPnl: -10, remainingQuantity: 0, highWaterMark: 2.1, lowWaterMark: 1.9,
+  }, 2_300));
+  snapshot = dashboard.snapshot();
+  assert.ok(Math.abs((snapshot.trades[0]?.maxFavorableExcursionPct ?? 0) - 5) < 1e-9);
+  assert.ok(Math.abs((snapshot.trades[0]?.maxAdverseExcursionPct ?? 0) + 5) < 1e-9);
+  assert.equal(snapshot.trades[0]?.capturePct, undefined);
+  assert.equal(snapshot.tuning.summary.avgCapturePct, undefined);
+
+  const winner = new TradingDashboardStore(timestamp, true);
+  winner.record(event("entry_fill", {
+    position: {
+      symbol, direction: "BULLISH", quantity: 1, averageEntryPrice: 2,
+      entryTimestamp: timestamp, highWaterMark: 2, lowWaterMark: 2,
+    },
+  }));
+  winner.record(event("exit_fill", {
+    reason: "OPPOSITE_REGIME", symbol, direction: "BULLISH", entryTimestamp: timestamp,
+    averageEntryPrice: 2, incrementalQuantity: 1, incrementalPrice: 2.2,
+    realizedPnl: 20, remainingQuantity: 0, highWaterMark: 2, lowWaterMark: 2,
+  }, 1_000));
+  const winningTrade = winner.snapshot().trades[0];
+  assert.ok(Math.abs((winningTrade?.maxFavorableExcursionPct ?? 0) - 10) < 1e-9);
+  assert.ok(Math.abs((winningTrade?.capturePct ?? 0) - 100) < 1e-9);
 });

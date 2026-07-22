@@ -17,8 +17,14 @@ export class OptionSelector {
   readonly #config: EngineConfig;
   constructor(config: EngineConfig) { this.#config = config; }
 
-  select(signal: TradeSignal, contracts: readonly OptionContract[], book: OptionBook): SelectionResult {
-    const evaluations = contracts.map((contract) => this.evaluate(contract, book.get(contract.symbol), signal));
+  select(
+    signal: TradeSignal,
+    contracts: readonly OptionContract[],
+    book: OptionBook,
+    decisionTimestamp = signal.timestamp,
+  ): SelectionResult {
+    const evaluations = contracts.map((contract) =>
+      this.evaluate(contract, book.get(contract.symbol), signal, decisionTimestamp));
     const eligible = evaluations.filter((candidate) => candidate.eligible)
       .sort((a, b) => b.score! - a.score!);
     const rejectionCounts: Record<string, number> = {};
@@ -32,7 +38,12 @@ export class OptionSelector {
     };
   }
 
-  evaluate(contract: OptionContract, entry: OptionBookEntry | undefined, signal: TradeSignal): OptionCandidateEvaluation {
+  evaluate(
+    contract: OptionContract,
+    entry: OptionBookEntry | undefined,
+    signal: TradeSignal,
+    decisionTimestamp = signal.timestamp,
+  ): OptionCandidateEvaluation {
     const rejectionReasons: string[] = [];
     const expectedType = signal.direction === "BULLISH" ? "call" : "put";
     const date = marketDate(signal.timestamp, this.#config.timeZone);
@@ -43,7 +54,7 @@ export class OptionSelector {
     if (secondsSinceMidnight(signal.timestamp, this.#config.timeZone) > parseClock(this.#config.options.zeroDteEntryCutoff)) rejectionReasons.push("ZERO_DTE_CUTOFF");
     if (Math.abs(contract.strike / signal.featureSnapshot.price - 1) > this.#config.options.strikeRangePct) rejectionReasons.push("STRIKE_OUTSIDE_RANGE");
     const quoteValidation = entry?.quote
-      ? validateOptionQuote(entry.quote, signal.timestamp, this.#config.dataQuality)
+      ? validateOptionQuote(entry.quote, decisionTimestamp, this.#config.dataQuality)
       : { usable: false, reasons: ["MISSING_QUOTE"] };
     if (!quoteValidation.usable) rejectionReasons.push(...quoteValidation.reasons.map((reason) => `QUOTE_${reason}`));
     const quote = entry?.quote;
