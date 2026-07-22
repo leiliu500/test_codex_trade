@@ -97,7 +97,7 @@
     "maxRiskDollarsPerTrade": 500,
     "maxPremiumDollarsPerTrade": 1500,
     "maxContracts": 10,
-    "maxTradesPerDay": 6,
+    "maxTradesPerDay": 1000,
     "maxDailyLossDollars": 1000,
     "hardOptionStopPct": 0.25,
     "optionProfitTargetPct": 0.35,
