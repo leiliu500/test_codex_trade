@@ -29,6 +29,56 @@ test("dashboard exposes liveness and feed tabs before any entries, orders, or hi
   assert.match(html, /Entry &amp; Order Tuning/);
   assert.match(html, /Live Feed Into System/);
   assert.match(html, /Entry Evaluations &amp; Decisions/);
+  assert.match(html, /Potential Missed Entry Review/);
+  assert.match(html, /Actionable stages only/);
+});
+
+test("dashboard separates potential hindsight misses from routine no-signal evaluations", () => {
+  const dashboard = new TradingDashboardStore(timestamp, true);
+  const noSignal = (price: number) => ({
+    decision: "NO_SIGNAL",
+    reasons: ["NO_DIRECTION_PASSED"],
+    regime: "GRIND_UP",
+    feature: { price },
+    directions: [{
+      direction: "BULLISH",
+      passed: false,
+      reasons: ["MEDIUM_SLOPE_MISALIGNED"],
+      votes: [{ name: "FAST_SLOPE", passed: false, value: 0.2, threshold: 0.42 }],
+    }, {
+      direction: "BEARISH",
+      passed: false,
+      reasons: ["MEDIUM_SLOPE_MISALIGNED"],
+      votes: [{ name: "FAST_SLOPE", passed: false, value: 0.2, threshold: -0.42 }],
+    }],
+  });
+
+  dashboard.record(event("live_entry_evaluation", noSignal(500)));
+  dashboard.record(event("live_entry_evaluation", noSignal(500.15), 5_000));
+  dashboard.record(event("live_entry_evaluation", noSignal(500.30), 10_000));
+
+  const snapshot = dashboard.snapshot();
+  assert.equal(snapshot.tuning.falseNegativeSummary.evaluations, 3);
+  assert.equal(snapshot.tuning.falseNegativeSummary.noSignalEvaluations, 3);
+  assert.equal(snapshot.tuning.falseNegativeSummary.matureNoSignalEvaluations, 2);
+  assert.equal(snapshot.tuning.falseNegativeSummary.potentialMisses, 1);
+  assert.equal(snapshot.tuning.falseNegativeSummary.bullishPotentialMisses, 1);
+  assert.equal(snapshot.tuning.falseNegativeSummary.bearishPotentialMisses, 0);
+  assert.equal(snapshot.tuning.potentialMisses[0]?.direction, "BULLISH");
+  assert.ok(Math.abs((snapshot.tuning.potentialMisses[0]?.forwardMoveBps ?? 0) - 3) < 1e-9);
+  assert.deepEqual(snapshot.tuning.potentialMisses[0]?.failedGates, [
+    "MEDIUM_SLOPE_MISALIGNED",
+    "FAST_SLOPE 0.200 vs 0.420",
+  ]);
+
+  const safetyBlocked = new TradingDashboardStore(timestamp, true);
+  safetyBlocked.record(event("live_entry_evaluation", {
+    ...noSignal(500),
+    reasons: ["WHIPSAW_REGIME_BLOCKED"],
+  }));
+  safetyBlocked.record(event("live_entry_evaluation", noSignal(500.15), 5_000));
+  assert.equal(safetyBlocked.snapshot().tuning.falseNegativeSummary.matureNoSignalEvaluations, 1);
+  assert.equal(safetyBlocked.snapshot().tuning.falseNegativeSummary.potentialMisses, 0);
 });
 
 test("dashboard reconstructs fired entries, broker execution, trades, and performance from audit history", () => {

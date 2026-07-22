@@ -136,6 +136,34 @@ export interface DashboardTuningSummary {
 export interface DashboardTuning {
   summary: DashboardTuningSummary;
   entries: DashboardEntryQuality[];
+  falseNegativeSummary: DashboardFalseNegativeSummary;
+  potentialMisses: DashboardPotentialMiss[];
+}
+
+export interface DashboardPotentialMiss {
+  id: string;
+  timestamp: number;
+  direction: "BULLISH" | "BEARISH";
+  regime: string;
+  price: number;
+  forwardPrice: number;
+  forwardMoveBps: number;
+  horizonSec: number;
+  thresholdBps: number;
+  reasons: string[];
+  failedGates: string[];
+}
+
+export interface DashboardFalseNegativeSummary {
+  evaluations: number;
+  noSignalEvaluations: number;
+  matureNoSignalEvaluations: number;
+  potentialMisses: number;
+  potentialMissRate: number;
+  bullishPotentialMisses: number;
+  bearishPotentialMisses: number;
+  horizonSec: number;
+  thresholdBps: number;
 }
 
 export interface DashboardActiveOrder {
@@ -180,6 +208,10 @@ export interface DashboardDecision {
   signalId?: string;
   direction?: string;
   symbol?: string;
+  regime?: string;
+  price?: number;
+  forwardPrice?: number;
+  forwardMoveBps?: number;
   summary: string;
   reasons: string[];
   directions?: Array<{
@@ -264,6 +296,11 @@ interface DashboardOptionQuote {
   askPrice: number;
 }
 
+const MISSED_ENTRY_HORIZON_SEC = 5;
+const MISSED_ENTRY_MOVE_THRESHOLD_BPS = 2;
+const FORWARD_SAMPLE_TOLERANCE_MS = 2_000;
+const MISSED_ENTRY_CLUSTER_MS = 15_000;
+
 /** Reconstructible read model derived only from durable execution audit events. */
 export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
   readonly #startedAt: number;
@@ -279,10 +316,14 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
   readonly #recentMarketEvents: DashboardLiveFeedEvent[] = [];
   readonly #lastFeedSampleAt = new Map<HistoricalMarketEventType, number>();
   readonly #decisions: DashboardDecision[] = [];
+  readonly #potentialMisses: DashboardPotentialMiss[] = [];
   #lastMarketEventReceivedAt: number | undefined;
   #lastProviderTimestamp: number | undefined;
   #feedSequence = 0;
   #decisionSequence = 0;
+  #entryEvaluationCount = 0;
+  #noSignalEvaluationCount = 0;
+  #matureNoSignalEvaluationCount = 0;
   #lastMarketDate: string | undefined;
   #lastExecutionError: string | undefined;
 
@@ -398,6 +439,10 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
       tuning: {
         summary: tuningSummary(entryQuality),
         entries: entryQuality,
+        falseNegativeSummary: this.#falseNegativeSummary(),
+        potentialMisses: this.#potentialMisses.slice(0, 250).map((miss) => ({
+          ...miss, reasons: [...miss.reasons], failedGates: [...miss.failedGates],
+        })),
       },
       liveData: {
         persistenceEnabled: this.#persistenceEnabled,
@@ -428,12 +473,18 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
     let summary = event.type.replaceAll("_", " ");
     let reasons = stringArray(event.data.reasons);
     let directions: DashboardDecision["directions"] | undefined;
+    let regime: string | undefined;
+    let price: number | undefined;
 
     if (event.type === "live_entry_evaluation") {
       stage = "ENTRY_EVALUATION";
       outcome = stringValue(event.data.decision) ?? "UNKNOWN";
-      const regime = stringValue(event.data.regime) ?? "UNKNOWN";
+      regime = stringValue(event.data.regime) ?? "UNKNOWN";
       const feature = recordValue(event.data.feature);
+      price = numberValue(feature.price);
+      if (price !== undefined) this.#updateForwardEntryEvaluations(event.timestamp, price);
+      this.#entryEvaluationCount += 1;
+      if (outcome === "NO_SIGNAL") this.#noSignalEvaluationCount += 1;
       summary = `${regime} · SPY ${formatFeedNumber(numberValue(feature.price))}`;
       directions = decisionDirections(event.data.directions);
     } else if (event.type === "live_signal_selection") {
@@ -477,11 +528,67 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
       ...(signalId ? { signalId } : {}),
       ...(direction ? { direction } : {}),
       ...(symbol ? { symbol } : {}),
+      ...(regime ? { regime } : {}),
+      ...(price !== undefined ? { price } : {}),
       summary,
       reasons,
       ...(directions ? { directions } : {}),
     });
     if (this.#decisions.length > 1_000) this.#decisions.length = 1_000;
+  }
+
+  #updateForwardEntryEvaluations(timestamp: number, forwardPrice: number): void {
+    const horizonMs = MISSED_ENTRY_HORIZON_SEC * 1_000;
+    for (const decision of this.#decisions) {
+      if (decision.stage !== "ENTRY_EVALUATION" || decision.price === undefined ||
+          decision.forwardMoveBps !== undefined) continue;
+      const elapsed = timestamp - decision.timestamp;
+      if (elapsed < horizonMs) continue;
+      if (elapsed > horizonMs + FORWARD_SAMPLE_TOLERANCE_MS) continue;
+      const forwardMoveBps = 10_000 * (forwardPrice - decision.price) / decision.price;
+      decision.forwardPrice = forwardPrice;
+      decision.forwardMoveBps = forwardMoveBps;
+      if (decision.outcome !== "NO_SIGNAL") continue;
+      this.#matureNoSignalEvaluationCount += 1;
+      if (!decision.reasons.includes("NO_DIRECTION_PASSED") ||
+          Math.abs(forwardMoveBps) < MISSED_ENTRY_MOVE_THRESHOLD_BPS) continue;
+      const direction: DashboardPotentialMiss["direction"] = forwardMoveBps > 0 ? "BULLISH" : "BEARISH";
+      if (this.#potentialMisses.some((miss) => miss.direction === direction &&
+          Math.abs(miss.timestamp - decision.timestamp) < MISSED_ENTRY_CLUSTER_MS)) continue;
+      const directionDecision = decision.directions?.find((item) => item.direction === direction);
+      const failedVotes = directionDecision?.votes.filter((vote) => !vote.passed).map((vote) =>
+        `${vote.name} ${vote.value.toFixed(3)} vs ${vote.threshold.toFixed(3)}`) ?? [];
+      this.#potentialMisses.unshift({
+        id: `potential-miss-${decision.id}`,
+        timestamp: decision.timestamp,
+        direction,
+        regime: decision.regime ?? "UNKNOWN",
+        price: decision.price,
+        forwardPrice,
+        forwardMoveBps,
+        horizonSec: MISSED_ENTRY_HORIZON_SEC,
+        thresholdBps: MISSED_ENTRY_MOVE_THRESHOLD_BPS,
+        reasons: [...decision.reasons],
+        failedGates: [...new Set([...(directionDecision?.reasons ?? []), ...failedVotes])],
+      });
+      if (this.#potentialMisses.length > 2_000) this.#potentialMisses.length = 2_000;
+    }
+  }
+
+  #falseNegativeSummary(): DashboardFalseNegativeSummary {
+    const potentialMisses = this.#potentialMisses.length;
+    return {
+      evaluations: this.#entryEvaluationCount,
+      noSignalEvaluations: this.#noSignalEvaluationCount,
+      matureNoSignalEvaluations: this.#matureNoSignalEvaluationCount,
+      potentialMisses,
+      potentialMissRate: this.#matureNoSignalEvaluationCount > 0
+        ? potentialMisses / this.#matureNoSignalEvaluationCount : 0,
+      bullishPotentialMisses: this.#potentialMisses.filter((miss) => miss.direction === "BULLISH").length,
+      bearishPotentialMisses: this.#potentialMisses.filter((miss) => miss.direction === "BEARISH").length,
+      horizonSec: MISSED_ENTRY_HORIZON_SEC,
+      thresholdBps: MISSED_ENTRY_MOVE_THRESHOLD_BPS,
+    };
   }
 
   #activeOrders(generatedAt: number, orders: DashboardOrder[]): DashboardActiveOrder[] {
@@ -1128,7 +1235,7 @@ export function tradingDashboardHtml(): string {
   return `<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>SPY 0DTE Trading Dashboard</title><style>
-:root{color-scheme:dark;--bg:#07111f;--panel:#0e1b2e;--line:#20324b;--text:#e7eef9;--muted:#91a4bd;--green:#35d07f;--red:#ff667a;--blue:#58a6ff;--amber:#f5c451}*{box-sizing:border-box}body{margin:0;background:linear-gradient(135deg,#06101c,#0a1830);color:var(--text);font:14px ui-sans-serif,system-ui,sans-serif}main{max-width:1500px;margin:auto;padding:24px}header{display:flex;justify-content:space-between;gap:18px;align-items:center;margin-bottom:18px}h1{font-size:24px;margin:0}h2{font-size:16px;margin:0 0 12px}.sub,.muted{color:var(--muted)}#state{display:flex;align-items:center;gap:8px;font-weight:700;padding:8px 12px;border:1px solid var(--line);border-radius:999px}.pulse-dot{width:9px;height:9px;border-radius:50%;background:currentColor;box-shadow:0 0 0 0 currentColor;animation:pulse 1.8s infinite}@keyframes pulse{70%{box-shadow:0 0 0 7px transparent}}.ok{color:var(--green)}.degraded{color:var(--amber)}.halted{color:var(--red)}.liveness-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(185px,1fr));gap:10px;margin-bottom:18px}.status-card{background:#0b192b;border:1px solid var(--line);border-radius:10px;padding:12px}.status-card .label{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.05em}.status-card strong{display:block;margin:5px 0 3px;font-size:14px}.status-detail{color:var(--muted);font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.tabs{display:flex;gap:5px;border-bottom:1px solid var(--line);margin-bottom:16px}.tab{appearance:none;border:0;border-bottom:2px solid transparent;background:transparent;color:var(--muted);font:inherit;font-weight:700;padding:11px 16px;cursor:pointer}.tab:hover{color:var(--text)}.tab.active{color:var(--blue);border-bottom-color:var(--blue)}.tab-panel{display:none}.tab-panel.active{display:block}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:12px;margin-bottom:18px}.card,.panel{background:rgba(14,27,46,.94);border:1px solid var(--line);border-radius:12px;box-shadow:0 10px 30px #0003}.card{padding:14px}.card .value{font-size:23px;font-weight:750;margin-top:6px}.panel{padding:16px;margin:14px 0;overflow:auto}.live-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(310px,1fr));gap:14px}.live-card{background:linear-gradient(145deg,#12243d,#0b1729);border:1px solid #294262;border-radius:13px;padding:16px;min-width:0;box-shadow:inset 3px 0 0 var(--blue)}.live-card.profit{box-shadow:inset 3px 0 0 var(--green)}.live-card.loss{box-shadow:inset 3px 0 0 var(--red)}.live-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}.live-symbol{font-weight:750;font-size:16px;overflow-wrap:anywhere}.badge,.source{display:inline-block;margin-top:5px;padding:3px 7px;border-radius:999px;background:#58a6ff1c;color:var(--blue);font-size:11px;font-weight:700;letter-spacing:.04em}.source{margin:0}.live-pnl{text-align:right;font-size:22px;font-weight:800}.live-return{text-align:right;font-size:12px;margin-top:3px}.live-fields{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin-top:16px}.live-field span{display:block;color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.04em;margin-bottom:4px}.live-field strong{font-size:14px}.order-strip{border-top:1px solid var(--line);margin-top:15px;padding-top:12px;display:flex;justify-content:space-between;gap:10px;color:var(--muted);font-size:12px}.empty{color:var(--muted);padding:22px;text-align:center;border:1px dashed var(--line);border-radius:10px}.section-note{color:var(--muted);font-size:12px;margin:-6px 0 12px}.decision-reasons{max-width:560px;white-space:normal;line-height:1.45}.outcome{font-weight:750}.outcome.pass{color:var(--green)}.outcome.block{color:var(--amber)}.tune-controls{display:flex;align-items:end;gap:12px;flex-wrap:wrap;margin-bottom:14px}.tune-control{display:grid;gap:5px}.tune-control label{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.04em}.tune-control select{min-width:150px;background:#0a1728;color:var(--text);border:1px solid var(--line);border-radius:7px;padding:8px 10px}.legend{display:flex;gap:16px;flex-wrap:wrap;color:var(--muted);font-size:11px;margin:8px 0}.quality-status{font-weight:750}.quality-status.WIN,.quality-status.FILLED,.quality-status.OPEN{color:var(--green)}.quality-status.LOSS,.quality-status.BLOCKED{color:var(--red)}.quality-status.WORKING,.quality-status.NO_OPTION{color:var(--amber)}table{border-collapse:collapse;width:100%;min-width:850px}th,td{text-align:left;padding:9px 10px;border-bottom:1px solid var(--line);white-space:nowrap}th{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.04em}tbody tr:hover{background:#ffffff08}.positive{color:var(--green)}.negative{color:var(--red)}@media(max-width:700px){main{padding:14px}header{align-items:flex-start;flex-direction:column}.live-fields{grid-template-columns:repeat(2,minmax(0,1fr))}.tab{padding:10px}.tune-control{width:100%}.tune-control select{width:100%}}
+:root{color-scheme:dark;--bg:#07111f;--panel:#0e1b2e;--line:#20324b;--text:#e7eef9;--muted:#91a4bd;--green:#35d07f;--red:#ff667a;--blue:#58a6ff;--amber:#f5c451}*{box-sizing:border-box}body{margin:0;background:linear-gradient(135deg,#06101c,#0a1830);color:var(--text);font:14px ui-sans-serif,system-ui,sans-serif}main{max-width:1500px;margin:auto;padding:24px}header{display:flex;justify-content:space-between;gap:18px;align-items:center;margin-bottom:18px}h1{font-size:24px;margin:0}h2{font-size:16px;margin:0 0 12px}.sub,.muted{color:var(--muted)}#state{display:flex;align-items:center;gap:8px;font-weight:700;padding:8px 12px;border:1px solid var(--line);border-radius:999px}.pulse-dot{width:9px;height:9px;border-radius:50%;background:currentColor;box-shadow:0 0 0 0 currentColor;animation:pulse 1.8s infinite}@keyframes pulse{70%{box-shadow:0 0 0 7px transparent}}.ok{color:var(--green)}.degraded{color:var(--amber)}.halted{color:var(--red)}.liveness-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(185px,1fr));gap:10px;margin-bottom:18px}.status-card{background:#0b192b;border:1px solid var(--line);border-radius:10px;padding:12px}.status-card .label{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.05em}.status-card strong{display:block;margin:5px 0 3px;font-size:14px}.status-detail{color:var(--muted);font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.tabs{display:flex;gap:5px;border-bottom:1px solid var(--line);margin-bottom:16px}.tab{appearance:none;border:0;border-bottom:2px solid transparent;background:transparent;color:var(--muted);font:inherit;font-weight:700;padding:11px 16px;cursor:pointer}.tab:hover{color:var(--text)}.tab.active{color:var(--blue);border-bottom-color:var(--blue)}.tab-panel{display:none}.tab-panel.active{display:block}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:12px;margin-bottom:18px}.card,.panel{background:rgba(14,27,46,.94);border:1px solid var(--line);border-radius:12px;box-shadow:0 10px 30px #0003}.card{padding:14px}.card .value{font-size:23px;font-weight:750;margin-top:6px}.card-detail{font-size:11px;margin-top:4px}.panel{padding:16px;margin:14px 0;overflow:auto}.live-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(310px,1fr));gap:14px}.live-card{background:linear-gradient(145deg,#12243d,#0b1729);border:1px solid #294262;border-radius:13px;padding:16px;min-width:0;box-shadow:inset 3px 0 0 var(--blue)}.live-card.profit{box-shadow:inset 3px 0 0 var(--green)}.live-card.loss{box-shadow:inset 3px 0 0 var(--red)}.live-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}.live-symbol{font-weight:750;font-size:16px;overflow-wrap:anywhere}.badge,.source{display:inline-block;margin-top:5px;padding:3px 7px;border-radius:999px;background:#58a6ff1c;color:var(--blue);font-size:11px;font-weight:700;letter-spacing:.04em}.source{margin:0}.live-pnl{text-align:right;font-size:22px;font-weight:800}.live-return{text-align:right;font-size:12px;margin-top:3px}.live-fields{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin-top:16px}.live-field span{display:block;color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.04em;margin-bottom:4px}.live-field strong{font-size:14px}.order-strip{border-top:1px solid var(--line);margin-top:15px;padding-top:12px;display:flex;justify-content:space-between;gap:10px;color:var(--muted);font-size:12px}.empty{color:var(--muted);padding:22px;text-align:center;border:1px dashed var(--line);border-radius:10px}.section-note{color:var(--muted);font-size:12px;margin:-6px 0 12px}.decision-reasons{max-width:560px;white-space:normal;line-height:1.45}.outcome{font-weight:750}.outcome.pass{color:var(--green)}.outcome.block{color:var(--amber)}.tune-controls{display:flex;align-items:end;gap:12px;flex-wrap:wrap;margin-bottom:14px}.tune-control{display:grid;gap:5px}.tune-control label{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.04em}.tune-control select{min-width:150px;background:#0a1728;color:var(--text);border:1px solid var(--line);border-radius:7px;padding:8px 10px}.legend{display:flex;gap:16px;flex-wrap:wrap;color:var(--muted);font-size:11px;margin:8px 0}.quality-status{font-weight:750}.quality-status.WIN,.quality-status.FILLED,.quality-status.OPEN{color:var(--green)}.quality-status.LOSS,.quality-status.BLOCKED{color:var(--red)}.quality-status.WORKING,.quality-status.NO_OPTION{color:var(--amber)}table{border-collapse:collapse;width:100%;min-width:850px}th,td{text-align:left;padding:9px 10px;border-bottom:1px solid var(--line);white-space:nowrap}th{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.04em}tbody tr:hover{background:#ffffff08}.positive{color:var(--green)}.negative{color:var(--red)}@media(max-width:700px){main{padding:14px}header{align-items:flex-start;flex-direction:column}.live-fields{grid-template-columns:repeat(2,minmax(0,1fr))}.tab{padding:10px}.tune-control{width:100%}.tune-control select{width:100%}}
 </style></head><body><main><header><div><h1>SPY 0DTE Option Day-Trade Dashboard</h1><div class="sub">Live SIP signals · OPRA options · Alpaca paper execution · PostgreSQL history</div></div><div id="state"><span class="pulse-dot"></span><span id="stateText">Loading…</span></div></header>
 <section class="liveness-grid" aria-label="System liveness">
 <div class="status-card"><div class="label">Engine heartbeat</div><strong id="engineState">Connecting</strong><div class="status-detail" id="engineDetail">Waiting for dashboard API</div></div>
@@ -1142,6 +1249,8 @@ export function tradingDashboardHtml(): string {
 <div class="tab-panel active" id="tradingTab">
 <section class="cards">
 <div class="card"><div class="muted">Entries Fired</div><div class="value" id="entries">0</div></div>
+<div class="card"><div class="muted">Potential Missed Entries</div><div class="value" id="potentialMisses">0</div><div class="muted card-detail" id="potentialMissDetail">Waiting for +5s outcomes</div></div>
+<div class="card"><div class="muted">No-Signal Evaluations</div><div class="value" id="noSignalEvaluations">0</div><div class="muted card-detail" id="noSignalDetail">All decisions remain recorded</div></div>
 <div class="card"><div class="muted">Entry Orders</div><div class="value" id="entryOrders">0</div></div>
 <div class="card"><div class="muted">Closed Trades</div><div class="value" id="closedTrades">0</div></div>
 <div class="card"><div class="muted">Win Rate</div><div class="value" id="winRate">0%</div></div>
@@ -1154,6 +1263,7 @@ export function tradingDashboardHtml(): string {
 </section>
 <section class="panel"><h2>Live Orders</h2><div id="liveOrders" class="live-grid"><div class="empty">Waiting for an active option order…</div></div></section>
 <section class="panel"><h2>Entries Fired</h2><table><thead><tr><th>Time</th><th>Direction</th><th>Kind</th><th>Regime</th><th>Projected</th><th>Option</th><th>Status</th><th>Reason</th></tr></thead><tbody id="signals"></tbody></table></section>
+<section class="panel"><h2>Potential Missed Entry Review</h2><div class="section-note">Hindsight diagnostic, not an automatic trade recommendation. A row appears only when directional gates produced NO SIGNAL and SPY subsequently moved at least ${MISSED_ENTRY_MOVE_THRESHOLD_BPS.toFixed(1)} bps in one direction over the ${MISSED_ENTRY_HORIZON_SEC}-second projection horizon. Consecutive rows are clustered for readability.</div><table><thead><tr><th>Evaluation</th><th>Direction</th><th>Regime</th><th>SPY Start</th><th>SPY +${MISSED_ENTRY_HORIZON_SEC}s</th><th>Forward Move</th><th>Failed Gates / Votes</th><th>Decision Reason</th></tr></thead><tbody id="potentialMissRows"></tbody></table></section>
 <section class="panel"><h2>Orders &amp; Executions</h2><table><thead><tr><th>Time</th><th>Purpose</th><th>Option</th><th>Side</th><th>Qty</th><th>Limit</th><th>Filled</th><th>Avg Fill</th><th>Status</th></tr></thead><tbody id="orders"></tbody></table></section>
 <section class="panel"><h2>Trade Performance</h2><table><thead><tr><th>Entry</th><th>Exit</th><th>Option</th><th>Direction</th><th>Qty</th><th>Entry Px</th><th>Exit Px</th><th>P&amp;L</th><th>Return</th><th>Exit Reason</th><th>Status</th></tr></thead><tbody id="trades"></tbody></table></section>
 </div>
@@ -1188,7 +1298,7 @@ export function tradingDashboardHtml(): string {
 <div class="card"><div class="muted">Feature Decisions</div><div class="value" id="featureEvents">0</div></div>
 <div class="card"><div class="muted">Latest Feed Age</div><div class="value" id="feedAge">—</div></div>
 </section>
-<section class="panel"><h2>Entry Evaluations &amp; Decisions</h2><div class="section-note">Every feature evaluation is recorded, including no-signal and blocked decisions. Signal selection, risk, and execution stages share the same timeline.</div><table><thead><tr><th>Time</th><th>Stage</th><th>Outcome</th><th>Direction</th><th>Option</th><th>Decision</th><th>Gates, Votes &amp; Reasons</th></tr></thead><tbody id="decisions"></tbody></table></section>
+<section class="panel"><h2>Entry Evaluations &amp; Decisions</h2><div class="section-note">Every evaluation remains stored, but routine one-second NO SIGNAL rows are hidden by default. Use All evaluations only when diagnosing individual gates.</div><div class="tune-controls"><div class="tune-control"><label for="decisionView">Rows shown</label><select id="decisionView"><option value="ACTIONABLE">Actionable stages only</option><option value="ALL">All evaluations</option><option value="NO_SIGNAL">NO SIGNAL only</option></select></div></div><table><thead><tr><th>Time</th><th>Stage</th><th>Outcome</th><th>Direction</th><th>Option</th><th>Decision</th><th>Gates, Votes &amp; Reasons</th></tr></thead><tbody id="decisions"></tbody></table></section>
 <section class="panel"><h2>Live Feed Into System</h2><div class="section-note">The UI is sampled for readability. PostgreSQL retains quote baselines, full-resolution quotes for working/open options, and every trade, feature, decision, order, and fill.</div><table><thead><tr><th>Received</th><th>Feed</th><th>Type</th><th>Symbol</th><th>Value</th><th>Provider Latency</th><th>Storage Policy</th></tr></thead><tbody id="feedEventsBody"></tbody></table></section>
 </div>
 <div class="muted" id="updated"></div></main><script>
@@ -1199,6 +1309,9 @@ function renderLiveOrders(items){const root=$('liveOrders');if(!items||items.len
 function setStatus(valueId,detailId,value,detail,level){$(valueId).textContent=value;$(valueId).className=level;$(detailId).textContent=detail}function age(ms){return Number.isFinite(ms)?duration(ms)+' ago':'No events yet'}function storagePolicy(event,live){if(!live.persistenceEnabled)return 'Disabled';if(event.type==='stock_quote'||event.type==='option_quote')return (live.quoteSampleIntervalMs||0)+' ms baseline · active option full';return 'Full retention'}
 function outcomeClass(value){return ['SIGNAL','SELECTED','ALLOWED','SUBMITTED','REQUESTED','FILLED'].includes(value)?'outcome pass':['NO_SIGNAL','NO_ELIGIBLE_OPTION','BLOCKED','SKIPPED'].includes(value)?'outcome block':'outcome'}
 function decisionDetail(item){const details=[...(item.reasons||[])];for(const direction of item.directions||[]){const failedVotes=(direction.votes||[]).filter(v=>!v.passed).map(v=>v.name);const result=direction.passed?'PASS':(direction.reasons||[]).slice(0,6).join(', ');details.push(direction.direction+': '+result+(failedVotes.length?' · failed votes '+failedVotes.join(', '):''))}return details.join(' · ')||'All configured gates passed'}
+let latestDecisions=[];
+function renderDecisionRows(items){latestDecisions=items||[];const view=$('decisionView').value,filtered=view==='ALL'?latestDecisions:view==='NO_SIGNAL'?latestDecisions.filter(x=>x.stage==='ENTRY_EVALUATION'&&x.outcome==='NO_SIGNAL'):latestDecisions.filter(x=>!(x.stage==='ENTRY_EVALUATION'&&x.outcome==='NO_SIGNAL'));rows('decisions',filtered,[x=>({value:time(x.timestamp)}),x=>({value:x.stage.replaceAll('_',' ')}),x=>({value:x.outcome.replaceAll('_',' '),cls:outcomeClass(x.outcome)}),x=>({value:x.direction}),x=>({value:x.symbol}),x=>({value:x.summary}),x=>({value:decisionDetail(x),cls:'decision-reasons'})],view==='ACTIONABLE'?'No actionable signal, option-selection, risk, or order events yet. Routine NO SIGNAL evaluations remain recorded.':'No evaluations match this view.')}
+function renderPotentialMisses(tuning){const summary=tuning?.falseNegativeSummary||{noSignalEvaluations:0,matureNoSignalEvaluations:0,potentialMisses:0,potentialMissRate:0,horizonSec:5,thresholdBps:2},misses=tuning?.potentialMisses||[];$('potentialMisses').textContent=count(summary.potentialMisses);$('potentialMisses').className='value '+(summary.potentialMisses>0?'negative':'positive');$('potentialMissDetail').textContent=count(summary.potentialMisses)+' of '+count(summary.matureNoSignalEvaluations)+' mature · '+percent(100*summary.potentialMissRate,2);$('noSignalEvaluations').textContent=count(summary.noSignalEvaluations);$('noSignalDetail').textContent=count(summary.matureNoSignalEvaluations)+' have a +'+summary.horizonSec+'s outcome';rows('potentialMissRows',misses,[x=>({value:time(x.timestamp)}),x=>({value:x.direction,cls:x.direction==='BULLISH'?'positive':'negative'}),x=>({value:String(x.regime).replaceAll('_',' ')}),x=>({value:num(x.price)}),x=>({value:num(x.forwardPrice)}),x=>({value:signedBps(x.forwardMoveBps),cls:x.forwardMoveBps>0?'positive':'negative'}),x=>({value:(x.failedGates||[]).join(' · '),cls:'decision-reasons'}),x=>({value:(x.reasons||[]).join(' · '),cls:'decision-reasons'})],'No potential hindsight misses detected at the '+summary.horizonSec+'-second / '+num(summary.thresholdBps,1)+'-bps review threshold.')}
 const percent=(value,d=1)=>Number.isFinite(value)?num(value,d)+'%':'—',latency=value=>!Number.isFinite(value)?'—':value<1000?Math.round(value)+' ms':value<60000?num(value/1000,2)+' s':duration(value),signedBps=value=>Number.isFinite(value)?(value>0?'+':'')+num(value,1)+' bps':'—';
 function tuneAverage(values){const finite=values.filter(Number.isFinite);return finite.length?finite.reduce((sum,value)=>sum+value,0)/finite.length:undefined}
 function tuneStats(items){const submitted=items.filter(x=>x.orderTimestamp!==undefined),filled=submitted.filter(x=>x.firstFillTimestamp!==undefined),closed=items.filter(x=>['WIN','LOSS','FLAT'].includes(x.status));return{signals:items.length,submitted:submitted.length,filled:filled.length,closed:closed.length,fillRate:submitted.length?filled.length/submitted.length:0,replacementRate:submitted.length?submitted.filter(x=>(x.replacements||0)>0).length/submitted.length:0,winRate:closed.length?closed.filter(x=>x.status==='WIN').length/closed.length:0,avgPnl:tuneAverage(closed.map(x=>x.realizedPnl)),avgReturn:tuneAverage(closed.map(x=>x.returnPct)),avgSignalOrder:tuneAverage(items.map(x=>x.signalToOrderMs)),avgOrderFill:tuneAverage(items.map(x=>x.orderToFirstFillMs)),avgSlippage:tuneAverage(items.map(x=>x.entrySlippageBps)),avgMfe:tuneAverage(items.map(x=>x.maxFavorableExcursionPct)),avgMae:tuneAverage(items.map(x=>x.maxAdverseExcursionPct)),avgCapture:tuneAverage(items.map(x=>x.capturePct))}}
@@ -1210,10 +1323,11 @@ const ids=new Set(items.map(x=>x.signalId)),filteredOrders=latestQualityOrders.f
 const key=$('tuneBreakdown').value,groups=new Map();for(const item of items){const label=item[key]||'UNKNOWN';if(!groups.has(label))groups.set(label,[]);groups.get(label).push(item)}const compared=[...groups.entries()].map(([label,group])=>({label,...tuneStats(group)})).sort((a,b)=>b.signals-a.signals);rows('tuningGroups',compared,[x=>({value:String(x.label).replaceAll('_',' ')}),x=>({value:x.signals}),x=>({value:x.filled}),x=>({value:percent(100*x.fillRate)}),x=>({value:x.closed}),x=>({value:percent(100*x.winRate)}),x=>({value:money(x.avgPnl),cls:x.avgPnl>0?'positive':x.avgPnl<0?'negative':''}),x=>({value:percent(x.avgReturn),cls:x.avgReturn>0?'positive':x.avgReturn<0?'negative':''}),x=>({value:signedBps(x.avgSlippage),cls:x.avgSlippage>0?'negative':x.avgSlippage<0?'positive':''}),x=>({value:latency(x.avgOrderFill)}),x=>({value:percent(x.avgMfe),cls:x.avgMfe>0?'positive':''}),x=>({value:percent(x.avgMae),cls:x.avgMae<0?'negative':''})],'No grouped samples match these filters.')}
 document.querySelectorAll('.tab').forEach(button=>button.addEventListener('click',()=>{document.querySelectorAll('.tab').forEach(tab=>{const active=tab===button;tab.classList.toggle('active',active);tab.setAttribute('aria-selected',String(active))});document.querySelectorAll('.tab-panel').forEach(panel=>panel.classList.toggle('active',panel.id===button.dataset.tab))}));
 ['tuneDirection','tuneRegime','tuneOutcome','tuneBreakdown'].forEach(id=>$(id).addEventListener('change',()=>renderTuning(latestTuning,latestQualityOrders)));
+$('decisionView').addEventListener('change',()=>renderDecisionRows(latestDecisions));
 async function refresh(){try{const response=await fetch('/api/dashboard',{cache:'no-store'});if(!response.ok)throw new Error('Dashboard API '+response.status);const data=await response.json(),p=data.performance,h=data.health||{},live=data.liveData||{eventCounts:{},recentEvents:[],totalEvents:0,uptimeMs:0,persistenceEnabled:false,quoteSampleIntervalMs:0,retentionDays:0};$('stateText').textContent=(data.readiness||'unknown').toUpperCase()+' · '+(h.executionMode||'paper');$('state').className=data.readiness||'degraded';setStatus('engineState','engineDetail','LIVE','API heartbeat · uptime '+duration(live.uptimeMs),'ok');setStatus('sipState','sipDetail',h.websocketConnected?'CONNECTED':'DISCONNECTED',count(h.receivedStockQuotes??live.eventCounts.stock_quote)+' quotes · '+age(h.lastStockQuoteAgeMs),h.websocketConnected?'ok':'halted');setStatus('opraState','opraDetail',h.optionWebsocketConnected?'CONNECTED':'DISCONNECTED',count(h.receivedOptionQuotes??live.eventCounts.option_quote)+' quotes · '+age(h.lastOptionQuoteAgeMs),h.optionWebsocketConnected?'ok':'halted');const dbLevel=!live.persistenceEnabled?'degraded':h.recorderHealthy?'ok':'halted',retentionDetail=(live.quoteSampleIntervalMs===0?'full-resolution quotes':live.quoteSampleIntervalMs+' ms quote baseline')+' · '+live.retentionDays+'d raw retention';setStatus('databaseState','databaseDetail',!live.persistenceEnabled?'DISABLED':h.recorderHealthy?'WRITING':'UNHEALTHY',live.persistenceEnabled?retentionDetail:'Persistence is not enabled',dbLevel);setStatus('brokerState','brokerDetail',h.brokerAvailable?'CONNECTED':'UNAVAILABLE',(h.executionMode||'paper').toUpperCase()+' · '+count(h.openOrderCount)+' open order(s)',h.brokerAvailable?'ok':'degraded');setStatus('marketState','marketDetail',String(h.marketClockState||'unknown').replaceAll('-',' ').toUpperCase(),h.positionsReconciled?'Positions reconciled':'Reconciliation required',h.positionsReconciled?'ok':'halted');$('entries').textContent=p.entriesFired;$('entryOrders').textContent=p.entryOrders;$('closedTrades').textContent=p.closedTrades;$('winRate').textContent=(p.winRate*100).toFixed(1)+'%';$('pnl').textContent=money(p.realizedPnl);$('pnl').className='value '+(p.realizedPnl>0?'positive':p.realizedPnl<0?'negative':'');$('openPnl').textContent=money(p.unrealizedPnl);$('openPnl').className='value '+(p.unrealizedPnl>0?'positive':p.unrealizedPnl<0?'negative':'');$('totalPnl').textContent=money(p.totalPnl);$('totalPnl').className='value '+(p.totalPnl>0?'positive':p.totalPnl<0?'negative':'');$('profitFactor').textContent=p.profitFactor===null?'—':num(p.profitFactor);$('openTrades').textContent=p.openTrades;$('subscriptions').textContent=h.subscribedOptionContracts||0;$('feedEvents').textContent=count(live.totalEvents);$('sipQuotes').textContent=count(live.eventCounts.stock_quote);$('sipTrades').textContent=count(live.eventCounts.stock_trade);$('opraQuotes').textContent=count(live.eventCounts.option_quote);$('featureEvents').textContent=count(live.eventCounts.feature_snapshot);$('feedAge').textContent=live.lastEventAgeMs===undefined?'—':duration(live.lastEventAgeMs);renderLiveOrders(data.activeOrders);
 rows('signals',data.signals,[x=>({value:time(x.timestamp)}),x=>({value:x.direction}),x=>({value:x.kind}),x=>({value:x.regime}),x=>({value:num(x.projectedMoveBps)+' bps'}),x=>({value:x.candidate}),x=>({value:x.status}),x=>({value:(x.reasons||[]).join(', ')})]);
 rows('orders',data.orders,[x=>({value:time(x.timestamp)}),x=>({value:x.purpose}),x=>({value:x.symbol}),x=>({value:x.side}),x=>({value:x.quantity}),x=>({value:money(x.limitPrice)}),x=>({value:x.filledQuantity}),x=>({value:x.averageFillPrice?money(x.averageFillPrice):'—'}),x=>({value:x.status})]);
-renderTuning(data.tuning||{entries:[]},data.orders||[]);
-rows('trades',data.trades,[x=>({value:time(x.entryTimestamp)}),x=>({value:time(x.exitTimestamp)}),x=>({value:x.symbol}),x=>({value:x.direction}),x=>({value:x.quantity}),x=>({value:money(x.averageEntryPrice)}),x=>({value:x.averageExitPrice?money(x.averageExitPrice):'—'}),x=>({value:money(x.realizedPnl),cls:x.realizedPnl>0?'positive':x.realizedPnl<0?'negative':''}),x=>({value:x.returnPct===undefined?'—':num(x.returnPct)+'%'}),x=>({value:x.exitReason}),x=>({value:x.status})]);rows('decisions',data.decisions||[],[x=>({value:time(x.timestamp)}),x=>({value:x.stage.replaceAll('_',' ')}),x=>({value:x.outcome.replaceAll('_',' '),cls:outcomeClass(x.outcome)}),x=>({value:x.direction}),x=>({value:x.symbol}),x=>({value:x.summary}),x=>({value:decisionDetail(x),cls:'decision-reasons'})],'No entry evaluations yet. The engine heartbeat above remains active while feature coverage warms up.');rows('feedEventsBody',live.recentEvents||[],[x=>({value:time(x.receivedTimestamp)}),x=>({value:x.channel.replaceAll('_',' ')}),x=>({value:x.type.replaceAll('_',' ')}),x=>({value:x.symbol}),x=>({value:x.summary}),x=>({value:x.latencyMs+' ms'}),x=>({value:storagePolicy(x,live),cls:live.persistenceEnabled?'positive':'muted'})],'No market events received yet. Connection cards above continue to show system liveness.');$('updated').textContent='Updated '+new Date(data.generatedAt).toLocaleString()+' · dashboard refreshes every second';}catch(error){$('stateText').textContent='DASHBOARD ERROR';$('state').className='halted';$('updated').textContent=String(error)}}refresh();setInterval(refresh,1000);
+renderTuning(data.tuning||{entries:[]},data.orders||[]);renderPotentialMisses(data.tuning);
+rows('trades',data.trades,[x=>({value:time(x.entryTimestamp)}),x=>({value:time(x.exitTimestamp)}),x=>({value:x.symbol}),x=>({value:x.direction}),x=>({value:x.quantity}),x=>({value:money(x.averageEntryPrice)}),x=>({value:x.averageExitPrice?money(x.averageExitPrice):'—'}),x=>({value:money(x.realizedPnl),cls:x.realizedPnl>0?'positive':x.realizedPnl<0?'negative':''}),x=>({value:x.returnPct===undefined?'—':num(x.returnPct)+'%'}),x=>({value:x.exitReason}),x=>({value:x.status})]);renderDecisionRows(data.decisions||[]);rows('feedEventsBody',live.recentEvents||[],[x=>({value:time(x.receivedTimestamp)}),x=>({value:x.channel.replaceAll('_',' ')}),x=>({value:x.type.replaceAll('_',' ')}),x=>({value:x.symbol}),x=>({value:x.summary}),x=>({value:x.latencyMs+' ms'}),x=>({value:storagePolicy(x,live),cls:live.persistenceEnabled?'positive':'muted'})],'No market events received yet. Connection cards above continue to show system liveness.');$('updated').textContent='Updated '+new Date(data.generatedAt).toLocaleString()+' · dashboard refreshes every second';}catch(error){$('stateText').textContent='DASHBOARD ERROR';$('state').className='halted';$('updated').textContent=String(error)}}refresh();setInterval(refresh,1000);
 </script></body></html>`;
 }
