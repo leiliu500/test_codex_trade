@@ -1,4 +1,5 @@
 import type { AuditEvent } from "../ops/recorder.js";
+import type { DashboardOrderCard, OrderCardPersistence } from "../ops/orderCards.js";
 import type { FeatureSnapshot } from "../types.js";
 
 export type HistoricalMarketEventType =
@@ -41,10 +42,11 @@ export class CompositeMarketHistorySink implements MarketHistorySink {
   healthy(): boolean { return this.#sinks.every((sink) => sink.healthy()); }
 }
 
-export interface HistoryStore extends MarketHistorySink {
+export interface HistoryStore extends MarketHistorySink, OrderCardPersistence {
   initialize(): Promise<void>;
   record(event: AuditEvent): void | Promise<void>;
   loadAuditEvents(limit?: number): Promise<AuditEvent[]>;
+  loadOrderCards(limit?: number): Promise<DashboardOrderCard[]>;
   loadReplayEvents(marketDate: string): Promise<Array<{
     type: Exclude<HistoricalMarketEventType, "feature_snapshot">;
     timestamp: number;
