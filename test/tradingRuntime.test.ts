@@ -429,13 +429,88 @@ test("shadow confirmation observes a pending candidate without delaying the pape
   await runtime.close();
 });
 
+test("late-session runtime audits and blocks an option whose spread exceeds the tighter limit", async () => {
+  const decisionTime = zonedDateTimeToEpoch(date, "12:10:00");
+  const config = structuredClone(defaultConfig);
+  config.signals.lateEntryGuard.followThroughMinSec = 0;
+  config.signals.lateEntryGuard.followThroughMaxSec = 0;
+  const client = new FakeRuntimeClient();
+  client.clock.timestamp = decisionTime;
+  const optionStream = new FakeOptionStream();
+  const recorder = new MemoryRecorder();
+  const runtime = new SpyOptionsTradingRuntime({
+    config,
+    client,
+    stockStream: new FakeStockStream(),
+    optionStream,
+    executionEnabled: true,
+    executionMode: "paper",
+    now: () => decisionTime,
+    executionTickMs: 60_000,
+    recorder,
+  });
+  await runtime.start();
+  await optionStream.quote({
+    symbol: callSymbol,
+    timestamp: decisionTime,
+    bidPrice: 1.99,
+    askPrice: 2.01,
+    bidSize: 100,
+    askSize: 100,
+  });
+  await runtime.ingestFeature({ ...bullishFeature(), timestamp: decisionTime });
+
+  const evaluation = recorder.events.find((event) => event.type === "live_entry_evaluation");
+  assert.equal(evaluation?.data.decision, "SIGNAL");
+  assert.equal((evaluation?.data.lateEntryGuard as Record<string, unknown>).active, true);
+  assert.equal((evaluation?.data.lateEntryBaseline as Record<string, unknown>).decision, "SIGNAL");
+  const selection = recorder.events.find((event) => event.type === "live_signal_selection");
+  assert.equal(selection?.data.candidate, null);
+  assert.ok(
+    ((selection?.data.rejectionCounts as Record<string, number>)["LATE_ENTRY_OPTION_SPREAD_TOO_WIDE"] ?? 0) > 0,
+  );
+  assert.equal(client.requests.length, 0);
+  await runtime.close();
+});
+
+test("late-session audit preserves an unguarded baseline while active follow-through is pending", async () => {
+  const decisionTime = zonedDateTimeToEpoch(date, "12:10:00");
+  const client = new FakeRuntimeClient();
+  client.clock.timestamp = decisionTime;
+  const recorder = new MemoryRecorder();
+  const runtime = new SpyOptionsTradingRuntime({
+    config: defaultConfig,
+    client,
+    stockStream: new FakeStockStream(),
+    optionStream: new FakeOptionStream(),
+    executionEnabled: true,
+    executionMode: "paper",
+    now: () => decisionTime,
+    executionTickMs: 60_000,
+    recorder,
+  });
+  await runtime.start();
+  await runtime.ingestFeature({ ...bullishFeature(), timestamp: decisionTime });
+
+  const evaluation = recorder.events.find((event) => event.type === "live_entry_evaluation");
+  assert.equal(evaluation?.data.decision, "NO_SIGNAL");
+  assert.deepEqual(evaluation?.data.reasons, ["LATE_ENTRY_FOLLOW_THROUGH_PENDING"]);
+  const baseline = evaluation?.data.lateEntryBaseline as Record<string, unknown>;
+  assert.equal(baseline.decision, "SIGNAL");
+  assert.equal(baseline.direction, "BULLISH");
+  assert.equal(client.requests.length, 0);
+  await runtime.close();
+});
+
 test("post-14:30 baseline candidates are labeled research-only before option selection", async () => {
   const afterCutoff = zonedDateTimeToEpoch(date, "14:30:01");
   const client = new FakeRuntimeClient();
   client.clock.timestamp = afterCutoff;
   const recorder = new MemoryRecorder();
+  const config = structuredClone(defaultConfig);
+  config.signals.lateEntryGuard.mode = "DISABLED";
   const runtime = new SpyOptionsTradingRuntime({
-    config: defaultConfig,
+    config,
     client,
     stockStream: new FakeStockStream(),
     optionStream: new FakeOptionStream(),

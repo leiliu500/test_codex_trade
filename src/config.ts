@@ -3,6 +3,7 @@ import { parseClock } from "./utils/time.js";
 
 export type FollowThroughScope = "BULLISH_IMPULSE" | "IMPULSE" | "ALL";
 export type EntryQualityMode = "SHADOW" | "ENFORCE";
+export type LateEntryGuardMode = "DISABLED" | "ENFORCE";
 
 export interface EngineConfig {
   version: string;
@@ -64,6 +65,16 @@ export interface EngineConfig {
     followThroughMinimumBps: number;
     followThroughScope: FollowThroughScope;
     shadowFollowThroughScope: FollowThroughScope | "DISABLED";
+    lateEntryGuard: {
+      mode: LateEntryGuardMode;
+      start: string;
+      minProjectedMoveBps: number;
+      minCostMarginBps: number;
+      maxOptionSpreadPct: number;
+      followThroughMinSec: number;
+      followThroughMaxSec: number;
+      followThroughMinimumBps: number;
+    };
     blockWhipsaw: boolean;
   };
   regimes: {
@@ -181,6 +192,7 @@ export function validateConfig(config: EngineConfig): void {
   const entryStart = parseClock(config.session.entryStart);
   const lateBullishImpulseStart = parseClock(config.signals.lateBullishImpulseStart);
   const bullishImpulseCutoff = parseClock(config.signals.bullishImpulseCutoff);
+  const lateEntryGuardStart = parseClock(config.signals.lateEntryGuard.start);
   const zeroDteCutoff = parseClock(config.options.zeroDteEntryCutoff);
   const entryEnd = parseClock(config.session.entryEnd);
   const forceExit = parseClock(config.session.forceExit);
@@ -192,6 +204,9 @@ export function validateConfig(config: EngineConfig): void {
   }
   if (!(lateBullishImpulseStart <= bullishImpulseCutoff && bullishImpulseCutoff <= zeroDteCutoff)) {
     throw new Error("Bullish impulse cutoff must follow late confirmation and precede the 0DTE cutoff");
+  }
+  if (!(entryStart <= lateEntryGuardStart && lateEntryGuardStart <= zeroDteCutoff)) {
+    throw new Error("Late-entry guard must start inside the executable entry window");
   }
   if (!(config.signals.followThroughMinSec >= 0 &&
         config.signals.followThroughMaxSec >= config.signals.followThroughMinSec &&
@@ -205,6 +220,18 @@ export function validateConfig(config: EngineConfig): void {
   }
   if (!new Set<EntryQualityMode>(["SHADOW", "ENFORCE"]).has(config.signals.entryQualityMode)) {
     throw new Error("Entry-quality mode must be SHADOW or ENFORCE");
+  }
+  if (!new Set<LateEntryGuardMode>(["DISABLED", "ENFORCE"]).has(config.signals.lateEntryGuard.mode)) {
+    throw new Error("Late-entry guard mode must be DISABLED or ENFORCE");
+  }
+  if (!(config.signals.lateEntryGuard.minProjectedMoveBps > 0 &&
+        config.signals.lateEntryGuard.minCostMarginBps >= 0 &&
+        config.signals.lateEntryGuard.maxOptionSpreadPct > 0 &&
+        config.signals.lateEntryGuard.maxOptionSpreadPct <= config.dataQuality.maxOptionSpreadPct &&
+        config.signals.lateEntryGuard.followThroughMinSec >= 0 &&
+        config.signals.lateEntryGuard.followThroughMaxSec >= config.signals.lateEntryGuard.followThroughMinSec &&
+        config.signals.lateEntryGuard.followThroughMinimumBps >= 0)) {
+    throw new Error("Late-entry guard thresholds or follow-through window are invalid");
   }
   if (!(Number.isInteger(config.risk.maxTradesPerDay) && config.risk.maxTradesPerDay > 0 &&
         Number.isInteger(config.risk.entryQualityMaxTradesPerDay) && config.risk.entryQualityMaxTradesPerDay > 0)) {

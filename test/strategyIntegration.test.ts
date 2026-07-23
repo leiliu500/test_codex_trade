@@ -58,6 +58,10 @@ enforcedSignalConfig.signals.entryQualityMode = "ENFORCE";
 const enforcedImmediateSignalConfig = structuredClone(enforcedSignalConfig);
 enforcedImmediateSignalConfig.signals.followThroughMinSec = 0;
 enforcedImmediateSignalConfig.signals.followThroughMaxSec = 0;
+const immediateWithoutLateGuardConfig = structuredClone(immediateSignalConfig);
+immediateWithoutLateGuardConfig.signals.lateEntryGuard.mode = "DISABLED";
+const enforcedImmediateWithoutLateGuardConfig = structuredClone(enforcedImmediateSignalConfig);
+enforcedImmediateWithoutLateGuardConfig.signals.lateEntryGuard.mode = "DISABLED";
 
 test("regime ordering distinguishes whipsaw, reversal, strong and grind", () => {
   const strong = feature();
@@ -109,19 +113,19 @@ test("late bullish impulses require an established up regime without blocking be
     vwap: { ...feature(1).vwap, rollingVwapSlopeBpsPerSec: -0.01 },
   };
   const unclassified: RegimeDecision = { regime: "UNCLASSIFIED", confidence: 0, reasons: [] };
-  const blocked = new SignalEngine(immediateSignalConfig).evaluateDetailed(lateBullish, unclassified);
+  const blocked = new SignalEngine(immediateWithoutLateGuardConfig).evaluateDetailed(lateBullish, unclassified);
   assert.equal(blocked.signal, undefined);
   assert.ok(blocked.directions.find((item) => item.direction === "BULLISH")?.reasons
     .includes("LATE_BULLISH_IMPULSE_REQUIRES_UP_REGIME"));
 
   const confirmed: RegimeDecision = { regime: "STRONG_UP", confidence: 1, reasons: [] };
-  assert.equal(new SignalEngine(immediateSignalConfig).evaluate(lateBullish, confirmed)?.kind, "IMPULSE");
+  assert.equal(new SignalEngine(immediateWithoutLateGuardConfig).evaluate(lateBullish, confirmed)?.kind, "IMPULSE");
 
   const lateBearish = {
     ...feature(-1),
     timestamp: zonedDateTimeToEpoch("2026-07-22", "12:49:00"),
   };
-  assert.equal(new SignalEngine(immediateSignalConfig).evaluate(lateBearish, unclassified)?.direction, "BEARISH");
+  assert.equal(new SignalEngine(immediateWithoutLateGuardConfig).evaluate(lateBearish, unclassified)?.direction, "BEARISH");
 });
 
 test("bullish impulses stop after 13:00 and all executable signals stop after 14:30 ET", () => {
@@ -130,8 +134,12 @@ test("bullish impulses stop after 13:00 and all executable signals stop after 14
     ...feature(1),
     timestamp: zonedDateTimeToEpoch("2026-07-22", "13:00:01"),
   };
-  assert.equal(new SignalEngine(immediateSignalConfig).evaluate(afterBullishCutoff, unclassified)?.direction, "BULLISH");
-  const bullish = new SignalEngine(enforcedImmediateSignalConfig).evaluateDetailed(afterBullishCutoff, unclassified);
+  assert.equal(new SignalEngine(immediateWithoutLateGuardConfig).evaluate(
+    afterBullishCutoff, unclassified,
+  )?.direction, "BULLISH");
+  const bullish = new SignalEngine(enforcedImmediateWithoutLateGuardConfig).evaluateDetailed(
+    afterBullishCutoff, unclassified,
+  );
   assert.equal(bullish.signal, undefined);
   assert.ok(bullish.directions.find((item) => item.direction === "BULLISH")?.reasons
     .includes("BULLISH_IMPULSE_CUTOFF_PASSED"));
@@ -140,12 +148,14 @@ test("bullish impulses stop after 13:00 and all executable signals stop after 14
     ...feature(-1),
     timestamp: afterBullishCutoff.timestamp,
   };
-  assert.equal(new SignalEngine(enforcedImmediateSignalConfig).evaluate(
+  assert.equal(new SignalEngine(enforcedImmediateWithoutLateGuardConfig).evaluate(
     bearishFeature, { regime: "STRONG_DOWN", confidence: 1, reasons: [] },
   )?.direction, "BEARISH");
 
   const afterEntryCutoff = { ...feature(1), timestamp: zonedDateTimeToEpoch("2026-07-22", "14:30:01") };
-  const cutoff = new SignalEngine(enforcedImmediateSignalConfig).evaluateDetailed(afterEntryCutoff, unclassified);
+  const cutoff = new SignalEngine(enforcedImmediateWithoutLateGuardConfig).evaluateDetailed(
+    afterEntryCutoff, unclassified,
+  );
   assert.equal(cutoff.signal, undefined);
   assert.ok(cutoff.reasons.includes("ZERO_DTE_ENTRY_CUTOFF_PASSED"));
 });
@@ -195,6 +205,51 @@ test("default execution is immediate while enforced A/B profiles confirm selecte
   const shadow = new SignalEngine(allEntryConfig).evaluateDetailed(bearish, down);
   assert.equal(shadow.signal, undefined);
   assert.deepEqual(shadow.reasons, ["FOLLOW_THROUGH_PENDING"]);
+});
+
+test("late-session entries require stronger projection and causal follow-through without delaying morning signals", () => {
+  const morning = feature(1);
+  const up: RegimeDecision = { regime: "STRONG_UP", confidence: 1, reasons: [] };
+  assert.equal(new SignalEngine(defaultConfig).evaluate(morning, up)?.direction, "BULLISH");
+
+  const late = {
+    ...morning,
+    timestamp: zonedDateTimeToEpoch("2026-07-22", "12:00:00"),
+  };
+  const engine = new SignalEngine(defaultConfig);
+  const pending = engine.evaluateDetailed(late, up);
+  assert.equal(pending.signal, undefined);
+  assert.deepEqual(pending.reasons, ["LATE_ENTRY_FOLLOW_THROUGH_PENDING"]);
+  const notConfirmed = engine.evaluateDetailed({
+    ...late,
+    timestamp: late.timestamp + 5_000,
+    price: late.price - 0.01,
+  }, up);
+  assert.equal(notConfirmed.signal, undefined);
+  assert.deepEqual(notConfirmed.reasons, ["LATE_ENTRY_FOLLOW_THROUGH_NOT_CONFIRMED"]);
+  const confirmed = engine.evaluateDetailed({
+    ...late,
+    timestamp: late.timestamp + 6_000,
+    price: late.price + 0.01,
+  }, up);
+  assert.equal(confirmed.signal?.direction, "BULLISH");
+  assert.ok(confirmed.signal?.reasons.some((reason) => reason.includes("causal follow-through confirmed")));
+
+  const weakProjection = {
+    ...late,
+    fast: {
+      ...late.fast,
+      regression: {
+        ...late.fast.regression,
+        slopeBpsPerSec: 0.1,
+        accelerationBpsPerSec2: 0,
+      },
+    },
+  };
+  const weak = new SignalEngine(defaultConfig).evaluateDetailed(weakProjection, up);
+  assert.equal(weak.signal, undefined);
+  assert.ok(weak.directions.find((item) => item.direction === "BULLISH")?.reasons
+    .includes("LATE_ENTRY_PROJECTED_MOVE_BELOW_MINIMUM"));
 });
 
 test("steady grind passes with acceleration near zero, but excessive adverse acceleration blocks", () => {
@@ -328,6 +383,73 @@ test("option selector rejects wide cost and ranks an eligible liquid contract", 
   assert.ok(selection.evaluations.find((item) => item.symbol === bad.symbol)!.rejectionReasons.includes("QUOTE_SPREAD_TOO_WIDE"));
   const laterDated = { ...good, symbol: "SPY260724C00501000", expirationDate: "2026-07-24" };
   assert.ok(new OptionSelector(defaultConfig).evaluate(laterDated, undefined, signal).rejectionReasons.includes("NOT_SAME_DAY_EXPIRATION"));
+});
+
+test("late-session option selection requires tighter spread, post-cost margin, and projected movement", () => {
+  const morning = feature();
+  const baseSignal = new SignalEngine(immediateSignalConfig).evaluate(
+    morning,
+    classifyRegime(morning, defaultConfig.regimes),
+  )!;
+  const timestamp = zonedDateTimeToEpoch("2026-07-22", "12:10:00");
+  const signal: TradeSignal = {
+    ...baseSignal,
+    timestamp,
+    projectedMoveBps: 3.25,
+    featureSnapshot: { ...baseSignal.featureSnapshot, timestamp },
+  };
+  const contract: OptionContract = {
+    symbol: "SPY260722C00501000",
+    underlying: "SPY",
+    expirationDate: "2026-07-22",
+    strike: 501,
+    type: "call",
+    active: true,
+    tradable: true,
+  };
+  const book = new OptionBook();
+  book.upsertContract(contract);
+  book.updateSnapshot({
+    symbol: contract.symbol,
+    timestamp,
+    impliedVolatility: 0.22,
+    greeks: { delta: 0.52, gamma: 0.02 },
+    dailyVolume: 1_000,
+    openInterest: 5_000,
+  });
+  book.updateQuote({
+    symbol: contract.symbol,
+    timestamp,
+    bidPrice: 1.995,
+    askPrice: 2.005,
+    bidSize: 100,
+    askSize: 100,
+  });
+  assert.equal(new OptionSelector(defaultConfig).select(signal, [contract], book).selected?.symbol, contract.symbol);
+
+  book.updateQuote({
+    symbol: contract.symbol,
+    timestamp: timestamp + 1,
+    bidPrice: 1.99,
+    askPrice: 2.01,
+    bidSize: 100,
+    askSize: 100,
+  });
+  const wide = new OptionSelector(defaultConfig).evaluate(contract, book.get(contract.symbol), signal, timestamp + 1);
+  assert.ok(wide.rejectionReasons.includes("LATE_ENTRY_OPTION_SPREAD_TOO_WIDE"));
+
+  const strictMarginConfig = structuredClone(defaultConfig);
+  strictMarginConfig.signals.lateEntryGuard.minCostMarginBps = 10;
+  const lowMargin = new OptionSelector(strictMarginConfig).evaluate(
+    contract, book.get(contract.symbol), signal, timestamp + 1,
+  );
+  assert.ok(lowMargin.rejectionReasons.includes("LATE_ENTRY_COST_MARGIN_BELOW_MINIMUM"));
+
+  const weakSignal = { ...signal, projectedMoveBps: 1.99 };
+  const weak = new OptionSelector(defaultConfig).evaluate(
+    contract, book.get(contract.symbol), weakSignal, timestamp + 1,
+  );
+  assert.ok(weak.rejectionReasons.includes("LATE_ENTRY_PROJECTED_MOVE_BELOW_MINIMUM"));
 });
 
 test("option selection uses an explicit causal decision timestamp", () => {
