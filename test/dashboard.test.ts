@@ -9,6 +9,7 @@ import {
 } from "../src/ops/tradingDashboard.js";
 import type { AuditEvent } from "../src/ops/recorder.js";
 import type { HistoricalMarketEvent } from "../src/history/types.js";
+import { mergeOrderCardQuoteDynamics } from "../src/ops/orderCards.js";
 
 const timestamp = Date.parse("2026-07-22T14:20:00Z");
 const symbol = "SPY260722C00501000";
@@ -182,6 +183,63 @@ test("dashboard persists a completed card with all captured P&L updates", async 
     [10, 20],
   );
   assert.equal(saved[0]?.updates.at(-1)?.totalPnl, 25);
+});
+
+test("historical order cards rebuild every bid-driven P&L change as a trackable list", () => {
+  const card: DashboardOrderCard = {
+    id: "historical-entry",
+    symbol,
+    direction: "BULLISH",
+    active: false,
+    stage: "CLOSED",
+    status: "filled",
+    quantity: 2,
+    remainingQuantity: 0,
+    entryPrice: 2,
+    exitPrice: 2.2,
+    realizedPnl: 40,
+    totalPnl: 40,
+    entryTimestamp: timestamp,
+    exitTimestamp: timestamp + 500,
+    updates: [{
+      timestamp,
+      stage: "POSITION_OPEN",
+      status: "filled",
+      remainingQuantity: 2,
+      realizedPnl: 0,
+    }, {
+      timestamp: timestamp + 350,
+      stage: "EXIT_WORKING",
+      status: "new",
+      remainingQuantity: 2,
+      realizedPnl: 0,
+    }, {
+      timestamp: timestamp + 500,
+      stage: "CLOSED",
+      status: "filled",
+      remainingQuantity: 0,
+      realizedPnl: 40,
+      unrealizedPnl: 0,
+      totalPnl: 40,
+    }],
+  };
+  const quotes = [
+    { timestamp: timestamp + 100, bidPrice: 2.05, askPrice: 2.07 },
+    { timestamp: timestamp + 150, bidPrice: 2.05, askPrice: 2.08 },
+    { timestamp: timestamp + 200, bidPrice: 2.1, askPrice: 2.12 },
+    { timestamp: timestamp + 400, bidPrice: 2.15, askPrice: 2.17 },
+  ];
+
+  const enriched = mergeOrderCardQuoteDynamics(card, quotes);
+  const pnlUpdates = enriched.updates.filter((update) => update.source === "PNL");
+  assert.deepEqual(pnlUpdates.map((update) => Math.round(update.totalPnl!)), [10, 20, 30]);
+  assert.deepEqual(pnlUpdates.map((update) => Math.round(update.pnlChange ?? 0)), [0, 10, 10]);
+  assert.equal(pnlUpdates.at(-1)?.stage, "EXIT_WORKING");
+  assert.equal(enriched.updates.filter((update) => update.source === "PNL").length, 3);
+  assert.deepEqual(
+    mergeOrderCardQuoteDynamics(enriched, quotes).updates,
+    enriched.updates,
+  );
 });
 
 test("completed cards keep the exit order from their own trade window when symbols repeat", () => {

@@ -1,5 +1,9 @@
 import type { AuditEvent } from "../ops/recorder.js";
-import type { DashboardOrderCard, OrderCardPersistence } from "../ops/orderCards.js";
+import type {
+  DashboardOrderCard,
+  DashboardOrderQuote,
+  OrderCardPersistence,
+} from "../ops/orderCards.js";
 import type { FeatureSnapshot } from "../types.js";
 
 export type HistoricalMarketEventType =
@@ -47,6 +51,7 @@ export interface HistoryStore extends MarketHistorySink, OrderCardPersistence {
   record(event: AuditEvent): void | Promise<void>;
   loadAuditEvents(limit?: number): Promise<AuditEvent[]>;
   loadOrderCards(limit?: number): Promise<DashboardOrderCard[]>;
+  loadOrderCardQuotes(cards: readonly DashboardOrderCard[]): Promise<Map<string, DashboardOrderQuote[]>>;
   loadReplayEvents(marketDate: string): Promise<Array<{
     type: Exclude<HistoricalMarketEventType, "feature_snapshot">;
     timestamp: number;
