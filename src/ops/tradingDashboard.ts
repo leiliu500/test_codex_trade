@@ -1,5 +1,6 @@
 import type { AuditEvent, AuditRecorder } from "./recorder.js";
 import type { HistoricalMarketEvent, HistoricalMarketEventType, MarketHistorySink } from "../history/types.js";
+import { marketDate, zonedDateTimeToEpoch } from "../utils/time.js";
 
 export interface DashboardSignal {
   id: string;
@@ -278,6 +279,9 @@ export interface DashboardPerformance {
 export interface TradingDashboardSnapshot {
   startedAt: number;
   generatedAt: number;
+  displayDate: string;
+  displayTimeZone: string;
+  nextDisplayRolloverAt: number;
   lastMarketDate?: string;
   lastExecutionError?: string;
   performance: DashboardPerformance;
@@ -308,10 +312,46 @@ const MISSED_ENTRY_HORIZON_SEC = 5;
 const MISSED_ENTRY_MOVE_THRESHOLD_BPS = 2;
 const FORWARD_SAMPLE_TOLERANCE_MS = 2_000;
 const MISSED_ENTRY_CLUSTER_MS = 15_000;
+export const DASHBOARD_DISPLAY_TIME_ZONE = "America/Los_Angeles";
+export const DASHBOARD_DISPLAY_ROLLOVER = "22:00:00";
+
+function addCalendarDays(date: string, days: number): string {
+  const [year, month, day] = date.split("-").map(Number);
+  const shifted = new Date(Date.UTC(year!, month! - 1, day! + days));
+  return shifted.toISOString().slice(0, 10);
+}
+
+/** Dashboard dates run from 22:00 Pacific through 21:59:59.999 the following day. */
+export function dashboardDisplayDate(timestamp: number): string {
+  const pacificDate = marketDate(timestamp, DASHBOARD_DISPLAY_TIME_ZONE);
+  const rollover = zonedDateTimeToEpoch(
+    pacificDate,
+    DASHBOARD_DISPLAY_ROLLOVER,
+    DASHBOARD_DISPLAY_TIME_ZONE,
+  );
+  return timestamp >= rollover ? addCalendarDays(pacificDate, 1) : pacificDate;
+}
+
+export function nextDashboardDisplayRollover(timestamp: number): number {
+  const pacificDate = marketDate(timestamp, DASHBOARD_DISPLAY_TIME_ZONE);
+  const todayRollover = zonedDateTimeToEpoch(
+    pacificDate,
+    DASHBOARD_DISPLAY_ROLLOVER,
+    DASHBOARD_DISPLAY_TIME_ZONE,
+  );
+  return timestamp < todayRollover
+    ? todayRollover
+    : zonedDateTimeToEpoch(
+      addCalendarDays(pacificDate, 1),
+      DASHBOARD_DISPLAY_ROLLOVER,
+      DASHBOARD_DISPLAY_TIME_ZONE,
+    );
+}
 
 /** Reconstructible read model derived only from durable execution audit events. */
 export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
   readonly #startedAt: number;
+  readonly #now: () => number;
   readonly #persistenceEnabled: boolean;
   readonly #quoteSampleIntervalMs: number;
   readonly #retentionDays: number;
@@ -335,15 +375,26 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
   #matureNoSignalEvaluationCount = 0;
   #lastMarketDate: string | undefined;
   #lastExecutionError: string | undefined;
+  #displayDate: string;
 
-  constructor(startedAt = Date.now(), persistenceEnabled = false, quoteSampleIntervalMs = 0, retentionDays = 0) {
+  constructor(
+    startedAt = Date.now(),
+    persistenceEnabled = false,
+    quoteSampleIntervalMs = 0,
+    retentionDays = 0,
+    now: () => number = Date.now,
+  ) {
     this.#startedAt = startedAt;
+    this.#now = now;
     this.#persistenceEnabled = persistenceEnabled;
     this.#quoteSampleIntervalMs = quoteSampleIntervalMs;
     this.#retentionDays = retentionDays;
+    this.#displayDate = dashboardDisplayDate(now());
   }
 
   record(event: AuditEvent): void {
+    this.#synchronizeDisplayWindow();
+    if (dashboardDisplayDate(event.timestamp) !== this.#displayDate) return;
     if (event.marketDate) this.#lastMarketDate = event.marketDate;
     if (event.type === "live_signal_selection") this.#recordSignal(event);
     else if (event.type === "risk_decision") this.#recordRiskDecision(event);
@@ -360,6 +411,8 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
   }
 
   recordMarketEvent(event: HistoricalMarketEvent): void {
+    this.#synchronizeDisplayWindow();
+    if (dashboardDisplayDate(event.receivedTimestamp) !== this.#displayDate) return;
     this.#lastMarketDate = event.marketDate;
     this.#marketEventCounts[event.type] += 1;
     this.#lastMarketEventReceivedAt = Math.max(this.#lastMarketEventReceivedAt ?? -Infinity, event.receivedTimestamp);
@@ -406,7 +459,8 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
   healthy(): boolean { return true; }
 
   snapshot(): TradingDashboardSnapshot {
-    const generatedAt = Date.now();
+    const generatedAt = this.#now();
+    this.#synchronizeDisplayWindow(generatedAt);
     const closed = this.#closedTrades;
     const realizedPnl = [...closed, ...this.#openTrades.values()].reduce((sum, trade) => sum + trade.realizedPnl, 0);
     const wins = closed.filter((trade) => trade.realizedPnl > 0).length;
@@ -428,6 +482,9 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
     return {
       startedAt: this.#startedAt,
       generatedAt,
+      displayDate: this.#displayDate,
+      displayTimeZone: DASHBOARD_DISPLAY_TIME_ZONE,
+      nextDisplayRolloverAt: nextDashboardDisplayRollover(generatedAt),
       ...(this.#lastMarketDate ? { lastMarketDate: this.#lastMarketDate } : {}),
       ...(this.#lastExecutionError ? { lastExecutionError: this.#lastExecutionError } : {}),
       performance: {
@@ -484,6 +541,32 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
       orders: publicOrders,
       trades: publicTrades,
     };
+  }
+
+  #synchronizeDisplayWindow(timestamp = this.#now()): void {
+    const displayDate = dashboardDisplayDate(timestamp);
+    if (displayDate === this.#displayDate) return;
+    this.#displayDate = displayDate;
+    this.#signals.clear();
+    this.#orders.clear();
+    this.#openTrades.clear();
+    this.#closedTrades.length = 0;
+    this.#latestOptionQuotes.clear();
+    Object.assign(this.#marketEventCounts, emptyMarketEventCounts());
+    this.#recentMarketEvents.length = 0;
+    this.#lastFeedSampleAt.clear();
+    this.#decisions.length = 0;
+    this.#potentialMisses.length = 0;
+    this.#entryGateBlocks.clear();
+    this.#lastMarketEventReceivedAt = undefined;
+    this.#lastProviderTimestamp = undefined;
+    this.#feedSequence = 0;
+    this.#decisionSequence = 0;
+    this.#entryEvaluationCount = 0;
+    this.#noSignalEvaluationCount = 0;
+    this.#matureNoSignalEvaluationCount = 0;
+    this.#lastMarketDate = undefined;
+    this.#lastExecutionError = undefined;
   }
 
   #recordDecision(event: AuditEvent): void {
@@ -1369,6 +1452,8 @@ function decisionDetail(item){const details=[...(item.reasons||[])];for(const di
 let latestDecisions=[];
 function renderDecisionRows(items){latestDecisions=items||[];const view=$('decisionView').value,filtered=view==='ALL'?latestDecisions:view==='NO_SIGNAL'?latestDecisions.filter(x=>x.stage==='ENTRY_EVALUATION'&&x.outcome==='NO_SIGNAL'):latestDecisions.filter(x=>!(x.stage==='ENTRY_EVALUATION'&&x.outcome==='NO_SIGNAL'));rows('decisions',filtered,[x=>({value:time(x.timestamp)}),x=>({value:x.stage.replaceAll('_',' ')}),x=>({value:x.outcome.replaceAll('_',' '),cls:outcomeClass(x.outcome)}),x=>({value:x.direction}),x=>({value:x.symbol}),x=>({value:x.summary}),x=>({value:decisionDetail(x),cls:'decision-reasons'})],view==='ACTIONABLE'?'No actionable signal, option-selection, risk, or order events yet. Routine NO SIGNAL evaluations remain recorded.':'No evaluations match this view.')}
 function renderPotentialMisses(tuning){const summary=tuning?.falseNegativeSummary||{evaluations:0,noSignalEvaluations:0,matureNoSignalEvaluations:0,potentialMisses:0,potentialMissRate:0,horizonSec:5,thresholdBps:2,gateBlocks:[]},misses=tuning?.potentialMisses||[];$('potentialMisses').textContent=count(summary.potentialMisses);$('potentialMisses').className='value '+(summary.potentialMisses>0?'negative':'positive');$('potentialMissDetail').textContent=count(summary.potentialMisses)+' of '+count(summary.matureNoSignalEvaluations)+' mature · '+percent(100*summary.potentialMissRate,2);$('noSignalEvaluations').textContent=count(summary.noSignalEvaluations);$('noSignalDetail').textContent=count(summary.matureNoSignalEvaluations)+' have a +'+summary.horizonSec+'s outcome';rows('potentialMissRows',misses,[x=>({value:time(x.timestamp)}),x=>({value:x.direction,cls:x.direction==='BULLISH'?'positive':'negative'}),x=>({value:String(x.regime).replaceAll('_',' ')}),x=>({value:num(x.price)}),x=>({value:num(x.forwardPrice)}),x=>({value:signedBps(x.forwardMoveBps),cls:x.forwardMoveBps>0?'positive':'negative'}),x=>({value:(x.failedGates||[]).join(' · '),cls:'decision-reasons'}),x=>({value:(x.reasons||[]).join(' · '),cls:'decision-reasons'})],'No potential hindsight misses detected at the '+summary.horizonSec+'-second / '+num(summary.thresholdBps,1)+'-bps review threshold.');rows('gateBlockRows',summary.gateBlocks||[],[x=>({value:String(x.reason).replaceAll('_',' '),cls:'decision-reasons'}),x=>({value:count(x.count)}),x=>({value:percent(summary.evaluations>0?100*x.count/summary.evaluations:0,1)})],'No entry gates have blocked an evaluation.')}
+let scheduledDisplayRolloverAt=0,displayRolloverTimer;
+function scheduleDisplayRollover(timestamp){if(!Number.isFinite(timestamp)||timestamp===scheduledDisplayRolloverAt)return;scheduledDisplayRolloverAt=timestamp;if(displayRolloverTimer)clearTimeout(displayRolloverTimer);const delay=Math.max(0,timestamp-Date.now()+250);displayRolloverTimer=setTimeout(()=>window.location.reload(),Math.min(delay,2147483647))}
 const percent=(value,d=1)=>Number.isFinite(value)?num(value,d)+'%':'—',latency=value=>!Number.isFinite(value)?'—':value<1000?Math.round(value)+' ms':value<60000?num(value/1000,2)+' s':duration(value),signedBps=value=>Number.isFinite(value)?(value>0?'+':'')+num(value,1)+' bps':'—';
 function tuneAverage(values){const finite=values.filter(Number.isFinite);return finite.length?finite.reduce((sum,value)=>sum+value,0)/finite.length:undefined}
 function tuneStats(items){const submitted=items.filter(x=>x.orderTimestamp!==undefined),filled=submitted.filter(x=>x.firstFillTimestamp!==undefined),closed=items.filter(x=>['WIN','LOSS','FLAT'].includes(x.status));return{signals:items.length,submitted:submitted.length,filled:filled.length,closed:closed.length,fillRate:submitted.length?filled.length/submitted.length:0,replacementRate:submitted.length?submitted.filter(x=>(x.replacements||0)>0).length/submitted.length:0,winRate:closed.length?closed.filter(x=>x.status==='WIN').length/closed.length:0,avgPnl:tuneAverage(closed.map(x=>x.realizedPnl)),avgReturn:tuneAverage(closed.map(x=>x.returnPct)),avgSignalOrder:tuneAverage(items.map(x=>x.signalToOrderMs)),avgOrderFill:tuneAverage(items.map(x=>x.orderToFirstFillMs)),avgSlippage:tuneAverage(items.map(x=>x.entrySlippageBps)),avgMfe:tuneAverage(items.map(x=>x.maxFavorableExcursionPct)),avgMae:tuneAverage(items.map(x=>x.maxAdverseExcursionPct)),avgCapture:tuneAverage(items.map(x=>x.capturePct))}}
@@ -1381,10 +1466,10 @@ const key=$('tuneBreakdown').value,groups=new Map();for(const item of items){con
 document.querySelectorAll('.tab').forEach(button=>button.addEventListener('click',()=>{document.querySelectorAll('.tab').forEach(tab=>{const active=tab===button;tab.classList.toggle('active',active);tab.setAttribute('aria-selected',String(active))});document.querySelectorAll('.tab-panel').forEach(panel=>panel.classList.toggle('active',panel.id===button.dataset.tab))}));
 ['tuneDirection','tuneRegime','tuneOutcome','tuneBreakdown'].forEach(id=>$(id).addEventListener('change',()=>renderTuning(latestTuning,latestQualityOrders)));
 $('decisionView').addEventListener('change',()=>renderDecisionRows(latestDecisions));
-async function refresh(){try{const response=await fetch('/api/dashboard',{cache:'no-store'});if(!response.ok)throw new Error('Dashboard API '+response.status);const data=await response.json(),p=data.performance,h=data.health||{},live=data.liveData||{eventCounts:{},recentEvents:[],totalEvents:0,uptimeMs:0,persistenceEnabled:false,quoteSampleIntervalMs:0,retentionDays:0};$('stateText').textContent=(data.readiness||'unknown').toUpperCase()+' · '+(h.executionMode||'paper');$('state').className=data.readiness||'degraded';setStatus('engineState','engineDetail','LIVE','API heartbeat · uptime '+duration(live.uptimeMs),'ok');setStatus('sipState','sipDetail',h.websocketConnected?'CONNECTED':'DISCONNECTED',count(h.receivedStockQuotes??live.eventCounts.stock_quote)+' quotes · '+age(h.lastStockQuoteAgeMs),h.websocketConnected?'ok':'halted');setStatus('opraState','opraDetail',h.optionWebsocketConnected?'CONNECTED':'DISCONNECTED',count(h.receivedOptionQuotes??live.eventCounts.option_quote)+' quotes · '+age(h.lastOptionQuoteAgeMs),h.optionWebsocketConnected?'ok':'halted');const dbLevel=!live.persistenceEnabled?'degraded':h.recorderHealthy?'ok':'halted',retentionDetail=(live.quoteSampleIntervalMs===0?'full-resolution quotes':live.quoteSampleIntervalMs+' ms quote baseline')+' · '+live.retentionDays+'d raw retention';setStatus('databaseState','databaseDetail',!live.persistenceEnabled?'DISABLED':h.recorderHealthy?'WRITING':'UNHEALTHY',live.persistenceEnabled?retentionDetail:'Persistence is not enabled',dbLevel);setStatus('brokerState','brokerDetail',h.brokerAvailable?'CONNECTED':'UNAVAILABLE',(h.executionMode||'paper').toUpperCase()+' · '+count(h.openOrderCount)+' open order(s)',h.brokerAvailable?'ok':'degraded');setStatus('marketState','marketDetail',String(h.marketClockState||'unknown').replaceAll('-',' ').toUpperCase(),h.positionsReconciled?'Positions reconciled':'Reconciliation required',h.positionsReconciled?'ok':'halted');const strategyRequired=h.executionEnabled&&h.marketClockState==='market-open',strategyReady=h.strategyStateReady===true||!strategyRequired,strategyStatus=String(h.strategyStateStatus||(!strategyRequired?'NOT REQUIRED':'UNKNOWN')).replaceAll('_',' ');setStatus('strategyState','strategyDetail',strategyReady?'READY':'BLOCKED',strategyStatus+' · '+count(h.restoredStockEvents)+' SIP events / '+count(h.restoredFeatureBars??h.restoredBars)+' bars',strategyReady?'ok':'halted');const signalsFired=p.signalsFired??p.entriesFired??0,optionsSelected=p.optionsSelected??0;$('signalsFired').textContent=count(signalsFired);$('optionsSelected').textContent=count(optionsSelected);$('optionSelectionDetail').textContent=percent(signalsFired>0?100*optionsSelected/signalsFired:0)+' of signals';$('riskAllowed').textContent=count(p.riskAllowed);$('riskDetail').textContent=count(p.riskBlocked)+' blocked';$('entryOrders').textContent=p.entryOrders;$('filledEntries').textContent=p.filledEntryOrders;$('closedTrades').textContent=p.closedTrades;$('winRate').textContent=(p.winRate*100).toFixed(1)+'%';$('pnl').textContent=money(p.realizedPnl);$('pnl').className='value '+(p.realizedPnl>0?'positive':p.realizedPnl<0?'negative':'');$('openPnl').textContent=money(p.unrealizedPnl);$('openPnl').className='value '+(p.unrealizedPnl>0?'positive':p.unrealizedPnl<0?'negative':'');$('totalPnl').textContent=money(p.totalPnl);$('totalPnl').className='value '+(p.totalPnl>0?'positive':p.totalPnl<0?'negative':'');$('profitFactor').textContent=p.profitFactor===null?'—':num(p.profitFactor);$('openTrades').textContent=p.openTrades;$('subscriptions').textContent=h.subscribedOptionContracts||0;$('feedEvents').textContent=count(live.totalEvents);$('sipQuotes').textContent=count(live.eventCounts.stock_quote);$('sipTrades').textContent=count(live.eventCounts.stock_trade);$('opraQuotes').textContent=count(live.eventCounts.option_quote);$('featureEvents').textContent=count(live.eventCounts.feature_snapshot);$('feedAge').textContent=live.lastEventAgeMs===undefined?'—':duration(live.lastEventAgeMs);renderLiveOrders(data.activeOrders);
+async function refresh(){try{const response=await fetch('/api/dashboard',{cache:'no-store'});if(!response.ok)throw new Error('Dashboard API '+response.status);const data=await response.json(),p=data.performance,h=data.health||{},live=data.liveData||{eventCounts:{},recentEvents:[],totalEvents:0,uptimeMs:0,persistenceEnabled:false,quoteSampleIntervalMs:0,retentionDays:0};scheduleDisplayRollover(data.nextDisplayRolloverAt);$('stateText').textContent=(data.readiness||'unknown').toUpperCase()+' · '+(h.executionMode||'paper');$('state').className=data.readiness||'degraded';setStatus('engineState','engineDetail','LIVE','API heartbeat · uptime '+duration(live.uptimeMs),'ok');setStatus('sipState','sipDetail',h.websocketConnected?'CONNECTED':'DISCONNECTED',count(live.eventCounts.stock_quote)+' display-day quotes · '+age(live.lastEventAgeMs),h.websocketConnected?'ok':'halted');setStatus('opraState','opraDetail',h.optionWebsocketConnected?'CONNECTED':'DISCONNECTED',count(live.eventCounts.option_quote)+' display-day quotes · '+age(live.lastEventAgeMs),h.optionWebsocketConnected?'ok':'halted');const dbLevel=!live.persistenceEnabled?'degraded':h.recorderHealthy?'ok':'halted',retentionDetail=(live.quoteSampleIntervalMs===0?'full-resolution quotes':live.quoteSampleIntervalMs+' ms quote baseline')+' · '+live.retentionDays+'d raw retention';setStatus('databaseState','databaseDetail',!live.persistenceEnabled?'DISABLED':h.recorderHealthy?'WRITING':'UNHEALTHY',live.persistenceEnabled?retentionDetail:'Persistence is not enabled',dbLevel);setStatus('brokerState','brokerDetail',h.brokerAvailable?'CONNECTED':'UNAVAILABLE',(h.executionMode||'paper').toUpperCase()+' · '+count(h.openOrderCount)+' open order(s)',h.brokerAvailable?'ok':'degraded');setStatus('marketState','marketDetail',String(h.marketClockState||'unknown').replaceAll('-',' ').toUpperCase(),h.positionsReconciled?'Positions reconciled':'Reconciliation required',h.positionsReconciled?'ok':'halted');const strategyRequired=h.executionEnabled&&h.marketClockState==='market-open',strategyReady=h.strategyStateReady===true||!strategyRequired,strategyStatus=String(h.strategyStateStatus||(!strategyRequired?'NOT REQUIRED':'UNKNOWN')).replaceAll('_',' ');setStatus('strategyState','strategyDetail',strategyReady?'READY':'BLOCKED',strategyStatus+' · '+count(h.restoredStockEvents)+' SIP events / '+count(h.restoredFeatureBars??h.restoredBars)+' bars',strategyReady?'ok':'halted');const signalsFired=p.signalsFired??p.entriesFired??0,optionsSelected=p.optionsSelected??0;$('signalsFired').textContent=count(signalsFired);$('optionsSelected').textContent=count(optionsSelected);$('optionSelectionDetail').textContent=percent(signalsFired>0?100*optionsSelected/signalsFired:0)+' of signals';$('riskAllowed').textContent=count(p.riskAllowed);$('riskDetail').textContent=count(p.riskBlocked)+' blocked';$('entryOrders').textContent=p.entryOrders;$('filledEntries').textContent=p.filledEntryOrders;$('closedTrades').textContent=p.closedTrades;$('winRate').textContent=(p.winRate*100).toFixed(1)+'%';$('pnl').textContent=money(p.realizedPnl);$('pnl').className='value '+(p.realizedPnl>0?'positive':p.realizedPnl<0?'negative':'');$('openPnl').textContent=money(p.unrealizedPnl);$('openPnl').className='value '+(p.unrealizedPnl>0?'positive':p.unrealizedPnl<0?'negative':'');$('totalPnl').textContent=money(p.totalPnl);$('totalPnl').className='value '+(p.totalPnl>0?'positive':p.totalPnl<0?'negative':'');$('profitFactor').textContent=p.profitFactor===null?'—':num(p.profitFactor);$('openTrades').textContent=p.openTrades;$('subscriptions').textContent=h.subscribedOptionContracts||0;$('feedEvents').textContent=count(live.totalEvents);$('sipQuotes').textContent=count(live.eventCounts.stock_quote);$('sipTrades').textContent=count(live.eventCounts.stock_trade);$('opraQuotes').textContent=count(live.eventCounts.option_quote);$('featureEvents').textContent=count(live.eventCounts.feature_snapshot);$('feedAge').textContent=live.lastEventAgeMs===undefined?'—':duration(live.lastEventAgeMs);renderLiveOrders(data.activeOrders);
 rows('signals',data.signals,[x=>({value:time(x.timestamp)}),x=>({value:x.direction}),x=>({value:x.kind}),x=>({value:x.regime}),x=>({value:num(x.projectedMoveBps)+' bps'}),x=>({value:x.candidate}),x=>({value:x.riskStatus||'—',cls:x.riskStatus==='ALLOWED'?'positive':x.riskStatus==='BLOCKED'?'negative':''}),x=>({value:x.status}),x=>({value:(x.riskReasons||x.reasons||[]).join(', ')})]);
 rows('orders',data.orders,[x=>({value:time(x.timestamp)}),x=>({value:x.purpose}),x=>({value:x.symbol}),x=>({value:x.side}),x=>({value:x.quantity}),x=>({value:money(x.limitPrice)}),x=>({value:x.filledQuantity}),x=>({value:x.averageFillPrice?money(x.averageFillPrice):'—'}),x=>({value:x.status})]);
 renderTuning(data.tuning||{entries:[]},data.orders||[]);renderPotentialMisses(data.tuning);
-rows('trades',data.trades,[x=>({value:time(x.entryTimestamp)}),x=>({value:time(x.exitTimestamp)}),x=>({value:x.symbol}),x=>({value:x.direction}),x=>({value:x.quantity}),x=>({value:money(x.averageEntryPrice)}),x=>({value:x.averageExitPrice?money(x.averageExitPrice):'—'}),x=>({value:money(x.realizedPnl),cls:x.realizedPnl>0?'positive':x.realizedPnl<0?'negative':''}),x=>({value:x.returnPct===undefined?'—':num(x.returnPct)+'%'}),x=>({value:x.exitReason}),x=>({value:x.status})]);renderDecisionRows(data.decisions||[]);rows('feedEventsBody',live.recentEvents||[],[x=>({value:time(x.receivedTimestamp)}),x=>({value:x.channel.replaceAll('_',' ')}),x=>({value:x.type.replaceAll('_',' ')}),x=>({value:x.symbol}),x=>({value:x.summary}),x=>({value:x.latencyMs+' ms'}),x=>({value:storagePolicy(x,live),cls:live.persistenceEnabled?'positive':'muted'})],'No market events received yet. Connection cards above continue to show system liveness.');$('updated').textContent='Updated '+new Date(data.generatedAt).toLocaleString()+' · dashboard refreshes every second';}catch(error){$('stateText').textContent='DASHBOARD ERROR';$('state').className='halted';$('updated').textContent=String(error)}}refresh();setInterval(refresh,1000);
+rows('trades',data.trades,[x=>({value:time(x.entryTimestamp)}),x=>({value:time(x.exitTimestamp)}),x=>({value:x.symbol}),x=>({value:x.direction}),x=>({value:x.quantity}),x=>({value:money(x.averageEntryPrice)}),x=>({value:x.averageExitPrice?money(x.averageExitPrice):'—'}),x=>({value:money(x.realizedPnl),cls:x.realizedPnl>0?'positive':x.realizedPnl<0?'negative':''}),x=>({value:x.returnPct===undefined?'—':num(x.returnPct)+'%'}),x=>({value:x.exitReason}),x=>({value:x.status})]);renderDecisionRows(data.decisions||[]);rows('feedEventsBody',live.recentEvents||[],[x=>({value:time(x.receivedTimestamp)}),x=>({value:x.channel.replaceAll('_',' ')}),x=>({value:x.type.replaceAll('_',' ')}),x=>({value:x.symbol}),x=>({value:x.summary}),x=>({value:x.latencyMs+' ms'}),x=>({value:storagePolicy(x,live),cls:live.persistenceEnabled?'positive':'muted'})],'No market events received yet. Connection cards above continue to show system liveness.');$('updated').textContent='Display day '+data.displayDate+' · Updated '+new Date(data.generatedAt).toLocaleString()+' · resets at 10:00 PM Pacific';}catch(error){$('stateText').textContent='DASHBOARD ERROR';$('state').className='halted';$('updated').textContent=String(error)}}refresh();setInterval(refresh,1000);
 </script></body></html>`;
 }
