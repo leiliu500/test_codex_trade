@@ -7,6 +7,14 @@ export type DashboardOrderCardStage =
   | "CANCELLED"
   | "REJECTED";
 
+export type DashboardOrderEntryQuality =
+  | "GOOD"
+  | "GOOD_ENTRY_POOR_EXIT"
+  | "MARGINAL"
+  | "POOR"
+  | "EVALUATING"
+  | "NOT_RATED";
+
 export interface DashboardOrderDynamicsUpdate {
   timestamp: number;
   stage: DashboardOrderCardStage;
@@ -58,6 +66,9 @@ export interface DashboardOrderCard {
   lastQuoteTimestamp?: number;
   quoteAgeMs?: number;
   exitReason?: string;
+  entryQuality?: DashboardOrderEntryQuality;
+  entryQualityReason?: string;
+  bestObservedPnl?: number;
   workingOrder?: {
     clientOrderId: string;
     brokerOrderId?: string;
@@ -76,6 +87,69 @@ export interface OrderCardPersistence {
   saveOrderCard(card: DashboardOrderCard): Promise<void>;
 }
 
+export function classifyOrderCardEntryQuality(card: DashboardOrderCard): {
+  entryQuality: DashboardOrderEntryQuality;
+  entryQualityReason: string;
+  bestObservedPnl?: number;
+} {
+  const observedPnl = card.updates
+    .map((update) => update.totalPnl ?? update.unrealizedPnl)
+    .filter((value): value is number => value !== undefined && Number.isFinite(value));
+  if (observedPnl.length === 0) {
+    return {
+      entryQuality: "NOT_RATED",
+      entryQualityReason: "No post-fill P&L observations are available yet.",
+    };
+  }
+
+  const bestObservedPnl = Math.max(...observedPnl);
+  const finalPnl = card.totalPnl ?? card.realizedPnl;
+  const epsilon = 0.005;
+  if (card.active) {
+    if (bestObservedPnl > epsilon) {
+      return {
+        entryQuality: "GOOD",
+        entryQualityReason: `Recovered the opening spread and reached ${formatSignedPnl(bestObservedPnl)}.`,
+        bestObservedPnl,
+      };
+    }
+    return {
+      entryQuality: "EVALUATING",
+      entryQualityReason: `Position is active; best observed P&L is ${formatSignedPnl(bestObservedPnl)}.`,
+      bestObservedPnl,
+    };
+  }
+  if (bestObservedPnl > epsilon) {
+    if (finalPnl > epsilon) {
+      return {
+        entryQuality: "GOOD",
+        entryQualityReason:
+          `Recovered the spread, reached ${formatSignedPnl(bestObservedPnl)}, and closed ${formatSignedPnl(finalPnl)}.`,
+        bestObservedPnl,
+      };
+    }
+    return {
+      entryQuality: "GOOD_ENTRY_POOR_EXIT",
+      entryQualityReason:
+        `Recovered the spread and reached ${formatSignedPnl(bestObservedPnl)}, but closed ${formatSignedPnl(finalPnl)}.`,
+      bestObservedPnl,
+    };
+  }
+  if (bestObservedPnl >= -epsilon) {
+    return {
+      entryQuality: "MARGINAL",
+      entryQualityReason: `Recovered only to breakeven and closed ${formatSignedPnl(finalPnl)}.`,
+      bestObservedPnl,
+    };
+  }
+  return {
+    entryQuality: "POOR",
+    entryQualityReason:
+      `Never recovered the opening spread; best observed P&L was ${formatSignedPnl(bestObservedPnl)}.`,
+    bestObservedPnl,
+  };
+}
+
 /**
  * Rebuilds the reviewable P&L timeline for a card from durable option quotes.
  * Existing lifecycle/status rows are retained, while only actual bid/P&L
@@ -87,7 +161,8 @@ export function mergeOrderCardQuoteDynamics(
 ): DashboardOrderCard {
   if (!(card.entryPrice !== undefined && card.entryPrice > 0) ||
       card.entryTimestamp === undefined || card.quantity <= 0) {
-    return cloneCard(card);
+    const cloned = cloneCard(card);
+    return { ...cloned, ...classifyOrderCardEntryQuality(cloned) };
   }
 
   const statusUpdates = card.updates.map((update, index) => ({
@@ -158,7 +233,8 @@ export function mergeOrderCardQuoteDynamics(
     updates.push(update);
   }
 
-  return { ...cloneCard(card), updates };
+  const mergedCard = { ...cloneCard(card), updates };
+  return { ...mergedCard, ...classifyOrderCardEntryQuality(mergedCard) };
 }
 
 function sameDynamics(left: DashboardOrderDynamicsUpdate, right: DashboardOrderDynamicsUpdate): boolean {
@@ -177,4 +253,9 @@ function cloneCard(card: DashboardOrderCard): DashboardOrderCard {
     ...(card.workingOrder ? { workingOrder: { ...card.workingOrder } } : {}),
     updates: card.updates.map((update) => ({ ...update })),
   };
+}
+
+function formatSignedPnl(value: number): string {
+  const rounded = Math.abs(value) < 0.005 ? 0 : value;
+  return rounded < 0 ? `-$${Math.abs(rounded).toFixed(2)}` : `+$${rounded.toFixed(2)}`;
 }
