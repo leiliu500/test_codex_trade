@@ -9,7 +9,10 @@ import {
 } from "../src/ops/tradingDashboard.js";
 import type { AuditEvent } from "../src/ops/recorder.js";
 import type { HistoricalMarketEvent } from "../src/history/types.js";
-import { mergeOrderCardQuoteDynamics } from "../src/ops/orderCards.js";
+import {
+  classifyOrderCardEntryQuality,
+  mergeOrderCardQuoteDynamics,
+} from "../src/ops/orderCards.js";
 
 const timestamp = Date.parse("2026-07-22T14:20:00Z");
 const symbol = "SPY260722C00501000";
@@ -106,10 +109,12 @@ test("dashboard starts a new empty display day at 10 PM Pacific without restorin
   assert.equal(dashboard.snapshot().signals[0]?.id, "new-display-day-signal");
 });
 
-test("dashboard keeps restored completed order cards available across display-day rollover", () => {
-  const now = Date.parse("2026-07-23T14:00:00Z");
-  const dashboard = new TradingDashboardStore(now, true, 250, 7, () => now);
-  dashboard.restoreOrderCards([{
+test("dashboard clears order cards at 10 PM Pacific and does not restore prior-display-day cards", () => {
+  const beforeRollover = Date.parse("2026-07-23T04:59:59Z");
+  const rollover = Date.parse("2026-07-23T05:00:00Z");
+  let now = beforeRollover;
+  const dashboard = new TradingDashboardStore(beforeRollover, true, 250, 7, () => now);
+  const completedCard: DashboardOrderCard = {
     id: "historical-entry",
     symbol,
     direction: "BULLISH",
@@ -123,11 +128,11 @@ test("dashboard keeps restored completed order cards available across display-da
     realizedPnl: 25,
     unrealizedPnl: 0,
     totalPnl: 25,
-    entryTimestamp: timestamp,
-    exitTimestamp: timestamp + 60_000,
+    entryTimestamp: beforeRollover - 60_000,
+    exitTimestamp: beforeRollover - 1_000,
     exitReason: "PROFIT_TARGET",
     updates: [{
-      timestamp: timestamp + 60_000,
+      timestamp: beforeRollover - 1_000,
       stage: "CLOSED",
       status: "filled",
       remainingQuantity: 0,
@@ -135,13 +140,14 @@ test("dashboard keeps restored completed order cards available across display-da
       unrealizedPnl: 0,
       totalPnl: 25,
     }],
-  }]);
+  };
+  dashboard.restoreOrderCards([completedCard]);
 
-  const snapshot = dashboard.snapshot();
-  assert.equal(snapshot.orders.length, 0);
-  assert.equal(snapshot.trades.length, 0);
-  assert.equal(snapshot.orderCards[0]?.id, "historical-entry");
-  assert.equal(snapshot.orderCards[0]?.updates[0]?.totalPnl, 25);
+  assert.equal(dashboard.snapshot().orderCards[0]?.id, "historical-entry");
+  now = rollover;
+  assert.equal(dashboard.snapshot().orderCards.length, 0);
+  dashboard.restoreOrderCards([completedCard]);
+  assert.equal(dashboard.snapshot().orderCards.length, 0);
 });
 
 test("dashboard persists a completed card with all captured P&L updates", async () => {
@@ -240,6 +246,36 @@ test("historical order cards rebuild every bid-driven P&L change as a trackable 
     mergeOrderCardQuoteDynamics(enriched, quotes).updates,
     enriched.updates,
   );
+});
+
+test("order cards classify entry quality from the best observed and final P&L", () => {
+  const classified = (pnls: number[], finalPnl: number, active = false) =>
+    classifyOrderCardEntryQuality({
+      id: "quality-entry",
+      symbol,
+      active,
+      stage: active ? "POSITION_OPEN" : "CLOSED",
+      status: active ? "OPEN" : "filled",
+      quantity: 1,
+      remainingQuantity: active ? 1 : 0,
+      realizedPnl: active ? 0 : finalPnl,
+      totalPnl: finalPnl,
+      updates: pnls.map((pnl, index) => ({
+        timestamp: timestamp + index,
+        stage: active ? "POSITION_OPEN" : index === pnls.length - 1 ? "CLOSED" : "POSITION_OPEN",
+        status: active ? "OPEN" : index === pnls.length - 1 ? "filled" : "OPEN",
+        remainingQuantity: active ? 1 : index === pnls.length - 1 ? 0 : 1,
+        realizedPnl: active ? 0 : index === pnls.length - 1 ? finalPnl : 0,
+        totalPnl: pnl,
+      })),
+    }).entryQuality;
+
+  assert.equal(classified([-7, 20, 12], 12), "GOOD");
+  assert.equal(classified([-6, 12, -6], -6), "GOOD_ENTRY_POOR_EXIT");
+  assert.equal(classified([-7, 0, -21], -21), "MARGINAL");
+  assert.equal(classified([-9, -7, -28], -28), "POOR");
+  assert.equal(classified([-7], -7, true), "EVALUATING");
+  assert.equal(classified([], 0), "NOT_RATED");
 });
 
 test("completed cards keep the exit order from their own trade window when symbols repeat", () => {
