@@ -102,6 +102,8 @@ test("PostgreSQL history saves completed order cards with their full dynamics li
   assert.equal(dynamics?.values[0], "entry-1");
   assert.equal(dynamics?.values[8], "entry-1");
   assert.match(String(dynamics?.values[15]), /"pnlChange":10/);
+  const truncate = client.queries.find((query) => query.text.includes("DELETE FROM order_card_updates"));
+  assert.deepEqual(truncate?.values, ["entry-1", 2]);
   await store.close();
 });
 
@@ -134,6 +136,49 @@ test("PostgreSQL history restores completed cards and ordered dynamics for dashb
   assert.equal(cards[0]?.id, "entry-1");
   assert.equal(cards[0]?.updates[0]?.stage, "CLOSED");
   assert.equal(cards[0]?.updates[0]?.totalPnl, 20);
+});
+
+test("PostgreSQL history loads each changed option bid inside a completed card window", async () => {
+  const client: DatabaseClient = {
+    async query<R extends QueryResultRow = QueryResultRow>(text: string, values: readonly unknown[] = []) {
+      assert.match(text, /WITH card_windows AS/);
+      assert.match(text, /bid_price IS DISTINCT FROM previous_bid/);
+      assert.match(String(values[0]), /"card_id":"entry-1"/);
+      const rows = [{
+        card_id: "entry-1",
+        provider_timestamp: 1_100,
+        bid_price: 2.05,
+        ask_price: 2.07,
+      }, {
+        card_id: "entry-1",
+        provider_timestamp: 1_200,
+        bid_price: 2.1,
+        ask_price: 2.12,
+      }];
+      return { command: "SELECT", rowCount: rows.length, oid: 0, fields: [], rows: rows as unknown as R[] };
+    },
+  };
+  const store = new PostgresHistoryStore({ connectionString: "postgresql://unused", client });
+  const quotes = await store.loadOrderCardQuotes([{
+    id: "entry-1",
+    symbol: "SPY260722C00500000",
+    active: false,
+    stage: "CLOSED",
+    status: "filled",
+    quantity: 1,
+    remainingQuantity: 0,
+    entryPrice: 2,
+    exitPrice: 2.2,
+    realizedPnl: 20,
+    entryTimestamp: 1_000,
+    exitTimestamp: 2_000,
+    updates: [],
+  }]);
+
+  assert.deepEqual(quotes.get("entry-1"), [
+    { timestamp: 1_100, bidPrice: 2.05, askPrice: 2.07 },
+    { timestamp: 1_200, bidPrice: 2.1, askPrice: 2.12 },
+  ]);
 });
 
 test("PostgreSQL history samples quote baselines but preserves priority option quotes at full resolution", async () => {

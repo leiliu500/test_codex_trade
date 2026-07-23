@@ -1,6 +1,10 @@
 import { Pool, type QueryResult, type QueryResultRow } from "pg";
 import type { AuditEvent, AuditRecorder } from "../ops/recorder.js";
-import type { DashboardOrderCard, DashboardOrderDynamicsUpdate } from "../ops/orderCards.js";
+import type {
+  DashboardOrderCard,
+  DashboardOrderDynamicsUpdate,
+  DashboardOrderQuote,
+} from "../ops/orderCards.js";
 import type { FeatureSnapshot } from "../types.js";
 import type { HistoricalMarketEvent, HistoryStore } from "./types.js";
 
@@ -52,6 +56,12 @@ interface OrderCardUpdateRow extends QueryResultRow {
   card_id: string;
   sequence_index: string | number;
   data: DashboardOrderDynamicsUpdate;
+}
+interface OrderCardQuoteRow extends QueryResultRow {
+  card_id: string;
+  provider_timestamp: string | number;
+  bid_price: string | number;
+  ask_price: string | number;
 }
 
 const SCHEMA_SQL = `
@@ -434,6 +444,11 @@ export class PostgresHistoryStore implements HistoryStore, AuditRecorder {
           values,
         );
       }
+      await this.#client.query(
+        `DELETE FROM order_card_updates
+         WHERE card_id = $1 AND sequence_index >= $2`,
+        [card.id, updates.length],
+      );
       this.#auditHealthy = true;
     } catch (error) {
       this.#recordError(error, "audit");
@@ -470,6 +485,62 @@ export class PostgresHistoryStore implements HistoryStore, AuditRecorder {
       id: row.card_id,
       updates: updatesByCard.get(row.card_id) ?? row.data.updates ?? [],
     }));
+  }
+
+  async loadOrderCardQuotes(cards: readonly DashboardOrderCard[]): Promise<Map<string, DashboardOrderQuote[]>> {
+    const windows = cards.flatMap((card) =>
+      card.entryTimestamp !== undefined && card.exitTimestamp !== undefined && card.entryTimestamp < card.exitTimestamp
+        ? [{
+          card_id: card.id,
+          symbol: card.symbol,
+          entry_timestamp: card.entryTimestamp,
+          exit_timestamp: card.exitTimestamp,
+        }] : []);
+    const quotesByCard = new Map<string, DashboardOrderQuote[]>();
+    if (windows.length === 0) return quotesByCard;
+    const result = await this.#client.query<OrderCardQuoteRow>(
+      `WITH card_windows AS (
+         SELECT card_id, symbol, entry_timestamp, exit_timestamp
+         FROM jsonb_to_recordset($1::jsonb)
+           AS card(card_id TEXT, symbol TEXT, entry_timestamp BIGINT, exit_timestamp BIGINT)
+       ),
+       quote_history AS (
+         SELECT card.card_id, quote.id, quote.provider_timestamp,
+                (quote.data->>'bidPrice')::double precision AS bid_price,
+                (quote.data->>'askPrice')::double precision AS ask_price,
+                lag((quote.data->>'bidPrice')::double precision) OVER (
+                  PARTITION BY card.card_id ORDER BY quote.provider_timestamp, quote.id
+                ) AS previous_bid
+         FROM card_windows card
+         CROSS JOIN LATERAL (
+           SELECT id, provider_timestamp, data
+           FROM market_events
+           WHERE event_type = 'option_quote'
+             AND symbol = card.symbol
+             AND provider_timestamp >= card.entry_timestamp
+             AND provider_timestamp < card.exit_timestamp
+           ORDER BY provider_timestamp, id
+         ) quote
+       )
+       SELECT card_id, provider_timestamp, bid_price, ask_price
+       FROM quote_history
+       WHERE bid_price IS DISTINCT FROM previous_bid
+       ORDER BY card_id, provider_timestamp, id`,
+      [JSON.stringify(windows)],
+    );
+    for (const row of result.rows) {
+      const quote = {
+        timestamp: Number(row.provider_timestamp),
+        bidPrice: Number(row.bid_price),
+        askPrice: Number(row.ask_price),
+      };
+      if (!Number.isFinite(quote.timestamp) || !Number.isFinite(quote.bidPrice) ||
+          !Number.isFinite(quote.askPrice) || quote.bidPrice < 0 || quote.askPrice < quote.bidPrice) continue;
+      const list = quotesByCard.get(row.card_id) ?? [];
+      list.push(quote);
+      quotesByCard.set(row.card_id, list);
+    }
+    return quotesByCard;
   }
 
   async loadReplayEvents(marketDate: string): Promise<Array<{

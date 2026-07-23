@@ -14,7 +14,10 @@ import { CompositeMarketHistorySink } from "./history/types.js";
 import { JsonLogger } from "./utils/logger.js";
 import { marketDate } from "./utils/time.js";
 import type { FeatureSnapshot } from "./types.js";
-import type { DashboardOrderCard } from "./ops/orderCards.js";
+import {
+  mergeOrderCardQuoteDynamics,
+  type DashboardOrderCard,
+} from "./ops/orderCards.js";
 
 loadDotEnv();
 validateConfig(defaultConfig);
@@ -54,14 +57,23 @@ if (history) {
   restoredFeatureCheckpoint = await history.loadLatestRecoveredFeature(marketDate(Date.now(), defaultConfig.timeZone));
   for (const event of restoredEvents) dashboard.record(event);
   const restoredCardIds = new Set(restoredOrderCards.map((card) => card.id));
-  const backfilledOrderCards = dashboard.snapshot().orderCards.filter((card) =>
-    !card.active && !restoredCardIds.has(card.id));
-  for (const card of backfilledOrderCards) await history.saveOrderCard(card);
+  const completedOrderCards = dashboard.snapshot().orderCards.filter((card) => !card.active);
+  const backfilledOrderCards = completedOrderCards.filter((card) => !restoredCardIds.has(card.id));
+  const quotesByCard = await history.loadOrderCardQuotes(completedOrderCards);
+  let backfilledPnlUpdates = 0;
+  for (const card of completedOrderCards) {
+    const quotes = quotesByCard.get(card.id) ?? [];
+    const enriched = mergeOrderCardQuoteDynamics(card, quotes);
+    backfilledPnlUpdates += Math.max(0, enriched.updates.length - card.updates.length);
+    dashboard.restoreOrderCards([enriched]);
+    if (quotes.length > 0 || !restoredCardIds.has(card.id)) await history.saveOrderCard(enriched);
+  }
   dashboard.setOrderCardPersistence(history);
   logger.log("info", "postgres_history_ready", {
     restoredAuditEvents: restoredEvents.length,
     restoredOrderCards: restoredOrderCards.length,
     backfilledOrderCards: backfilledOrderCards.length,
+    backfilledPnlUpdates,
     recoveredFeatureCheckpoint: restoredFeatureCheckpoint !== undefined,
   });
 }
