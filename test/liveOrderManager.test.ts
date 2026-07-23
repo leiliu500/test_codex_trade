@@ -108,10 +108,30 @@ function candidate(): OptionCandidateEvaluation {
   };
 }
 
+test("production sizing submits exactly one option contract per entry order", async () => {
+  const client = new FakeTradingClient();
+  const manager = new LiveOrderManager({ config: defaultConfig, client });
+  await manager.initialize(start);
+
+  const submitted = await manager.submitEntry({
+    timestamp: start,
+    signal: signal(),
+    candidate: candidate(),
+    quote: optionQuote(start),
+  });
+
+  assert.equal(submitted.submitted, true);
+  assert.equal(submitted.risk?.quantity, 1);
+  assert.equal(client.requests[0]?.quantity, 1);
+});
+
 test("live manager submits an option entry, reconciles partial fill, cancels remainder, and hard-stops exposure", async () => {
   const client = new FakeTradingClient();
   const recorder = new MemoryRecorder();
-  const manager = new LiveOrderManager({ config: defaultConfig, client, recorder });
+  const partialFillConfig = structuredClone(defaultConfig);
+  // Exercise multi-fill reconciliation independently of the production one-contract configuration invariant.
+  partialFillConfig.risk.maxContracts = 5;
+  const manager = new LiveOrderManager({ config: partialFillConfig, client, recorder });
   await manager.initialize(start);
 
   const submitted = await manager.submitEntry({ timestamp: start, signal: signal(), candidate: candidate(), quote: optionQuote(start) });

@@ -210,6 +210,9 @@ export function validateConfig(config: EngineConfig): void {
         Number.isInteger(config.risk.entryQualityMaxTradesPerDay) && config.risk.entryQualityMaxTradesPerDay > 0)) {
     throw new Error("Daily entry caps must be positive integers");
   }
+  if (config.risk.maxContracts !== 1) {
+    throw new Error("Entry order sizing is hard-limited to exactly one option contract");
+  }
   if (!(config.risk.earlyScratchMinAgeSec >= 0 &&
         config.risk.earlyScratchMaxAgeSec >= config.risk.earlyScratchMinAgeSec &&
         config.risk.earlyScratchMinimumFavorablePct >= 0 &&
