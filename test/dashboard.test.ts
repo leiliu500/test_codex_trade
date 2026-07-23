@@ -1,11 +1,21 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { TradingDashboardStore, tradingDashboardHtml } from "../src/ops/tradingDashboard.js";
+import {
+  dashboardDisplayDate,
+  nextDashboardDisplayRollover,
+  TradingDashboardStore,
+  tradingDashboardHtml,
+} from "../src/ops/tradingDashboard.js";
 import type { AuditEvent } from "../src/ops/recorder.js";
 import type { HistoricalMarketEvent } from "../src/history/types.js";
 
 const timestamp = Date.parse("2026-07-22T14:20:00Z");
 const symbol = "SPY260722C00501000";
+const dashboardNow = () => timestamp + 120_000;
+
+function historicalDashboard(): TradingDashboardStore {
+  return new TradingDashboardStore(timestamp, true, 0, 0, dashboardNow);
+}
 
 function event(type: string, data: Record<string, unknown>, offset = 0): AuditEvent {
   return { timestamp: timestamp + offset, marketDate: "2026-07-22", type, configVersion: "test", data };
@@ -33,10 +43,69 @@ test("dashboard exposes liveness and feed tabs before any entries, orders, or hi
   assert.match(html, /Entry Gate Blocks/);
   assert.match(html, /Strategy state/);
   assert.match(html, /Actionable stages only/);
+  assert.match(html, /scheduleDisplayRollover/);
+  assert.match(html, /window\.location\.reload/);
+  assert.match(html, /resets at 10:00 PM Pacific/);
+});
+
+test("dashboard starts a new empty display day at 10 PM Pacific without restoring older rows", () => {
+  const beforeRollover = Date.parse("2026-07-23T04:59:59Z");
+  const rollover = Date.parse("2026-07-23T05:00:00Z");
+  let now = beforeRollover;
+  const dashboard = new TradingDashboardStore(beforeRollover, true, 250, 7, () => now);
+  const signalEvent = (eventTimestamp: number, signalId: string): AuditEvent => ({
+    timestamp: eventTimestamp,
+    marketDate: "2026-07-22",
+    type: "live_signal_selection",
+    configVersion: "test",
+    data: {
+      signalId,
+      timestamp: eventTimestamp,
+      direction: "BULLISH",
+      kind: "IMPULSE",
+      regime: "STRONG_UP",
+      candidate: symbol,
+    },
+  });
+
+  dashboard.record(signalEvent(beforeRollover, "old-signal"));
+  dashboard.recordMarketEvent({
+    type: "stock_quote",
+    providerTimestamp: beforeRollover - 1,
+    receivedTimestamp: beforeRollover,
+    marketDate: "2026-07-22",
+    symbol: "SPY",
+    data: { bidPrice: 500, askPrice: 500.01 },
+  });
+  let snapshot = dashboard.snapshot();
+  assert.equal(dashboardDisplayDate(beforeRollover), "2026-07-22");
+  assert.equal(nextDashboardDisplayRollover(beforeRollover), rollover);
+  assert.equal(snapshot.displayDate, "2026-07-22");
+  assert.equal(snapshot.displayTimeZone, "America/Los_Angeles");
+  assert.equal(snapshot.nextDisplayRolloverAt, rollover);
+  assert.equal(snapshot.signals.length, 1);
+  assert.equal(snapshot.liveData.totalEvents, 1);
+
+  now = rollover;
+  snapshot = dashboard.snapshot();
+  assert.equal(dashboardDisplayDate(rollover), "2026-07-23");
+  assert.equal(snapshot.displayDate, "2026-07-23");
+  assert.equal(snapshot.nextDisplayRolloverAt, Date.parse("2026-07-24T05:00:00Z"));
+  assert.equal(snapshot.signals.length, 0);
+  assert.equal(snapshot.orders.length, 0);
+  assert.equal(snapshot.trades.length, 0);
+  assert.equal(snapshot.decisions.length, 0);
+  assert.equal(snapshot.liveData.totalEvents, 0);
+  assert.equal(snapshot.lastMarketDate, undefined);
+
+  dashboard.record(signalEvent(beforeRollover, "restored-old-signal"));
+  assert.equal(dashboard.snapshot().signals.length, 0);
+  dashboard.record(signalEvent(rollover + 1, "new-display-day-signal"));
+  assert.equal(dashboard.snapshot().signals[0]?.id, "new-display-day-signal");
 });
 
 test("dashboard separates potential hindsight misses from routine no-signal evaluations", () => {
-  const dashboard = new TradingDashboardStore(timestamp, true);
+  const dashboard = historicalDashboard();
   const noSignal = (price: number) => ({
     decision: "NO_SIGNAL",
     reasons: ["NO_DIRECTION_PASSED"],
@@ -74,7 +143,7 @@ test("dashboard separates potential hindsight misses from routine no-signal eval
     "FAST_SLOPE 0.200 vs 0.420",
   ]);
 
-  const safetyBlocked = new TradingDashboardStore(timestamp, true);
+  const safetyBlocked = historicalDashboard();
   safetyBlocked.record(event("live_entry_evaluation", {
     ...noSignal(500),
     reasons: ["WHIPSAW_REGIME_BLOCKED"],
@@ -85,7 +154,7 @@ test("dashboard separates potential hindsight misses from routine no-signal eval
 });
 
 test("dashboard reconstructs fired entries, broker execution, trades, and performance from audit history", () => {
-  const dashboard = new TradingDashboardStore(timestamp, true);
+  const dashboard = historicalDashboard();
   dashboard.record(event("live_signal_selection", {
     signalId: "signal-1", timestamp, direction: "BULLISH", kind: "IMPULSE", regime: "STRONG_UP",
     projectedMoveBps: 8.5, candidate: symbol, evaluatedContracts: 24,
@@ -214,7 +283,7 @@ test("dashboard reconstructs fired entries, broker execution, trades, and perfor
 });
 
 test("dashboard exposes the full signal funnel and excludes losses from profit capture", () => {
-  const dashboard = new TradingDashboardStore(timestamp, true);
+  const dashboard = historicalDashboard();
   dashboard.record(event("live_signal_selection", {
     signalId: "no-option", timestamp, direction: "BULLISH", kind: "IMPULSE", regime: "STRONG_UP",
     projectedMoveBps: 0.4, candidate: null, evaluatedContracts: 24,
@@ -264,7 +333,7 @@ test("dashboard exposes the full signal funnel and excludes losses from profit c
   assert.equal(snapshot.trades[0]?.capturePct, undefined);
   assert.equal(snapshot.tuning.summary.avgCapturePct, undefined);
 
-  const winner = new TradingDashboardStore(timestamp, true);
+  const winner = historicalDashboard();
   winner.record(event("entry_fill", {
     position: {
       symbol, direction: "BULLISH", quantity: 1, averageEntryPrice: 2,
