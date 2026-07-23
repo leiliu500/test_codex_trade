@@ -5,6 +5,7 @@ import {
   nextDashboardDisplayRollover,
   TradingDashboardStore,
   tradingDashboardHtml,
+  type DashboardOrderCard,
 } from "../src/ops/tradingDashboard.js";
 import type { AuditEvent } from "../src/ops/recorder.js";
 import type { HistoricalMarketEvent } from "../src/history/types.js";
@@ -102,6 +103,139 @@ test("dashboard starts a new empty display day at 10 PM Pacific without restorin
   assert.equal(dashboard.snapshot().signals.length, 0);
   dashboard.record(signalEvent(rollover + 1, "new-display-day-signal"));
   assert.equal(dashboard.snapshot().signals[0]?.id, "new-display-day-signal");
+});
+
+test("dashboard keeps restored completed order cards available across display-day rollover", () => {
+  const now = Date.parse("2026-07-23T14:00:00Z");
+  const dashboard = new TradingDashboardStore(now, true, 250, 7, () => now);
+  dashboard.restoreOrderCards([{
+    id: "historical-entry",
+    symbol,
+    direction: "BULLISH",
+    active: false,
+    stage: "CLOSED",
+    status: "filled",
+    quantity: 1,
+    remainingQuantity: 0,
+    entryPrice: 2,
+    exitPrice: 2.25,
+    realizedPnl: 25,
+    unrealizedPnl: 0,
+    totalPnl: 25,
+    entryTimestamp: timestamp,
+    exitTimestamp: timestamp + 60_000,
+    exitReason: "PROFIT_TARGET",
+    updates: [{
+      timestamp: timestamp + 60_000,
+      stage: "CLOSED",
+      status: "filled",
+      remainingQuantity: 0,
+      realizedPnl: 25,
+      unrealizedPnl: 0,
+      totalPnl: 25,
+    }],
+  }]);
+
+  const snapshot = dashboard.snapshot();
+  assert.equal(snapshot.orders.length, 0);
+  assert.equal(snapshot.trades.length, 0);
+  assert.equal(snapshot.orderCards[0]?.id, "historical-entry");
+  assert.equal(snapshot.orderCards[0]?.updates[0]?.totalPnl, 25);
+});
+
+test("dashboard persists a completed card with all captured P&L updates", async () => {
+  const dashboard = historicalDashboard();
+  const saved: DashboardOrderCard[] = [];
+  dashboard.setOrderCardPersistence({
+    async saveOrderCard(card) { saved.push(card); },
+  });
+  await dashboard.record(event("entry_fill", {
+    position: {
+      symbol, direction: "BULLISH", quantity: 1, averageEntryPrice: 2,
+      entryTimestamp: timestamp, stopPrice: 1.5, targetPrice: 2.7,
+      highWaterMark: 2, lowWaterMark: 2,
+    },
+  }));
+  dashboard.recordMarketEvent({
+    type: "option_quote", providerTimestamp: timestamp + 100, receivedTimestamp: timestamp + 101,
+    marketDate: "2026-07-22", symbol,
+    data: { timestamp: timestamp + 100, bidPrice: 2.1, askPrice: 2.12 },
+  });
+  dashboard.recordMarketEvent({
+    type: "option_quote", providerTimestamp: timestamp + 200, receivedTimestamp: timestamp + 201,
+    marketDate: "2026-07-22", symbol,
+    data: { timestamp: timestamp + 200, bidPrice: 2.2, askPrice: 2.22 },
+  });
+  await dashboard.record(event("exit_fill", {
+    reason: "PROFIT_TARGET", symbol, direction: "BULLISH", entryTimestamp: timestamp,
+    averageEntryPrice: 2, incrementalQuantity: 1, incrementalPrice: 2.25,
+    realizedPnl: 25, remainingQuantity: 0,
+  }, 300));
+
+  assert.equal(saved.length, 1);
+  assert.equal(saved[0]?.active, false);
+  assert.equal(saved[0]?.stage, "CLOSED");
+  assert.equal(saved[0]?.realizedPnl, 25);
+  assert.deepEqual(
+    saved[0]?.updates.filter((update) =>
+      update.stage === "POSITION_OPEN" && update.totalPnl !== undefined).map((update) => Math.round(update.totalPnl!)),
+    [10, 20],
+  );
+  assert.equal(saved[0]?.updates.at(-1)?.totalPnl, 25);
+});
+
+test("completed cards keep the exit order from their own trade window when symbols repeat", () => {
+  const dashboard = historicalDashboard();
+  dashboard.record(event("entry_fill", {
+    position: {
+      symbol, direction: "BULLISH", quantity: 1, averageEntryPrice: 2,
+      entryTimestamp: timestamp, highWaterMark: 2, lowWaterMark: 2,
+    },
+  }));
+  dashboard.record(event("broker_order_request", {
+    purpose: "EXIT", reason: "TREND_INVALIDATION",
+    order: {
+      clientOrderId: "first-exit", symbol, side: "sell", requestedQuantity: 1,
+      filledQuantity: 0, limitPrice: 1.9, status: "SUBMITTED",
+      submittedAt: timestamp + 100, replacements: 0,
+    },
+  }, 100));
+  dashboard.record(event("exit_fill", {
+    reason: "TREND_INVALIDATION", symbol, direction: "BULLISH", entryTimestamp: timestamp,
+    averageEntryPrice: 2, incrementalQuantity: 1, incrementalPrice: 1.9,
+    realizedPnl: -10, remainingQuantity: 0,
+  }, 110));
+  dashboard.record(event("broker_order_state", {
+    purpose: "EXIT",
+    broker: {
+      id: "first-broker-exit", clientOrderId: "first-exit", status: "filled",
+      filledQuantity: 1, averageFillPrice: 1.9,
+    },
+    localOrder: {
+      clientOrderId: "first-exit", status: "FILLED", filledQuantity: 1,
+      averageFillPrice: 1.9, limitPrice: 1.9, replacements: 0,
+    },
+  }, 111));
+
+  dashboard.record(event("entry_fill", {
+    position: {
+      symbol, direction: "BULLISH", quantity: 1, averageEntryPrice: 2.1,
+      entryTimestamp: timestamp + 1_000, highWaterMark: 2.1, lowWaterMark: 2.1,
+    },
+  }, 1_000));
+  dashboard.record(event("broker_order_request", {
+    purpose: "EXIT", reason: "PROFIT_TARGET",
+    order: {
+      clientOrderId: "second-exit", symbol, side: "sell", requestedQuantity: 1,
+      filledQuantity: 0, limitPrice: 2.3, status: "SUBMITTED",
+      submittedAt: timestamp + 1_100, replacements: 0,
+    },
+  }, 1_100));
+
+  const firstCard = dashboard.snapshot().orderCards.find((card) => card.entryTimestamp === timestamp);
+  assert.equal(firstCard?.workingOrder?.clientOrderId, "first-exit");
+  assert.equal(firstCard?.status, "filled");
+  assert.ok(firstCard?.updates.every((update) => update.timestamp <= timestamp + 111));
 });
 
 test("dashboard separates potential hindsight misses from routine no-signal evaluations", () => {
@@ -207,6 +341,11 @@ test("dashboard reconstructs fired entries, broker execution, trades, and perfor
   assert.equal(openSnapshot.activeOrders[0]?.markPrice, 2.4);
   assert.ok(Math.abs((openSnapshot.activeOrders[0]?.unrealizedPnl ?? 0) - 80) < 1e-9);
   assert.ok(Math.abs((openSnapshot.activeOrders[0]?.unrealizedReturnPct ?? 0) - 20) < 1e-9);
+  assert.equal(openSnapshot.orderCards.length, 1);
+  assert.equal(openSnapshot.orderCards[0]?.id, "entry-1");
+  assert.equal(openSnapshot.orderCards[0]?.active, true);
+  assert.ok(openSnapshot.orderCards[0]?.updates.some((update) =>
+    update.stage === "POSITION_OPEN" && Math.abs((update.totalPnl ?? 0) - 80) < 1e-9));
   assert.equal(openSnapshot.activeOrders[0]?.stopPrice, 1.5);
   assert.equal(openSnapshot.activeOrders[0]?.targetPrice, 2.7);
   assert.ok(Math.abs(openSnapshot.performance.unrealizedPnl - 80) < 1e-9);
@@ -253,6 +392,13 @@ test("dashboard reconstructs fired entries, broker execution, trades, and perfor
   assert.equal(snapshot.performance.unrealizedPnl, 0);
   assert.equal(snapshot.performance.totalPnl, 140);
   assert.equal(snapshot.activeOrders.length, 0);
+  assert.equal(snapshot.orderCards.length, 1);
+  assert.equal(snapshot.orderCards[0]?.stage, "CLOSED");
+  assert.equal(snapshot.orderCards[0]?.active, false);
+  assert.equal(snapshot.orderCards[0]?.realizedPnl, 140);
+  assert.ok((snapshot.orderCards[0]?.updates.length ?? 0) >= 5);
+  assert.ok(snapshot.orderCards[0]?.updates.some((update) =>
+    update.stage === "CLOSED" && update.status === "filled" && update.totalPnl === 140));
   assert.equal(snapshot.signals[0]?.status, "ORDER_SUBMITTED");
   assert.equal(snapshot.orders.find((order) => order.clientOrderId === "entry-1")?.filledQuantity, 2);
   assert.equal(snapshot.trades[0]?.averageExitPrice, 2.7);
@@ -274,7 +420,9 @@ test("dashboard reconstructs fired entries, broker execution, trades, and perfor
   assert.equal(snapshot.orders.find((order) => order.clientOrderId === "entry-1")?.firstFillLatencyMs, 20);
   assert.equal(snapshot.orders.find((order) => order.clientOrderId === "entry-1")?.completionLatencyMs, 20);
   assert.match(tradingDashboardHtml(), /Orders &amp; Executions/);
-  assert.match(tradingDashboardHtml(), /Live Orders/);
+  assert.match(tradingDashboardHtml(), /<h2>Orders<\/h2>/);
+  assert.doesNotMatch(tradingDashboardHtml(), /<h2>Live Orders<\/h2>/);
+  assert.match(tradingDashboardHtml(), /P&amp;L or status change/);
   assert.match(tradingDashboardHtml(), /Entry Timing &amp; Quality/);
   assert.match(tradingDashboardHtml(), /Order Execution Quality/);
   assert.match(tradingDashboardHtml(), /Setup Comparison/);

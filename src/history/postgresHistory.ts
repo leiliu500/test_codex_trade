@@ -1,5 +1,6 @@
 import { Pool, type QueryResult, type QueryResultRow } from "pg";
 import type { AuditEvent, AuditRecorder } from "../ops/recorder.js";
+import type { DashboardOrderCard, DashboardOrderDynamicsUpdate } from "../ops/orderCards.js";
 import type { FeatureSnapshot } from "../types.js";
 import type { HistoricalMarketEvent, HistoryStore } from "./types.js";
 
@@ -46,6 +47,12 @@ interface StockHistoryRow extends QueryResultRow {
 }
 
 interface FeatureRow extends QueryResultRow { data: FeatureSnapshot }
+interface OrderCardRow extends QueryResultRow { card_id: string; data: DashboardOrderCard }
+interface OrderCardUpdateRow extends QueryResultRow {
+  card_id: string;
+  sequence_index: string | number;
+  data: DashboardOrderDynamicsUpdate;
+}
 
 const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS market_events (
@@ -122,6 +129,40 @@ CREATE INDEX IF NOT EXISTS order_lifecycle_events_client_timestamp_idx
   ON order_lifecycle_events (client_order_id, event_timestamp, id);
 CREATE INDEX IF NOT EXISTS order_lifecycle_events_symbol_timestamp_idx
   ON order_lifecycle_events (symbol, event_timestamp DESC);
+
+CREATE TABLE IF NOT EXISTS order_cards (
+  card_id TEXT PRIMARY KEY,
+  signal_id TEXT,
+  symbol TEXT NOT NULL,
+  direction TEXT,
+  stage TEXT NOT NULL,
+  status TEXT NOT NULL,
+  quantity INTEGER NOT NULL,
+  realized_pnl DOUBLE PRECISION NOT NULL,
+  entry_timestamp BIGINT,
+  exit_timestamp BIGINT,
+  exit_reason TEXT,
+  updated_timestamp BIGINT NOT NULL,
+  data JSONB NOT NULL
+);
+CREATE INDEX IF NOT EXISTS order_cards_updated_idx
+  ON order_cards (updated_timestamp DESC);
+CREATE INDEX IF NOT EXISTS order_cards_symbol_updated_idx
+  ON order_cards (symbol, updated_timestamp DESC);
+
+CREATE TABLE IF NOT EXISTS order_card_updates (
+  card_id TEXT NOT NULL REFERENCES order_cards(card_id) ON DELETE CASCADE,
+  sequence_index INTEGER NOT NULL,
+  event_timestamp BIGINT NOT NULL,
+  stage TEXT NOT NULL,
+  status TEXT NOT NULL,
+  total_pnl DOUBLE PRECISION,
+  pnl_change DOUBLE PRECISION,
+  data JSONB NOT NULL,
+  PRIMARY KEY (card_id, sequence_index)
+);
+CREATE INDEX IF NOT EXISTS order_card_updates_timestamp_idx
+  ON order_card_updates (card_id, event_timestamp, sequence_index);
 `;
 
 interface NormalizedOrderLifecycle {
@@ -318,6 +359,116 @@ export class PostgresHistoryStore implements HistoryStore, AuditRecorder {
       configVersion: row.config_version,
       ...(row.calibration_version ? { calibrationVersion: row.calibration_version } : {}),
       data: row.data,
+    }));
+  }
+
+  async saveOrderCard(card: DashboardOrderCard): Promise<void> {
+    const { updates } = card;
+    const updatedTimestamp = updates.at(-1)?.timestamp ?? card.exitTimestamp ?? card.entryTimestamp ?? Date.now();
+    try {
+      await this.#client.query(
+        `INSERT INTO order_cards
+          (card_id, signal_id, symbol, direction, stage, status, quantity, realized_pnl,
+           entry_timestamp, exit_timestamp, exit_reason, updated_timestamp, data)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb)
+         ON CONFLICT (card_id) DO UPDATE SET
+           signal_id = COALESCE(EXCLUDED.signal_id, order_cards.signal_id),
+           symbol = EXCLUDED.symbol,
+           direction = COALESCE(EXCLUDED.direction, order_cards.direction),
+           stage = EXCLUDED.stage,
+           status = EXCLUDED.status,
+           quantity = EXCLUDED.quantity,
+           realized_pnl = EXCLUDED.realized_pnl,
+           entry_timestamp = COALESCE(EXCLUDED.entry_timestamp, order_cards.entry_timestamp),
+           exit_timestamp = COALESCE(EXCLUDED.exit_timestamp, order_cards.exit_timestamp),
+           exit_reason = COALESCE(EXCLUDED.exit_reason, order_cards.exit_reason),
+           updated_timestamp = GREATEST(EXCLUDED.updated_timestamp, order_cards.updated_timestamp),
+           data = EXCLUDED.data`,
+        [
+          card.id,
+          card.signalId ?? null,
+          card.symbol,
+          card.direction ?? null,
+          card.stage,
+          card.status,
+          card.quantity,
+          card.realizedPnl,
+          card.entryTimestamp ?? null,
+          card.exitTimestamp ?? null,
+          card.exitReason ?? null,
+          updatedTimestamp,
+          JSON.stringify(card),
+        ],
+      );
+      const chunkSize = 1_000;
+      for (let start = 0; start < updates.length; start += chunkSize) {
+        const chunk = updates.slice(start, start + chunkSize);
+        const values: unknown[] = [];
+        const placeholders = chunk.map((update, offset) => {
+          const index = start + offset;
+          const parameter = offset * 8;
+          values.push(
+            card.id,
+            index,
+            update.timestamp,
+            update.stage,
+            update.status,
+            update.totalPnl ?? null,
+            update.pnlChange ?? null,
+            JSON.stringify(update),
+          );
+          return `($${parameter + 1},$${parameter + 2},$${parameter + 3},$${parameter + 4},` +
+            `$${parameter + 5},$${parameter + 6},$${parameter + 7},$${parameter + 8}::jsonb)`;
+        });
+        await this.#client.query(
+          `INSERT INTO order_card_updates
+            (card_id, sequence_index, event_timestamp, stage, status, total_pnl, pnl_change, data)
+           VALUES ${placeholders.join(",")}
+           ON CONFLICT (card_id, sequence_index) DO UPDATE SET
+             event_timestamp = EXCLUDED.event_timestamp,
+             stage = EXCLUDED.stage,
+             status = EXCLUDED.status,
+             total_pnl = EXCLUDED.total_pnl,
+             pnl_change = EXCLUDED.pnl_change,
+             data = EXCLUDED.data`,
+          values,
+        );
+      }
+      this.#auditHealthy = true;
+    } catch (error) {
+      this.#recordError(error, "audit");
+      throw error;
+    }
+  }
+
+  async loadOrderCards(limit = 250): Promise<DashboardOrderCard[]> {
+    const boundedLimit = Math.max(1, Math.min(2_000, Math.floor(limit)));
+    const cards = await this.#client.query<OrderCardRow>(
+      `SELECT card_id, data
+       FROM order_cards
+       ORDER BY updated_timestamp DESC
+       LIMIT $1`,
+      [boundedLimit],
+    );
+    if (cards.rows.length === 0) return [];
+    const ids = cards.rows.map((row) => row.card_id);
+    const updates = await this.#client.query<OrderCardUpdateRow>(
+      `SELECT card_id, sequence_index, data
+       FROM order_card_updates
+       WHERE card_id = ANY($1::text[])
+       ORDER BY card_id, sequence_index`,
+      [ids],
+    );
+    const updatesByCard = new Map<string, DashboardOrderDynamicsUpdate[]>();
+    for (const row of updates.rows) {
+      const list = updatesByCard.get(row.card_id) ?? [];
+      list.push(row.data);
+      updatesByCard.set(row.card_id, list);
+    }
+    return cards.rows.map((row) => ({
+      ...row.data,
+      id: row.card_id,
+      updates: updatesByCard.get(row.card_id) ?? row.data.updates ?? [],
     }));
   }
 

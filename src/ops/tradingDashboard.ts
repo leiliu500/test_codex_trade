@@ -1,6 +1,13 @@
 import type { AuditEvent, AuditRecorder } from "./recorder.js";
 import type { HistoricalMarketEvent, HistoricalMarketEventType, MarketHistorySink } from "../history/types.js";
 import { marketDate, zonedDateTimeToEpoch } from "../utils/time.js";
+import type {
+  DashboardOrderCard,
+  DashboardOrderDynamicsUpdate,
+  OrderCardPersistence,
+} from "./orderCards.js";
+
+export type { DashboardOrderCard, DashboardOrderDynamicsUpdate } from "./orderCards.js";
 
 export interface DashboardSignal {
   id: string;
@@ -202,6 +209,7 @@ export interface DashboardActiveOrder {
     filledQuantity: number;
     replacements: number;
   };
+  updates?: DashboardOrderDynamicsUpdate[];
 }
 
 export interface DashboardDecision {
@@ -286,6 +294,7 @@ export interface TradingDashboardSnapshot {
   lastExecutionError?: string;
   performance: DashboardPerformance;
   activeOrders: DashboardActiveOrder[];
+  orderCards: DashboardOrderCard[];
   decisions: DashboardDecision[];
   liveData: DashboardLiveData;
   tuning: DashboardTuning;
@@ -300,6 +309,7 @@ interface MutableTrade extends Omit<DashboardTrade,
   "maxAdverseExcursionPct" | "capturePct"> {
   exitedQuantity: number;
   exitNotional: number;
+  entryOrderId?: string;
 }
 
 interface DashboardOptionQuote {
@@ -357,6 +367,7 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
   readonly #retentionDays: number;
   readonly #signals = new Map<string, DashboardSignal>();
   readonly #orders = new Map<string, DashboardOrder>();
+  readonly #orderCards = new Map<string, DashboardOrderCard>();
   readonly #openTrades = new Map<string, MutableTrade>();
   readonly #closedTrades: MutableTrade[] = [];
   readonly #latestOptionQuotes = new Map<string, DashboardOptionQuote>();
@@ -376,6 +387,8 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
   #lastMarketDate: string | undefined;
   #lastExecutionError: string | undefined;
   #displayDate: string;
+  #orderCardPersistence: OrderCardPersistence | undefined;
+  #orderCardPersistenceHealthy = true;
 
   constructor(
     startedAt = Date.now(),
@@ -392,7 +405,17 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
     this.#displayDate = dashboardDisplayDate(now());
   }
 
-  record(event: AuditEvent): void {
+  restoreOrderCards(cards: readonly DashboardOrderCard[]): void {
+    for (const card of cards) {
+      this.#orderCards.set(card.id, cloneOrderCard(card));
+    }
+  }
+
+  setOrderCardPersistence(persistence: OrderCardPersistence): void {
+    this.#orderCardPersistence = persistence;
+  }
+
+  record(event: AuditEvent): void | Promise<void> {
     this.#synchronizeDisplayWindow();
     if (dashboardDisplayDate(event.timestamp) !== this.#displayDate) return;
     if (event.marketDate) this.#lastMarketDate = event.marketDate;
@@ -408,6 +431,15 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
       this.#lastExecutionError = stringValue(event.data.reason) ?? "Execution halted";
     }
     if (isDecisionEvent(event.type)) this.#recordDecision(event);
+    const completedCards = this.#refreshProjectedOrderCards(event.timestamp);
+    if (completedCards.length > 0 && this.#orderCardPersistence) {
+      return Promise.all(completedCards.map((card) => this.#orderCardPersistence!.saveOrderCard(cloneOrderCard(card))))
+        .then(() => { this.#orderCardPersistenceHealthy = true; })
+        .catch((error: unknown) => {
+          this.#orderCardPersistenceHealthy = false;
+          throw error;
+        });
+    }
   }
 
   recordMarketEvent(event: HistoricalMarketEvent): void {
@@ -433,6 +465,7 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
           trade.highWaterMark = Math.max(trade.highWaterMark, mark);
           trade.lowWaterMark = Math.min(trade.lowWaterMark, mark);
         }
+        this.#refreshProjectedOrderCards(timestamp, event.symbol);
         this.#pruneMap(this.#latestOptionQuotes, 5_000);
       }
     }
@@ -456,7 +489,7 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
     }
   }
 
-  healthy(): boolean { return true; }
+  healthy(): boolean { return this.#orderCardPersistenceHealthy; }
 
   snapshot(): TradingDashboardSnapshot {
     const generatedAt = this.#now();
@@ -473,8 +506,20 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
     const optionsSelected = signals.filter((signal) => signal.candidate !== undefined).length;
     const riskAllowed = signals.filter((signal) => signal.riskStatus === "ALLOWED").length;
     const riskBlocked = signals.filter((signal) => signal.riskStatus === "BLOCKED").length;
-    const activeOrders = this.#activeOrders(generatedAt, orders);
+    this.#refreshProjectedOrderCards(generatedAt);
+    const activeOrders = this.#activeOrders(generatedAt, orders).map((order) => ({
+      ...order,
+      ...(this.#orderCards.get(order.id)
+        ? { updates: this.#orderCards.get(order.id)!.updates.map((update) => ({ ...update })) } : {}),
+    }));
     const unrealizedPnl = activeOrders.reduce((sum, order) => sum + (order.unrealizedPnl ?? 0), 0);
+    const orderCards = [...this.#orderCards.values()]
+      .sort((a, b) =>
+        Number(b.active) - Number(a.active) ||
+        (b.exitTimestamp ?? b.entryTimestamp ?? b.updates.at(-1)?.timestamp ?? 0) -
+          (a.exitTimestamp ?? a.entryTimestamp ?? a.updates.at(-1)?.timestamp ?? 0))
+      .slice(0, 250)
+      .map(cloneOrderCard);
     const publicOrders = orders.slice(-250).reverse().map((order) => this.#publicOrder(order, generatedAt));
     const publicTrades = [...closed, ...this.#openTrades.values()]
       .slice(-250).reverse().map((trade) => this.#publicTrade(trade));
@@ -510,6 +555,7 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
         worstTradePnl: pnls.length > 0 ? Math.min(...pnls) : null,
       },
       activeOrders,
+      orderCards,
       decisions: this.#decisions.slice(0, 100).map(publicDecision),
       tuning: {
         summary: tuningSummary(entryQuality),
@@ -719,7 +765,7 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
       const unrealizedReturnPct = unrealizedPnl === undefined || openCost <= 0
         ? undefined : 100 * unrealizedPnl / openCost;
       cards.push({
-        id: trade.id,
+        id: trade.entryOrderId ?? trade.id,
         symbol: trade.symbol,
         direction: trade.direction,
         stage: workingOrder?.purpose === "EXIT" ? "EXIT_WORKING"
@@ -766,6 +812,7 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
           quoteAgeMs: Math.max(0, generatedAt - quote.timestamp),
         } : {}),
         realizedPnl: 0,
+        entryTimestamp: order.timestamp,
         elapsedMs: Math.max(0, generatedAt - order.timestamp),
         workingOrder: publicWorkingOrder(order),
       });
@@ -1063,6 +1110,7 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
     const highWaterMark = numberValue(position.highWaterMark) ?? averageEntryPrice;
     const lowWaterMark = numberValue(position.lowWaterMark) ?? averageEntryPrice;
     if (existing) {
+      if (order) existing.entryOrderId = order.clientOrderId;
       existing.quantity = Math.max(existing.quantity, quantity);
       existing.averageEntryPrice = averageEntryPrice;
       if (stopPrice !== undefined) existing.stopPrice = stopPrice;
@@ -1086,6 +1134,7 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
         status: "OPEN",
         exitedQuantity: 0,
         exitNotional: 0,
+        ...(order ? { entryOrderId: order.clientOrderId } : {}),
       });
     }
   }
@@ -1138,6 +1187,175 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
     } else {
       trade.status = "PARTIAL_EXIT";
     }
+  }
+
+  #refreshProjectedOrderCards(timestamp: number, symbol?: string): DashboardOrderCard[] {
+    const changedCompleted: DashboardOrderCard[] = [];
+    const orders = [...this.#orders.values()];
+    const closedEntryOrderIds = new Set(
+      this.#closedTrades.map((trade) => trade.entryOrderId).filter((id): id is string => id !== undefined),
+    );
+
+    for (const active of this.#activeOrders(timestamp, orders)) {
+      if (symbol && active.symbol !== symbol) continue;
+      if (active.workingOrder?.purpose === "EXIT" &&
+          this.#closedTrades.some((trade) => trade.symbol === active.symbol)) continue;
+      this.#captureOrderCard(this.#activeOrderCard(active), timestamp);
+    }
+
+    for (const trade of this.#closedTrades) {
+      if (symbol && trade.symbol !== symbol) continue;
+      const card = this.#closedOrderCard(trade);
+      if (this.#captureOrderCard(card, timestamp)) changedCompleted.push(this.#orderCards.get(card.id)!);
+    }
+
+    for (const order of orders) {
+      if (symbol && order.symbol !== symbol) continue;
+      if (order.purpose !== "ENTRY") continue;
+      const existingCard = this.#orderCards.get(order.clientOrderId);
+      if (order.filledQuantity > 0 && !isWorkingOrder(order) && existingCard &&
+          !closedEntryOrderIds.has(order.clientOrderId) &&
+          !this.#openTrades.has(order.symbol)) {
+        this.#captureOrderCard({
+          ...cloneOrderCard(existingCard),
+          active: true,
+          status: order.status,
+          remainingQuantity: Math.max(0, order.quantity - order.filledQuantity),
+          workingOrder: publicWorkingOrder(order),
+          updates: [],
+        }, timestamp);
+        continue;
+      }
+      if (order.filledQuantity > 0 || isWorkingOrder(order) ||
+          closedEntryOrderIds.has(order.clientOrderId)) continue;
+      const stage = order.status.toUpperCase().includes("REJECT") ? "REJECTED" : "CANCELLED";
+      const card: DashboardOrderCard = {
+        id: order.clientOrderId,
+        ...(order.signalId ? { signalId: order.signalId } : {}),
+        symbol: order.symbol,
+        active: false,
+        stage,
+        status: order.status,
+        quantity: order.quantity,
+        remainingQuantity: 0,
+        realizedPnl: 0,
+        totalPnl: 0,
+        entryTimestamp: order.timestamp,
+        exitTimestamp: order.completedTimestamp ?? order.updatedAt,
+        elapsedMs: Math.max(0, (order.completedTimestamp ?? order.updatedAt) - order.timestamp),
+        updates: [],
+      };
+      if (this.#captureOrderCard(card, timestamp)) changedCompleted.push(this.#orderCards.get(card.id)!);
+    }
+    return changedCompleted;
+  }
+
+  #activeOrderCard(active: DashboardActiveOrder): DashboardOrderCard {
+    const trade = this.#openTrades.get(active.symbol);
+    const order = active.workingOrder
+      ? this.#orders.get(active.workingOrder.clientOrderId)
+      : trade?.entryOrderId ? this.#orders.get(trade.entryOrderId) : undefined;
+    return {
+      id: active.id,
+      ...(trade?.signalId ? { signalId: trade.signalId } : order?.signalId ? { signalId: order.signalId } : {}),
+      symbol: active.symbol,
+      ...(active.direction ? { direction: active.direction } : {}),
+      active: true,
+      stage: active.stage,
+      status: active.workingOrder?.status ?? order?.status ?? trade?.status ?? active.stage,
+      quantity: active.quantity,
+      remainingQuantity: active.remainingQuantity,
+      ...(active.entryPrice !== undefined ? { entryPrice: active.entryPrice } : {}),
+      ...(active.currentBid !== undefined ? { currentBid: active.currentBid } : {}),
+      ...(active.currentAsk !== undefined ? { currentAsk: active.currentAsk } : {}),
+      ...(active.markPrice !== undefined ? { markPrice: active.markPrice } : {}),
+      realizedPnl: active.realizedPnl,
+      ...(active.unrealizedPnl !== undefined ? { unrealizedPnl: active.unrealizedPnl } : {}),
+      ...(active.unrealizedReturnPct !== undefined ? { unrealizedReturnPct: active.unrealizedReturnPct } : {}),
+      ...(active.totalPnl !== undefined ? { totalPnl: active.totalPnl } : {}),
+      ...(active.stopPrice !== undefined ? { stopPrice: active.stopPrice } : {}),
+      ...(active.targetPrice !== undefined ? { targetPrice: active.targetPrice } : {}),
+      ...(active.entryTimestamp !== undefined ? { entryTimestamp: active.entryTimestamp } : {}),
+      ...(active.elapsedMs !== undefined ? { elapsedMs: active.elapsedMs } : {}),
+      ...(active.lastQuoteTimestamp !== undefined ? { lastQuoteTimestamp: active.lastQuoteTimestamp } : {}),
+      ...(active.quoteAgeMs !== undefined ? { quoteAgeMs: active.quoteAgeMs } : {}),
+      ...(active.workingOrder ? { workingOrder: { ...active.workingOrder } } : {}),
+      updates: [],
+    };
+  }
+
+  #closedOrderCard(trade: MutableTrade): DashboardOrderCard {
+    const exitOrder = [...this.#orders.values()].reverse().find((order) =>
+      order.purpose === "EXIT" && order.symbol === trade.symbol &&
+      order.timestamp >= trade.entryTimestamp &&
+      (trade.exitTimestamp === undefined || order.timestamp <= trade.exitTimestamp));
+    const quote = this.#latestOptionQuotes.get(trade.symbol);
+    return {
+      id: trade.entryOrderId ?? trade.id,
+      ...(trade.signalId ? { signalId: trade.signalId } : {}),
+      symbol: trade.symbol,
+      direction: trade.direction,
+      active: false,
+      stage: "CLOSED",
+      status: exitOrder?.status ?? "CLOSED",
+      quantity: trade.quantity,
+      remainingQuantity: 0,
+      entryPrice: trade.averageEntryPrice,
+      ...(trade.averageExitPrice !== undefined ? { exitPrice: trade.averageExitPrice } : {}),
+      ...(quote ? {
+        currentBid: quote.bidPrice,
+        currentAsk: quote.askPrice,
+        markPrice: quote.bidPrice,
+        lastQuoteTimestamp: quote.timestamp,
+        quoteAgeMs: trade.exitTimestamp === undefined ? 0 : Math.max(0, trade.exitTimestamp - quote.timestamp),
+      } : {}),
+      realizedPnl: trade.realizedPnl,
+      unrealizedPnl: 0,
+      totalPnl: trade.realizedPnl,
+      ...(trade.returnPct !== undefined ? { unrealizedReturnPct: trade.returnPct } : {}),
+      ...(trade.stopPrice !== undefined ? { stopPrice: trade.stopPrice } : {}),
+      ...(trade.targetPrice !== undefined ? { targetPrice: trade.targetPrice } : {}),
+      entryTimestamp: trade.entryTimestamp,
+      ...(trade.exitTimestamp !== undefined ? {
+        exitTimestamp: trade.exitTimestamp,
+        elapsedMs: Math.max(0, trade.exitTimestamp - trade.entryTimestamp),
+      } : {}),
+      ...(trade.exitReason ? { exitReason: trade.exitReason } : {}),
+      ...(exitOrder ? { workingOrder: publicWorkingOrder(exitOrder) } : {}),
+      updates: [],
+    };
+  }
+
+  #captureOrderCard(projected: DashboardOrderCard, timestamp: number): boolean {
+    const existing = this.#orderCards.get(projected.id);
+    const updates = existing?.updates ?? [];
+    const previous = updates.at(-1);
+    const next: DashboardOrderDynamicsUpdate = {
+      timestamp,
+      stage: projected.stage,
+      status: projected.status,
+      remainingQuantity: projected.remainingQuantity,
+      realizedPnl: projected.realizedPnl,
+      ...(projected.currentBid !== undefined ? { currentBid: projected.currentBid } : {}),
+      ...(projected.currentAsk !== undefined ? { currentAsk: projected.currentAsk } : {}),
+      ...(projected.unrealizedPnl !== undefined ? { unrealizedPnl: projected.unrealizedPnl } : {}),
+      ...(projected.totalPnl !== undefined ? { totalPnl: projected.totalPnl } : {}),
+    };
+    const duplicate = updates.some((update) =>
+      update.timestamp === next.timestamp && sameDynamics(update, next));
+    const changed = !previous || !sameDynamics(previous, next);
+    if (!duplicate && changed && (!previous || timestamp >= previous.timestamp)) {
+      const previousPnl = previous?.totalPnl ?? previous?.unrealizedPnl;
+      const nextPnl = next.totalPnl ?? next.unrealizedPnl;
+      if (previousPnl !== undefined && nextPnl !== undefined) next.pnlChange = nextPnl - previousPnl;
+      updates.push(next);
+    }
+    this.#orderCards.set(projected.id, {
+      ...(existing ?? {}),
+      ...projected,
+      updates,
+    });
+    return !projected.active && (!existing || changed);
   }
 
   #pruneMap<K, V>(map: Map<K, V>, maximum: number): void {
@@ -1345,6 +1563,24 @@ function publicWorkingOrder(order: DashboardOrder): NonNullable<DashboardActiveO
   };
 }
 
+function sameDynamics(left: DashboardOrderDynamicsUpdate, right: DashboardOrderDynamicsUpdate): boolean {
+  return left.stage === right.stage &&
+    left.status === right.status &&
+    left.remainingQuantity === right.remainingQuantity &&
+    left.realizedPnl === right.realizedPnl &&
+    left.currentBid === right.currentBid &&
+    left.unrealizedPnl === right.unrealizedPnl &&
+    left.totalPnl === right.totalPnl;
+}
+
+function cloneOrderCard(card: DashboardOrderCard): DashboardOrderCard {
+  return {
+    ...card,
+    ...(card.workingOrder ? { workingOrder: { ...card.workingOrder } } : {}),
+    updates: card.updates.map((update) => ({ ...update })),
+  };
+}
+
 function recordValue(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
 }
@@ -1370,7 +1606,7 @@ export function tradingDashboardHtml(): string {
   return `<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>SPY 0DTE Trading Dashboard</title><style>
-:root{color-scheme:dark;--bg:#07111f;--panel:#0e1b2e;--line:#20324b;--text:#e7eef9;--muted:#91a4bd;--green:#35d07f;--red:#ff667a;--blue:#58a6ff;--amber:#f5c451}*{box-sizing:border-box}body{margin:0;background:linear-gradient(135deg,#06101c,#0a1830);color:var(--text);font:14px ui-sans-serif,system-ui,sans-serif}main{max-width:1500px;margin:auto;padding:24px}header{display:flex;justify-content:space-between;gap:18px;align-items:center;margin-bottom:18px}h1{font-size:24px;margin:0}h2{font-size:16px;margin:0 0 12px}.sub,.muted{color:var(--muted)}#state{display:flex;align-items:center;gap:8px;font-weight:700;padding:8px 12px;border:1px solid var(--line);border-radius:999px}.pulse-dot{width:9px;height:9px;border-radius:50%;background:currentColor;box-shadow:0 0 0 0 currentColor;animation:pulse 1.8s infinite}@keyframes pulse{70%{box-shadow:0 0 0 7px transparent}}.ok{color:var(--green)}.degraded{color:var(--amber)}.halted{color:var(--red)}.liveness-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(185px,1fr));gap:10px;margin-bottom:18px}.status-card{background:#0b192b;border:1px solid var(--line);border-radius:10px;padding:12px}.status-card .label{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.05em}.status-card strong{display:block;margin:5px 0 3px;font-size:14px}.status-detail{color:var(--muted);font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.tabs{display:flex;gap:5px;border-bottom:1px solid var(--line);margin-bottom:16px}.tab{appearance:none;border:0;border-bottom:2px solid transparent;background:transparent;color:var(--muted);font:inherit;font-weight:700;padding:11px 16px;cursor:pointer}.tab:hover{color:var(--text)}.tab.active{color:var(--blue);border-bottom-color:var(--blue)}.tab-panel{display:none}.tab-panel.active{display:block}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:12px;margin-bottom:18px}.card,.panel{background:rgba(14,27,46,.94);border:1px solid var(--line);border-radius:12px;box-shadow:0 10px 30px #0003}.card{padding:14px}.card .value{font-size:23px;font-weight:750;margin-top:6px}.card-detail{font-size:11px;margin-top:4px}.panel{padding:16px;margin:14px 0;overflow:auto}.live-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(310px,1fr));gap:14px}.live-card{background:linear-gradient(145deg,#12243d,#0b1729);border:1px solid #294262;border-radius:13px;padding:16px;min-width:0;box-shadow:inset 3px 0 0 var(--blue)}.live-card.profit{box-shadow:inset 3px 0 0 var(--green)}.live-card.loss{box-shadow:inset 3px 0 0 var(--red)}.live-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}.live-symbol{font-weight:750;font-size:16px;overflow-wrap:anywhere}.badge,.source{display:inline-block;margin-top:5px;padding:3px 7px;border-radius:999px;background:#58a6ff1c;color:var(--blue);font-size:11px;font-weight:700;letter-spacing:.04em}.source{margin:0}.live-pnl{text-align:right;font-size:22px;font-weight:800}.live-return{text-align:right;font-size:12px;margin-top:3px}.live-fields{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin-top:16px}.live-field span{display:block;color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.04em;margin-bottom:4px}.live-field strong{font-size:14px}.order-strip{border-top:1px solid var(--line);margin-top:15px;padding-top:12px;display:flex;justify-content:space-between;gap:10px;color:var(--muted);font-size:12px}.empty{color:var(--muted);padding:22px;text-align:center;border:1px dashed var(--line);border-radius:10px}.section-note{color:var(--muted);font-size:12px;margin:-6px 0 12px}.decision-reasons{max-width:560px;white-space:normal;line-height:1.45}.outcome{font-weight:750}.outcome.pass{color:var(--green)}.outcome.block{color:var(--amber)}.tune-controls{display:flex;align-items:end;gap:12px;flex-wrap:wrap;margin-bottom:14px}.tune-control{display:grid;gap:5px}.tune-control label{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.04em}.tune-control select{min-width:150px;background:#0a1728;color:var(--text);border:1px solid var(--line);border-radius:7px;padding:8px 10px}.legend{display:flex;gap:16px;flex-wrap:wrap;color:var(--muted);font-size:11px;margin:8px 0}.quality-status{font-weight:750}.quality-status.WIN,.quality-status.FILLED,.quality-status.OPEN{color:var(--green)}.quality-status.LOSS,.quality-status.BLOCKED{color:var(--red)}.quality-status.WORKING,.quality-status.NO_OPTION{color:var(--amber)}table{border-collapse:collapse;width:100%;min-width:850px}th,td{text-align:left;padding:9px 10px;border-bottom:1px solid var(--line);white-space:nowrap}th{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.04em}tbody tr:hover{background:#ffffff08}.positive{color:var(--green)}.negative{color:var(--red)}@media(max-width:700px){main{padding:14px}header{align-items:flex-start;flex-direction:column}.live-fields{grid-template-columns:repeat(2,minmax(0,1fr))}.tab{padding:10px}.tune-control{width:100%}.tune-control select{width:100%}}
+:root{color-scheme:dark;--bg:#07111f;--panel:#0e1b2e;--line:#20324b;--text:#e7eef9;--muted:#91a4bd;--green:#35d07f;--red:#ff667a;--blue:#58a6ff;--amber:#f5c451}*{box-sizing:border-box}body{margin:0;background:linear-gradient(135deg,#06101c,#0a1830);color:var(--text);font:14px ui-sans-serif,system-ui,sans-serif}main{max-width:1500px;margin:auto;padding:24px}header{display:flex;justify-content:space-between;gap:18px;align-items:center;margin-bottom:18px}h1{font-size:24px;margin:0}h2{font-size:16px;margin:0 0 12px}.sub,.muted{color:var(--muted)}#state{display:flex;align-items:center;gap:8px;font-weight:700;padding:8px 12px;border:1px solid var(--line);border-radius:999px}.pulse-dot{width:9px;height:9px;border-radius:50%;background:currentColor;box-shadow:0 0 0 0 currentColor;animation:pulse 1.8s infinite}@keyframes pulse{70%{box-shadow:0 0 0 7px transparent}}.ok{color:var(--green)}.degraded{color:var(--amber)}.halted{color:var(--red)}.liveness-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(185px,1fr));gap:10px;margin-bottom:18px}.status-card{background:#0b192b;border:1px solid var(--line);border-radius:10px;padding:12px}.status-card .label{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.05em}.status-card strong{display:block;margin:5px 0 3px;font-size:14px}.status-detail{color:var(--muted);font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.tabs{display:flex;gap:5px;border-bottom:1px solid var(--line);margin-bottom:16px}.tab{appearance:none;border:0;border-bottom:2px solid transparent;background:transparent;color:var(--muted);font:inherit;font-weight:700;padding:11px 16px;cursor:pointer}.tab:hover{color:var(--text)}.tab.active{color:var(--blue);border-bottom-color:var(--blue)}.tab-panel{display:none}.tab-panel.active{display:block}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:12px;margin-bottom:18px}.card,.panel{background:rgba(14,27,46,.94);border:1px solid var(--line);border-radius:12px;box-shadow:0 10px 30px #0003}.card{padding:14px}.card .value{font-size:23px;font-weight:750;margin-top:6px}.card-detail{font-size:11px;margin-top:4px}.panel{padding:16px;margin:14px 0;overflow:auto}.live-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(360px,1fr));gap:14px}.live-card{background:linear-gradient(145deg,#12243d,#0b1729);border:1px solid #294262;border-radius:13px;padding:16px;min-width:0;box-shadow:inset 3px 0 0 var(--blue)}.live-card.profit{box-shadow:inset 3px 0 0 var(--green)}.live-card.loss{box-shadow:inset 3px 0 0 var(--red)}.live-card.completed{background:linear-gradient(145deg,#101d30,#091421)}.live-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}.live-symbol{font-weight:750;font-size:16px;overflow-wrap:anywhere}.badge,.source{display:inline-block;margin-top:5px;padding:3px 7px;border-radius:999px;background:#58a6ff1c;color:var(--blue);font-size:11px;font-weight:700;letter-spacing:.04em}.source{margin:0}.live-pnl{text-align:right;font-size:22px;font-weight:800}.live-return{text-align:right;font-size:12px;margin-top:3px}.live-fields{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin-top:16px}.live-field span{display:block;color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.04em;margin-bottom:4px}.live-field strong{font-size:14px}.order-strip{border-top:1px solid var(--line);margin-top:15px;padding-top:12px;display:flex;justify-content:space-between;gap:10px;color:var(--muted);font-size:12px}.dynamics{border-top:1px solid var(--line);margin-top:14px;padding-top:12px}.dynamics-title{color:var(--muted);font-size:11px;font-weight:750;text-transform:uppercase;letter-spacing:.05em;margin-bottom:7px}.dynamics-list{display:grid;gap:5px;max-height:260px;overflow:auto;padding-right:3px}.dynamics-row{display:grid;grid-template-columns:72px minmax(105px,1fr) 82px 76px;gap:7px;align-items:center;border-radius:6px;background:#07111f80;padding:7px;font-size:11px}.dynamics-row .dynamics-time,.dynamics-row .dynamics-state{color:var(--muted)}.dynamics-row .dynamics-pnl,.dynamics-row .dynamics-change{text-align:right;font-variant-numeric:tabular-nums}.empty{color:var(--muted);padding:22px;text-align:center;border:1px dashed var(--line);border-radius:10px}.section-note{color:var(--muted);font-size:12px;margin:-6px 0 12px}.decision-reasons{max-width:560px;white-space:normal;line-height:1.45}.outcome{font-weight:750}.outcome.pass{color:var(--green)}.outcome.block{color:var(--amber)}.tune-controls{display:flex;align-items:end;gap:12px;flex-wrap:wrap;margin-bottom:14px}.tune-control{display:grid;gap:5px}.tune-control label{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.04em}.tune-control select{min-width:150px;background:#0a1728;color:var(--text);border:1px solid var(--line);border-radius:7px;padding:8px 10px}.legend{display:flex;gap:16px;flex-wrap:wrap;color:var(--muted);font-size:11px;margin:8px 0}.quality-status{font-weight:750}.quality-status.WIN,.quality-status.FILLED,.quality-status.OPEN{color:var(--green)}.quality-status.LOSS,.quality-status.BLOCKED{color:var(--red)}.quality-status.WORKING,.quality-status.NO_OPTION{color:var(--amber)}table{border-collapse:collapse;width:100%;min-width:850px}th,td{text-align:left;padding:9px 10px;border-bottom:1px solid var(--line);white-space:nowrap}th{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.04em}tbody tr:hover{background:#ffffff08}.positive{color:var(--green)}.negative{color:var(--red)}@media(max-width:700px){main{padding:14px}header{align-items:flex-start;flex-direction:column}.live-grid{grid-template-columns:1fr}.live-fields{grid-template-columns:repeat(2,minmax(0,1fr))}.dynamics-row{grid-template-columns:64px 1fr 72px}.dynamics-change{display:none}.tab{padding:10px}.tune-control{width:100%}.tune-control select{width:100%}}
 </style></head><body><main><header><div><h1>SPY 0DTE Option Day-Trade Dashboard</h1><div class="sub">Live SIP signals · OPRA options · Alpaca paper execution · PostgreSQL history</div></div><div id="state"><span class="pulse-dot"></span><span id="stateText">Loading…</span></div></header>
 <section class="liveness-grid" aria-label="System liveness">
 <div class="status-card"><div class="label">Engine heartbeat</div><strong id="engineState">Connecting</strong><div class="status-detail" id="engineDetail">Waiting for dashboard API</div></div>
@@ -1400,7 +1636,7 @@ export function tradingDashboardHtml(): string {
 <div class="card"><div class="muted">Open Trades</div><div class="value" id="openTrades">0</div></div>
 <div class="card"><div class="muted">Option Subs</div><div class="value" id="subscriptions">0</div></div>
 </section>
-<section class="panel"><h2>Live Orders</h2><div id="liveOrders" class="live-grid"><div class="empty">Waiting for an active option order…</div></div></section>
+<section class="panel"><h2>Orders</h2><div class="section-note">Active orders update with every observed P&amp;L or status change. When persistence is enabled, completed cards retain the full timeline in PostgreSQL for later review.</div><div id="orderCards" class="live-grid"><div class="empty">Waiting for an option order…</div></div></section>
 <section class="panel"><h2>Signal → Trade Funnel</h2><div class="section-note">A fired signal is not an order. Each row shows option selection, risk, and submission status explicitly.</div><table><thead><tr><th>Time</th><th>Direction</th><th>Kind</th><th>Regime</th><th>Projected</th><th>Option</th><th>Risk</th><th>Status</th><th>Reason</th></tr></thead><tbody id="signals"></tbody></table></section>
 <section class="panel"><h2>Potential Missed Entry Review</h2><div class="section-note">Hindsight diagnostic, not an automatic trade recommendation. A row appears only when directional gates produced NO SIGNAL and SPY subsequently moved at least ${MISSED_ENTRY_MOVE_THRESHOLD_BPS.toFixed(1)} bps in one direction over the ${MISSED_ENTRY_HORIZON_SEC}-second projection horizon. Consecutive rows are clustered for readability.</div><table><thead><tr><th>Evaluation</th><th>Direction</th><th>Regime</th><th>SPY Start</th><th>SPY +${MISSED_ENTRY_HORIZON_SEC}s</th><th>Forward Move</th><th>Failed Gates / Votes</th><th>Decision Reason</th></tr></thead><tbody id="potentialMissRows"></tbody></table></section>
 <section class="panel"><h2>Entry Gate Blocks</h2><div class="section-note">Counts every top-level reason that prevented an entry evaluation. This exposes global state failures such as incomplete opening-range recovery even when no hindsight row is created.</div><table><thead><tr><th>Gate / Reason</th><th>Blocked Evaluations</th><th>Share of Evaluations</th></tr></thead><tbody id="gateBlockRows"></tbody></table></section>
@@ -1445,7 +1681,7 @@ export function tradingDashboardHtml(): string {
 const $=id=>document.getElementById(id),money=n=>new Intl.NumberFormat('en-US',{style:'currency',currency:'USD'}).format(n||0),num=(n,d=2)=>Number.isFinite(n)?n.toFixed(d):'—',count=n=>Number(n||0).toLocaleString(),time=n=>n?new Date(n).toLocaleString('en-US',{timeZone:'America/New_York'}):'—';
 function cell(value,cls=''){const td=document.createElement('td');td.textContent=String(value??'—');if(cls)td.className=cls;return td}function rows(id,data,fields,empty=''){const body=$(id);if(data.length===0&&empty){const tr=document.createElement('tr'),td=cell(empty,'muted');td.colSpan=fields.length;tr.append(td);body.replaceChildren(tr);return}body.replaceChildren(...data.map(item=>{const tr=document.createElement('tr');for(const field of fields){const result=field(item);tr.append(cell(result.value,result.cls||''))}return tr}))}
 function node(tag,cls,text){const value=document.createElement(tag);if(cls)value.className=cls;if(text!==undefined)value.textContent=String(text);return value}function field(label,value){const wrap=node('div','live-field'),caption=node('span','',label),content=node('strong','',value);wrap.append(caption,content);return wrap}function duration(ms){if(!Number.isFinite(ms))return '—';const seconds=Math.floor(ms/1000),minutes=Math.floor(seconds/60),hours=Math.floor(minutes/60);return hours>0?hours+'h '+(minutes%60)+'m':minutes>0?minutes+'m '+(seconds%60)+'s':seconds+'s'}
-function renderLiveOrders(items){const root=$('liveOrders');if(!items||items.length===0){root.replaceChildren(node('div','empty','No active option orders or open option positions.'));return}const cards=items.map(x=>{const pnl=x.totalPnl===undefined?x.unrealizedPnl:x.totalPnl,pnlClass=pnl>0?'positive':pnl<0?'negative':'',card=node('article','live-card '+(pnl>0?'profit':pnl<0?'loss':'')),head=node('div','live-head'),identity=node('div'),symbol=node('div','live-symbol',x.symbol),badge=node('div','badge',x.stage.replaceAll('_',' ')),pnlBox=node('div'),pnlValue=node('div','live-pnl '+pnlClass,pnl===undefined?'AWAITING FILL':money(pnl)),pnlReturn=node('div','live-return '+pnlClass,x.unrealizedReturnPct===undefined?'P&L from executable bid':num(x.unrealizedReturnPct)+'% open return');identity.append(symbol,badge);pnlBox.append(pnlValue,pnlReturn);head.append(identity,pnlBox);const fields=node('div','live-fields');fields.append(field('Position',x.remainingQuantity+' / '+x.quantity+' contracts'),field('Entry',x.entryPrice===undefined?'—':money(x.entryPrice)),field('Bid / Ask',x.currentBid===undefined?'—':money(x.currentBid)+' / '+money(x.currentAsk)),field('Stop',x.stopPrice===undefined?'—':money(x.stopPrice)),field('Target',x.targetPrice===undefined?'—':money(x.targetPrice)),field('Elapsed',duration(x.elapsedMs)),field('Realized',money(x.realizedPnl)),field('Quote age',x.quoteAgeMs===undefined?'Waiting for quote':duration(x.quoteAgeMs)),field('Direction',x.direction||'Pending entry'));card.append(head,fields);if(x.workingOrder){const strip=node('div','order-strip'),left=node('span','',x.workingOrder.purpose+' '+x.workingOrder.status+' · '+x.workingOrder.filledQuantity+'/'+x.workingOrder.requestedQuantity+' filled'),right=node('span','',money(x.workingOrder.limitPrice)+' limit · '+x.workingOrder.replacements+' replaces');strip.append(left,right);card.append(strip)}return card});root.replaceChildren(...cards)}
+function renderOrders(items){const root=$('orderCards');if(!items||items.length===0){root.replaceChildren(node('div','empty','No option orders have been recorded.'));return}const cards=items.map(x=>{const pnl=x.totalPnl===undefined?x.unrealizedPnl:x.totalPnl,pnlClass=pnl>0?'positive':pnl<0?'negative':'',card=node('article','live-card '+(x.active?'':'completed ')+(pnl>0?'profit':pnl<0?'loss':'')),head=node('div','live-head'),identity=node('div'),symbol=node('div','live-symbol',x.symbol),badge=node('div','badge',x.stage.replaceAll('_',' ')),pnlBox=node('div'),pnlValue=node('div','live-pnl '+pnlClass,pnl===undefined?'AWAITING FILL':money(pnl)),returnLabel=x.active?' open return':' final return',pnlReturn=node('div','live-return '+pnlClass,x.unrealizedReturnPct===undefined?(x.active?'P&L from executable bid':'Completed order'):num(x.unrealizedReturnPct)+'%'+returnLabel);identity.append(symbol,badge);pnlBox.append(pnlValue,pnlReturn);head.append(identity,pnlBox);const fields=node('div','live-fields');fields.append(field('Position',x.remainingQuantity+' / '+x.quantity+' contracts'),field('Entry',x.entryPrice===undefined?'—':money(x.entryPrice)),field(x.active?'Bid / Ask':'Exit',x.active?(x.currentBid===undefined?'—':money(x.currentBid)+' / '+money(x.currentAsk)):(x.exitPrice===undefined?'—':money(x.exitPrice))),field('Stop',x.stopPrice===undefined?'—':money(x.stopPrice)),field('Target',x.targetPrice===undefined?'—':money(x.targetPrice)),field('Elapsed',duration(x.elapsedMs)),field('Realized',money(x.realizedPnl)),field(x.active?'Quote age':'Exit reason',x.active?(x.quoteAgeMs===undefined?'Waiting for quote':duration(x.quoteAgeMs)):(x.exitReason||x.status)),field('Direction',x.direction||'Pending entry'));card.append(head,fields);if(x.workingOrder){const strip=node('div','order-strip'),left=node('span','',x.workingOrder.purpose+' '+x.workingOrder.status+' · '+x.workingOrder.filledQuantity+'/'+x.workingOrder.requestedQuantity+' filled'),right=node('span','',money(x.workingOrder.limitPrice)+' limit · '+x.workingOrder.replacements+' replaces');strip.append(left,right);card.append(strip)}const updates=x.updates||[],dynamics=node('div','dynamics'),title=node('div','dynamics-title','P&L & status updates · '+updates.length),list=node('div','dynamics-list');for(const update of [...updates].reverse()){const total=update.totalPnl===undefined?update.unrealizedPnl:update.totalPnl,change=update.pnlChange,row=node('div','dynamics-row'),at=node('span','dynamics-time',new Date(update.timestamp).toLocaleTimeString('en-US',{timeZone:'America/New_York'})),stateText=update.stage.replaceAll('_',' ')+' · '+update.status+(update.currentBid===undefined?'':' · bid '+money(update.currentBid)),state=node('span','dynamics-state',stateText),value=node('span','dynamics-pnl '+(total>0?'positive':total<0?'negative':''),total===undefined?'—':money(total)),delta=node('span','dynamics-change '+(change>0?'positive':change<0?'negative':''),change===undefined?'—':(change>0?'+':'')+money(change));row.append(at,state,value,delta);list.append(row)}if(updates.length===0)list.append(node('div','muted','Waiting for the first P&L or status update.'));dynamics.append(title,list);card.append(dynamics);return card});root.replaceChildren(...cards)}
 function setStatus(valueId,detailId,value,detail,level){$(valueId).textContent=value;$(valueId).className=level;$(detailId).textContent=detail}function age(ms){return Number.isFinite(ms)?duration(ms)+' ago':'No events yet'}function storagePolicy(event,live){if(!live.persistenceEnabled)return 'Disabled';if(event.type==='stock_quote'||event.type==='option_quote')return (live.quoteSampleIntervalMs||0)+' ms baseline · active option full';return 'Full retention'}
 function outcomeClass(value){return ['SIGNAL','SELECTED','ALLOWED','SUBMITTED','REQUESTED','FILLED'].includes(value)?'outcome pass':['NO_SIGNAL','NO_ELIGIBLE_OPTION','BLOCKED','SKIPPED'].includes(value)?'outcome block':'outcome'}
 function decisionDetail(item){const details=[...(item.reasons||[])];for(const direction of item.directions||[]){const failedVotes=(direction.votes||[]).filter(v=>!v.passed).map(v=>v.name);const result=direction.passed?'PASS':(direction.reasons||[]).slice(0,6).join(', ');details.push(direction.direction+': '+result+(failedVotes.length?' · failed votes '+failedVotes.join(', '):''))}return details.join(' · ')||'All configured gates passed'}
@@ -1466,7 +1702,7 @@ const key=$('tuneBreakdown').value,groups=new Map();for(const item of items){con
 document.querySelectorAll('.tab').forEach(button=>button.addEventListener('click',()=>{document.querySelectorAll('.tab').forEach(tab=>{const active=tab===button;tab.classList.toggle('active',active);tab.setAttribute('aria-selected',String(active))});document.querySelectorAll('.tab-panel').forEach(panel=>panel.classList.toggle('active',panel.id===button.dataset.tab))}));
 ['tuneDirection','tuneRegime','tuneOutcome','tuneBreakdown'].forEach(id=>$(id).addEventListener('change',()=>renderTuning(latestTuning,latestQualityOrders)));
 $('decisionView').addEventListener('change',()=>renderDecisionRows(latestDecisions));
-async function refresh(){try{const response=await fetch('/api/dashboard',{cache:'no-store'});if(!response.ok)throw new Error('Dashboard API '+response.status);const data=await response.json(),p=data.performance,h=data.health||{},live=data.liveData||{eventCounts:{},recentEvents:[],totalEvents:0,uptimeMs:0,persistenceEnabled:false,quoteSampleIntervalMs:0,retentionDays:0};scheduleDisplayRollover(data.nextDisplayRolloverAt);$('stateText').textContent=(data.readiness||'unknown').toUpperCase()+' · '+(h.executionMode||'paper');$('state').className=data.readiness||'degraded';setStatus('engineState','engineDetail','LIVE','API heartbeat · uptime '+duration(live.uptimeMs),'ok');setStatus('sipState','sipDetail',h.websocketConnected?'CONNECTED':'DISCONNECTED',count(live.eventCounts.stock_quote)+' display-day quotes · '+age(live.lastEventAgeMs),h.websocketConnected?'ok':'halted');setStatus('opraState','opraDetail',h.optionWebsocketConnected?'CONNECTED':'DISCONNECTED',count(live.eventCounts.option_quote)+' display-day quotes · '+age(live.lastEventAgeMs),h.optionWebsocketConnected?'ok':'halted');const dbLevel=!live.persistenceEnabled?'degraded':h.recorderHealthy?'ok':'halted',retentionDetail=(live.quoteSampleIntervalMs===0?'full-resolution quotes':live.quoteSampleIntervalMs+' ms quote baseline')+' · '+live.retentionDays+'d raw retention';setStatus('databaseState','databaseDetail',!live.persistenceEnabled?'DISABLED':h.recorderHealthy?'WRITING':'UNHEALTHY',live.persistenceEnabled?retentionDetail:'Persistence is not enabled',dbLevel);setStatus('brokerState','brokerDetail',h.brokerAvailable?'CONNECTED':'UNAVAILABLE',(h.executionMode||'paper').toUpperCase()+' · '+count(h.openOrderCount)+' open order(s)',h.brokerAvailable?'ok':'degraded');setStatus('marketState','marketDetail',String(h.marketClockState||'unknown').replaceAll('-',' ').toUpperCase(),h.positionsReconciled?'Positions reconciled':'Reconciliation required',h.positionsReconciled?'ok':'halted');const strategyRequired=h.executionEnabled&&h.marketClockState==='market-open',strategyReady=h.strategyStateReady===true||!strategyRequired,strategyStatus=String(h.strategyStateStatus||(!strategyRequired?'NOT REQUIRED':'UNKNOWN')).replaceAll('_',' ');setStatus('strategyState','strategyDetail',strategyReady?'READY':'BLOCKED',strategyStatus+' · '+count(h.restoredStockEvents)+' SIP events / '+count(h.restoredFeatureBars??h.restoredBars)+' bars',strategyReady?'ok':'halted');const signalsFired=p.signalsFired??p.entriesFired??0,optionsSelected=p.optionsSelected??0;$('signalsFired').textContent=count(signalsFired);$('optionsSelected').textContent=count(optionsSelected);$('optionSelectionDetail').textContent=percent(signalsFired>0?100*optionsSelected/signalsFired:0)+' of signals';$('riskAllowed').textContent=count(p.riskAllowed);$('riskDetail').textContent=count(p.riskBlocked)+' blocked';$('entryOrders').textContent=p.entryOrders;$('filledEntries').textContent=p.filledEntryOrders;$('closedTrades').textContent=p.closedTrades;$('winRate').textContent=(p.winRate*100).toFixed(1)+'%';$('pnl').textContent=money(p.realizedPnl);$('pnl').className='value '+(p.realizedPnl>0?'positive':p.realizedPnl<0?'negative':'');$('openPnl').textContent=money(p.unrealizedPnl);$('openPnl').className='value '+(p.unrealizedPnl>0?'positive':p.unrealizedPnl<0?'negative':'');$('totalPnl').textContent=money(p.totalPnl);$('totalPnl').className='value '+(p.totalPnl>0?'positive':p.totalPnl<0?'negative':'');$('profitFactor').textContent=p.profitFactor===null?'—':num(p.profitFactor);$('openTrades').textContent=p.openTrades;$('subscriptions').textContent=h.subscribedOptionContracts||0;$('feedEvents').textContent=count(live.totalEvents);$('sipQuotes').textContent=count(live.eventCounts.stock_quote);$('sipTrades').textContent=count(live.eventCounts.stock_trade);$('opraQuotes').textContent=count(live.eventCounts.option_quote);$('featureEvents').textContent=count(live.eventCounts.feature_snapshot);$('feedAge').textContent=live.lastEventAgeMs===undefined?'—':duration(live.lastEventAgeMs);renderLiveOrders(data.activeOrders);
+async function refresh(){try{const response=await fetch('/api/dashboard',{cache:'no-store'});if(!response.ok)throw new Error('Dashboard API '+response.status);const data=await response.json(),p=data.performance,h=data.health||{},live=data.liveData||{eventCounts:{},recentEvents:[],totalEvents:0,uptimeMs:0,persistenceEnabled:false,quoteSampleIntervalMs:0,retentionDays:0};scheduleDisplayRollover(data.nextDisplayRolloverAt);$('stateText').textContent=(data.readiness||'unknown').toUpperCase()+' · '+(h.executionMode||'paper');$('state').className=data.readiness||'degraded';setStatus('engineState','engineDetail','LIVE','API heartbeat · uptime '+duration(live.uptimeMs),'ok');setStatus('sipState','sipDetail',h.websocketConnected?'CONNECTED':'DISCONNECTED',count(live.eventCounts.stock_quote)+' display-day quotes · '+age(live.lastEventAgeMs),h.websocketConnected?'ok':'halted');setStatus('opraState','opraDetail',h.optionWebsocketConnected?'CONNECTED':'DISCONNECTED',count(live.eventCounts.option_quote)+' display-day quotes · '+age(live.lastEventAgeMs),h.optionWebsocketConnected?'ok':'halted');const dbLevel=!live.persistenceEnabled?'degraded':h.recorderHealthy?'ok':'halted',retentionDetail=(live.quoteSampleIntervalMs===0?'full-resolution quotes':live.quoteSampleIntervalMs+' ms quote baseline')+' · '+live.retentionDays+'d raw retention';setStatus('databaseState','databaseDetail',!live.persistenceEnabled?'DISABLED':h.recorderHealthy?'WRITING':'UNHEALTHY',live.persistenceEnabled?retentionDetail:'Persistence is not enabled',dbLevel);setStatus('brokerState','brokerDetail',h.brokerAvailable?'CONNECTED':'UNAVAILABLE',(h.executionMode||'paper').toUpperCase()+' · '+count(h.openOrderCount)+' open order(s)',h.brokerAvailable?'ok':'degraded');setStatus('marketState','marketDetail',String(h.marketClockState||'unknown').replaceAll('-',' ').toUpperCase(),h.positionsReconciled?'Positions reconciled':'Reconciliation required',h.positionsReconciled?'ok':'halted');const strategyRequired=h.executionEnabled&&h.marketClockState==='market-open',strategyReady=h.strategyStateReady===true||!strategyRequired,strategyStatus=String(h.strategyStateStatus||(!strategyRequired?'NOT REQUIRED':'UNKNOWN')).replaceAll('_',' ');setStatus('strategyState','strategyDetail',strategyReady?'READY':'BLOCKED',strategyStatus+' · '+count(h.restoredStockEvents)+' SIP events / '+count(h.restoredFeatureBars??h.restoredBars)+' bars',strategyReady?'ok':'halted');const signalsFired=p.signalsFired??p.entriesFired??0,optionsSelected=p.optionsSelected??0;$('signalsFired').textContent=count(signalsFired);$('optionsSelected').textContent=count(optionsSelected);$('optionSelectionDetail').textContent=percent(signalsFired>0?100*optionsSelected/signalsFired:0)+' of signals';$('riskAllowed').textContent=count(p.riskAllowed);$('riskDetail').textContent=count(p.riskBlocked)+' blocked';$('entryOrders').textContent=p.entryOrders;$('filledEntries').textContent=p.filledEntryOrders;$('closedTrades').textContent=p.closedTrades;$('winRate').textContent=(p.winRate*100).toFixed(1)+'%';$('pnl').textContent=money(p.realizedPnl);$('pnl').className='value '+(p.realizedPnl>0?'positive':p.realizedPnl<0?'negative':'');$('openPnl').textContent=money(p.unrealizedPnl);$('openPnl').className='value '+(p.unrealizedPnl>0?'positive':p.unrealizedPnl<0?'negative':'');$('totalPnl').textContent=money(p.totalPnl);$('totalPnl').className='value '+(p.totalPnl>0?'positive':p.totalPnl<0?'negative':'');$('profitFactor').textContent=p.profitFactor===null?'—':num(p.profitFactor);$('openTrades').textContent=p.openTrades;$('subscriptions').textContent=h.subscribedOptionContracts||0;$('feedEvents').textContent=count(live.totalEvents);$('sipQuotes').textContent=count(live.eventCounts.stock_quote);$('sipTrades').textContent=count(live.eventCounts.stock_trade);$('opraQuotes').textContent=count(live.eventCounts.option_quote);$('featureEvents').textContent=count(live.eventCounts.feature_snapshot);$('feedAge').textContent=live.lastEventAgeMs===undefined?'—':duration(live.lastEventAgeMs);renderOrders(data.orderCards||data.activeOrders);
 rows('signals',data.signals,[x=>({value:time(x.timestamp)}),x=>({value:x.direction}),x=>({value:x.kind}),x=>({value:x.regime}),x=>({value:num(x.projectedMoveBps)+' bps'}),x=>({value:x.candidate}),x=>({value:x.riskStatus||'—',cls:x.riskStatus==='ALLOWED'?'positive':x.riskStatus==='BLOCKED'?'negative':''}),x=>({value:x.status}),x=>({value:(x.riskReasons||x.reasons||[]).join(', ')})]);
 rows('orders',data.orders,[x=>({value:time(x.timestamp)}),x=>({value:x.purpose}),x=>({value:x.symbol}),x=>({value:x.side}),x=>({value:x.quantity}),x=>({value:money(x.limitPrice)}),x=>({value:x.filledQuantity}),x=>({value:x.averageFillPrice?money(x.averageFillPrice):'—'}),x=>({value:x.status})]);
 renderTuning(data.tuning||{entries:[]},data.orders||[]);renderPotentialMisses(data.tuning);

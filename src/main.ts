@@ -14,6 +14,7 @@ import { CompositeMarketHistorySink } from "./history/types.js";
 import { JsonLogger } from "./utils/logger.js";
 import { marketDate } from "./utils/time.js";
 import type { FeatureSnapshot } from "./types.js";
+import type { DashboardOrderCard } from "./ops/orderCards.js";
 
 loadDotEnv();
 validateConfig(defaultConfig);
@@ -41,14 +42,26 @@ const history = environment.historyDatabaseEnabled ? new PostgresHistoryStore({
   }),
 }) : undefined;
 let restoredEvents: AuditEvent[] = [];
+let restoredOrderCards: DashboardOrderCard[] = [];
 let restoredFeatureCheckpoint: FeatureSnapshot | undefined;
 if (history) {
   await history.initialize();
-  restoredEvents = await history.loadAuditEvents();
+  [restoredEvents, restoredOrderCards] = await Promise.all([
+    history.loadAuditEvents(),
+    history.loadOrderCards(),
+  ]);
+  dashboard.restoreOrderCards(restoredOrderCards);
   restoredFeatureCheckpoint = await history.loadLatestRecoveredFeature(marketDate(Date.now(), defaultConfig.timeZone));
   for (const event of restoredEvents) dashboard.record(event);
+  const restoredCardIds = new Set(restoredOrderCards.map((card) => card.id));
+  const backfilledOrderCards = dashboard.snapshot().orderCards.filter((card) =>
+    !card.active && !restoredCardIds.has(card.id));
+  for (const card of backfilledOrderCards) await history.saveOrderCard(card);
+  dashboard.setOrderCardPersistence(history);
   logger.log("info", "postgres_history_ready", {
     restoredAuditEvents: restoredEvents.length,
+    restoredOrderCards: restoredOrderCards.length,
+    backfilledOrderCards: backfilledOrderCards.length,
     recoveredFeatureCheckpoint: restoredFeatureCheckpoint !== undefined,
   });
 }

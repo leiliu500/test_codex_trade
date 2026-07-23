@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import type { QueryResult, QueryResultRow } from "pg";
 import { PostgresHistoryStore, type DatabaseClient } from "../src/history/postgresHistory.js";
+import type { DashboardOrderCard } from "../src/ops/orderCards.js";
 
 class FakeDatabaseClient implements DatabaseClient {
   readonly queries: Array<{ text: string; values: readonly unknown[] }> = [];
@@ -42,6 +43,7 @@ test("PostgreSQL history creates schema, batches market data, and durably insert
   });
   assert.ok(client.queries.some((query) => query.text.includes("CREATE TABLE IF NOT EXISTS market_events")));
   assert.ok(client.queries.some((query) => query.text.includes("CREATE TABLE IF NOT EXISTS order_lifecycle_events")));
+  assert.ok(client.queries.some((query) => query.text.includes("CREATE TABLE IF NOT EXISTS order_card_updates")));
   const marketInsert = client.queries.find((query) => query.text.includes("INSERT INTO market_events"));
   assert.equal(marketInsert?.values.length, 12);
   assert.ok(client.queries.some((query) => query.text.includes("INSERT INTO audit_events")));
@@ -53,6 +55,85 @@ test("PostgreSQL history creates schema, batches market data, and durably insert
   assert.equal(lifecycleCurrent?.values[9], "SUBMITTED");
   assert.equal(store.healthy(), true);
   await store.close();
+});
+
+test("PostgreSQL history saves completed order cards with their full dynamics list", async () => {
+  const client = new FakeDatabaseClient();
+  const store = new PostgresHistoryStore({
+    connectionString: "postgresql://unused", client, retentionDays: 0,
+  });
+  await store.initialize();
+  const card: DashboardOrderCard = {
+    id: "entry-1",
+    signalId: "signal-1",
+    symbol: "SPY260722C00500000",
+    direction: "BULLISH",
+    active: false,
+    stage: "CLOSED",
+    status: "filled",
+    quantity: 1,
+    remainingQuantity: 0,
+    entryPrice: 2,
+    exitPrice: 2.2,
+    realizedPnl: 20,
+    unrealizedPnl: 0,
+    totalPnl: 20,
+    entryTimestamp: 1_000,
+    exitTimestamp: 2_000,
+    exitReason: "PROFIT_TARGET",
+    updates: [{
+      timestamp: 1_100, stage: "POSITION_OPEN", status: "OPEN", remainingQuantity: 1,
+      realizedPnl: 0, currentBid: 2.1, unrealizedPnl: 10, totalPnl: 10,
+    }, {
+      timestamp: 2_000, stage: "CLOSED", status: "filled", remainingQuantity: 0,
+      realizedPnl: 20, unrealizedPnl: 0, totalPnl: 20, pnlChange: 10,
+    }],
+  };
+
+  await store.saveOrderCard(card);
+
+  const summary = client.queries.find((query) => query.text.includes("INSERT INTO order_cards\n"));
+  assert.equal(summary?.values[0], "entry-1");
+  assert.equal(summary?.values[4], "CLOSED");
+  assert.equal(summary?.values[7], 20);
+  assert.match(String(summary?.values[12]), /"updates":\[/);
+  const dynamics = client.queries.find((query) => query.text.includes("INSERT INTO order_card_updates"));
+  assert.equal(dynamics?.values.length, 16);
+  assert.equal(dynamics?.values[0], "entry-1");
+  assert.equal(dynamics?.values[8], "entry-1");
+  assert.match(String(dynamics?.values[15]), /"pnlChange":10/);
+  await store.close();
+});
+
+test("PostgreSQL history restores completed cards and ordered dynamics for dashboard review", async () => {
+  const client: DatabaseClient = {
+    async query<R extends QueryResultRow = QueryResultRow>(text: string) {
+      const rows = text.includes("FROM order_cards")
+        ? [{
+          card_id: "entry-1",
+          data: {
+            id: "entry-1", symbol: "SPY260722C00500000", active: false, stage: "CLOSED",
+            status: "filled", quantity: 1, remainingQuantity: 0, realizedPnl: 20, updates: [],
+          },
+        }]
+        : text.includes("FROM order_card_updates")
+          ? [{
+            card_id: "entry-1", sequence_index: 0,
+            data: {
+              timestamp: 2_000, stage: "CLOSED", status: "filled",
+              remainingQuantity: 0, realizedPnl: 20, totalPnl: 20,
+            },
+          }]
+          : [];
+      return { command: "SELECT", rowCount: rows.length, oid: 0, fields: [], rows: rows as unknown as R[] };
+    },
+  };
+  const store = new PostgresHistoryStore({ connectionString: "postgresql://unused", client });
+  const cards = await store.loadOrderCards();
+
+  assert.equal(cards[0]?.id, "entry-1");
+  assert.equal(cards[0]?.updates[0]?.stage, "CLOSED");
+  assert.equal(cards[0]?.updates[0]?.totalPnl, 20);
 });
 
 test("PostgreSQL history samples quote baselines but preserves priority option quotes at full resolution", async () => {
