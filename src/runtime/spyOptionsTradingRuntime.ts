@@ -21,6 +21,7 @@ import { classifyRegime } from "../strategy/regimeClassifier.js";
 import { SpySipReceiver } from "./spySipReceiver.js";
 import { isAtOrAfter, marketDate, parseClock, secondsSinceMidnight, zonedDateTimeToEpoch } from "../utils/time.js";
 import type { DailyRiskState } from "../risk/riskManager.js";
+import { lateEntryGuardAudit } from "../strategy/lateEntryGuard.js";
 
 export interface SpyOptionsRuntimeClient extends TradingRestClient {
   getLatestSpySipQuote(): Promise<StockQuote>;
@@ -82,6 +83,7 @@ export class SpyOptionsTradingRuntime {
   readonly #selector: OptionSelector;
   readonly #universe: OptionUniverseManager;
   readonly #signals: SignalEngine;
+  readonly #lateEntryBaselineSignals: SignalEngine | undefined;
   readonly #shadowSignals = new Map<FollowThroughScope, SignalEngine>();
   readonly #orders: LiveOrderManager;
   readonly #stockReceiver: SpySipReceiver;
@@ -134,6 +136,11 @@ export class SpyOptionsTradingRuntime {
     this.#selector = new OptionSelector(options.config);
     this.#universe = new OptionUniverseManager(options.config);
     this.#signals = new SignalEngine(options.config);
+    if (options.config.signals.lateEntryGuard.mode === "ENFORCE") {
+      const lateEntryBaselineConfig = structuredClone(options.config);
+      lateEntryBaselineConfig.signals.lateEntryGuard.mode = "DISABLED";
+      this.#lateEntryBaselineSignals = new SignalEngine(lateEntryBaselineConfig);
+    }
     if (options.config.signals.shadowFollowThroughScope !== "DISABLED") {
       for (const scope of ["BULLISH_IMPULSE", "IMPULSE", "ALL"] as const) {
         const shadowConfig = structuredClone(options.config);
@@ -150,6 +157,7 @@ export class SpyOptionsTradingRuntime {
     const restored = restoreRuntimeState(options.restoredAuditEvents ?? [], this.#now(), options.config.timeZone);
     this.#restoredRuntimeState = restored;
     this.#signals.restoreState(restored.signal);
+    this.#lateEntryBaselineSignals?.restoreState(restored.signal);
     for (const engine of this.#shadowSignals.values()) engine.restoreState(restored.signal);
     this.#recorder = options.recorder ?? new MemoryRecorder();
     this.#history = options.history;
@@ -273,6 +281,7 @@ export class SpyOptionsTradingRuntime {
         activeFollowThroughScope: this.#config.signals.followThroughScope,
         shadowFollowThroughScope: this.#config.signals.shadowFollowThroughScope,
         shadowFollowThroughScopes: [...this.#shadowSignals.keys()],
+        lateEntryBaselineEnabled: this.#lateEntryBaselineSignals !== undefined,
       });
     } catch (error) {
       this.#recordError(error);
@@ -309,6 +318,13 @@ export class SpyOptionsTradingRuntime {
           scope,
           { scope, ...signalEvaluationSummary(engine.evaluateDetailed(feature, this.#lastRegime!)) },
         ]));
+        const lateEntryBaseline = this.#lateEntryBaselineSignals
+          ? {
+              mode: "SHADOW",
+              guardMode: "DISABLED",
+              ...signalEvaluationSummary(this.#lateEntryBaselineSignals.evaluateDetailed(feature, this.#lastRegime)),
+            }
+          : null;
         const primaryShadowScope = this.#config.signals.shadowFollowThroughScope;
         const shadowAudit = primaryShadowScope === "DISABLED" ? null : shadowEvaluations[primaryShadowScope] ?? null;
         const runtimeBlocks: string[] = [];
@@ -329,6 +345,8 @@ export class SpyOptionsTradingRuntime {
             directions: [],
             shadowEvaluation: shadowAudit,
             shadowEvaluations,
+            lateEntryGuard: lateEntryGuardAudit(this.#config, feature.timestamp),
+            lateEntryBaseline,
             feature: entryFeatureSummary(feature),
           });
           return;
@@ -351,6 +369,8 @@ export class SpyOptionsTradingRuntime {
           directions: evaluation.directions,
           shadowEvaluation: shadowAudit,
           shadowEvaluations,
+          lateEntryGuard: lateEntryGuardAudit(this.#config, feature.timestamp),
+          lateEntryBaseline,
           ...(signal ? {
             signalId: signal.id,
             direction: signal.direction,
@@ -373,6 +393,7 @@ export class SpyOptionsTradingRuntime {
           kind: signal.kind,
           regime: signal.regime,
           projectedMoveBps: signal.projectedMoveBps,
+          lateEntryGuard: lateEntryGuardAudit(this.#config, signal.timestamp),
           candidate: candidate?.symbol ?? null,
           candidateMetrics: candidate ? {
             score: candidate.score,
@@ -424,6 +445,7 @@ export class SpyOptionsTradingRuntime {
           timestamp: this.#now(),
           symbol: candidate.symbol,
           direction: signal.direction,
+          lateEntryGuard: lateEntryGuardAudit(this.#config, signal.timestamp),
           submitted: result.submitted,
           reasons: result.reasons,
           brokerOrderId: result.brokerOrder?.id ?? null,
@@ -762,6 +784,10 @@ export class SpyOptionsTradingRuntime {
       this.#universe.retainOpenPosition(symbol, this.#now());
       this.#retainedPositionSymbol = symbol;
       this.#signals.recordEntry(this.#execution.position!.direction, this.#execution.position!.entryTimestamp);
+      this.#lateEntryBaselineSignals?.recordEntry(
+        this.#execution.position!.direction,
+        this.#execution.position!.entryTimestamp,
+      );
       for (const engine of this.#shadowSignals.values()) {
         engine.recordEntry(this.#execution.position!.direction, this.#execution.position!.entryTimestamp);
       }

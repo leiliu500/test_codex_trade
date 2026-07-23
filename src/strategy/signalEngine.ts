@@ -3,6 +3,7 @@ import type { Direction, FeatureSnapshot, RegimeDecision, SignalVote, TradeSigna
 import { inSessionWindow, parseClock, secondsSinceMidnight } from "../utils/time.js";
 import { hashString, stableStringify } from "../utils/statistics.js";
 import { boundedProjectionBps } from "./projection.js";
+import { lateEntryGuardActive } from "./lateEntryGuard.js";
 
 export interface SignalDirectionEvaluation {
   direction: Direction;
@@ -29,6 +30,15 @@ interface PendingFollowThrough {
   kind: TradeSignal["kind"];
   armedAt: number;
   entryReferencePrice: number;
+  maxSec: number;
+  reasonPrefix: "" | "LATE_ENTRY_";
+}
+
+interface FollowThroughRequirement {
+  minSec: number;
+  maxSec: number;
+  minimumBps: number;
+  reasonPrefix: "" | "LATE_ENTRY_";
 }
 
 export class SignalEngine {
@@ -93,11 +103,12 @@ export class SignalEngine {
     const candidates = directions.flatMap((direction) => direction.signal ? [direction.signal] : []);
     if (candidates.length === 0) {
       const pendingExpired = this.#pendingFollowThrough !== undefined &&
-        feature.timestamp - this.#pendingFollowThrough.armedAt >= this.#config.signals.followThroughMaxSec * 1000;
+        feature.timestamp - this.#pendingFollowThrough.armedAt >= this.#pendingFollowThrough.maxSec * 1000;
+      const expiredReason = `${this.#pendingFollowThrough?.reasonPrefix ?? ""}FOLLOW_THROUGH_EXPIRED`;
       if (pendingExpired) this.#pendingFollowThrough = undefined;
       return {
         passed: false,
-        reasons: [pendingExpired ? "FOLLOW_THROUGH_EXPIRED" : "NO_DIRECTION_PASSED"],
+        reasons: [pendingExpired ? expiredReason : "NO_DIRECTION_PASSED"],
         directions: directions.map(({ signal: _signal, ...direction }) => direction),
       };
     }
@@ -107,9 +118,9 @@ export class SignalEngine {
     });
     const selected = candidates[0]!;
     const directionEvaluations = directions.map(({ signal: _signal, ...direction }) => direction);
-    if (this.#config.signals.entryQualityMode === "ENFORCE" &&
-        this.#config.signals.followThroughMinSec > 0 && this.#requiresFollowThrough(selected)) {
-      const confirmation = this.#confirmFollowThrough(selected, feature);
+    const followThrough = this.#followThroughRequirement(selected);
+    if (followThrough && followThrough.minSec > 0) {
+      const confirmation = this.#confirmFollowThrough(selected, feature, followThrough);
       if (!confirmation.confirmed) {
         return { passed: false, reasons: confirmation.reasons, directions: directionEvaluations };
       }
@@ -129,43 +140,72 @@ export class SignalEngine {
   }
 
   #confirmFollowThrough(
-    selected: TradeSignal, feature: FeatureSnapshot,
+    selected: TradeSignal, feature: FeatureSnapshot, requirement: FollowThroughRequirement,
   ): { confirmed: true; elapsedSec: number; moveBps: number } | { confirmed: false; reasons: string[] } {
     const pending = this.#pendingFollowThrough;
-    if (!pending || pending.direction !== selected.direction || pending.kind !== selected.kind) {
+    const prefix = requirement.reasonPrefix;
+    if (!pending || pending.direction !== selected.direction || pending.kind !== selected.kind ||
+        pending.reasonPrefix !== prefix) {
       this.#pendingFollowThrough = {
         direction: selected.direction,
         kind: selected.kind,
         armedAt: feature.timestamp,
         entryReferencePrice: feature.price,
+        maxSec: requirement.maxSec,
+        reasonPrefix: prefix,
       };
-      return { confirmed: false, reasons: [pending ? "FOLLOW_THROUGH_DIRECTION_CHANGED" : "FOLLOW_THROUGH_PENDING"] };
+      return {
+        confirmed: false,
+        reasons: [`${prefix}${pending ? "FOLLOW_THROUGH_DIRECTION_CHANGED" : "FOLLOW_THROUGH_PENDING"}`],
+      };
     }
     const elapsedMs = feature.timestamp - pending.armedAt;
     const elapsedSec = elapsedMs / 1000;
-    if (elapsedMs < this.#config.signals.followThroughMinSec * 1000) {
-      return { confirmed: false, reasons: ["FOLLOW_THROUGH_PENDING"] };
+    if (elapsedMs < requirement.minSec * 1000) {
+      return { confirmed: false, reasons: [`${prefix}FOLLOW_THROUGH_PENDING`] };
     }
     const sign = selected.direction === "BULLISH" ? 1 : -1;
     const moveBps = sign * (feature.price / pending.entryReferencePrice - 1) * 10_000;
-    if (elapsedMs <= this.#config.signals.followThroughMaxSec * 1000 &&
-        moveBps >= this.#config.signals.followThroughMinimumBps) {
+    if (elapsedMs <= requirement.maxSec * 1000 && moveBps >= requirement.minimumBps) {
       this.#pendingFollowThrough = undefined;
       return { confirmed: true, elapsedSec, moveBps };
     }
-    if (elapsedMs < this.#config.signals.followThroughMaxSec * 1000) {
-      return { confirmed: false, reasons: ["FOLLOW_THROUGH_NOT_CONFIRMED"] };
+    if (elapsedMs < requirement.maxSec * 1000) {
+      return { confirmed: false, reasons: [`${prefix}FOLLOW_THROUGH_NOT_CONFIRMED`] };
     }
     this.#pendingFollowThrough = {
       direction: selected.direction,
       kind: selected.kind,
       armedAt: feature.timestamp,
       entryReferencePrice: feature.price,
+      maxSec: requirement.maxSec,
+      reasonPrefix: prefix,
     };
-    return { confirmed: false, reasons: ["FOLLOW_THROUGH_FAILED"] };
+    return { confirmed: false, reasons: [`${prefix}FOLLOW_THROUGH_FAILED`] };
   }
 
-  #requiresFollowThrough(signal: TradeSignal): boolean {
+  #followThroughRequirement(signal: TradeSignal): FollowThroughRequirement | undefined {
+    if (lateEntryGuardActive(this.#config, signal.timestamp)) {
+      const guard = this.#config.signals.lateEntryGuard;
+      return {
+        minSec: guard.followThroughMinSec,
+        maxSec: guard.followThroughMaxSec,
+        minimumBps: guard.followThroughMinimumBps,
+        reasonPrefix: "LATE_ENTRY_",
+      };
+    }
+    if (this.#config.signals.entryQualityMode !== "ENFORCE" || !this.#requiresStandardFollowThrough(signal)) {
+      return undefined;
+    }
+    return {
+      minSec: this.#config.signals.followThroughMinSec,
+      maxSec: this.#config.signals.followThroughMaxSec,
+      minimumBps: this.#config.signals.followThroughMinimumBps,
+      reasonPrefix: "",
+    };
+  }
+
+  #requiresStandardFollowThrough(signal: TradeSignal): boolean {
     const scope = this.#config.signals.followThroughScope;
     if (scope === "ALL") return true;
     if (scope === "IMPULSE") return signal.kind === "IMPULSE";
@@ -209,6 +249,11 @@ export class SignalEngine {
     const directionalProjection = s * projection.projectedMoveBps;
     if (!(directionalProjection > 0)) {
       blockedReasons.push("PROJECTED_MOVE_NOT_DIRECTIONAL");
+      return undefined;
+    }
+    if (lateEntryGuardActive(this.#config, f.timestamp) &&
+        directionalProjection < this.#config.signals.lateEntryGuard.minProjectedMoveBps) {
+      blockedReasons.push("LATE_ENTRY_PROJECTED_MOVE_BELOW_MINIMUM");
       return undefined;
     }
 
