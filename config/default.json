@@ -105,7 +105,7 @@
     "riskFractionOfEquity": 0.0025,
     "maxRiskDollarsPerTrade": 500,
     "maxPremiumDollarsPerTrade": 1500,
-    "maxContracts": 10,
+    "maxContracts": 1,
     "maxTradesPerDay": 1000,
     "entryQualityMaxTradesPerDay": 6,
     "maxDailyLossDollars": 1000,

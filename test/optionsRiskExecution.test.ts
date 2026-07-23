@@ -31,6 +31,9 @@ test("configuration cannot enable later-dated or overnight option trading", () =
   const invalidShadowCap = structuredClone(defaultConfig);
   invalidShadowCap.risk.entryQualityMaxTradesPerDay = 0;
   assert.throws(() => validateConfig(invalidShadowCap), /Daily entry caps/);
+  const multipleContracts = structuredClone(defaultConfig);
+  multipleContracts.risk.maxContracts = 2;
+  assert.throws(() => validateConfig(multipleContracts), /exactly one option contract/);
 });
 
 test("Black-Scholes values/Greeks and IV bisection are internally consistent", () => {
@@ -71,9 +74,10 @@ test("risk sizing honors every cap and resets stop/target from actual fill", () 
     timestamp, optionMid: 2, hasOpenPosition: false,
     account: { equity: 100_000, optionBuyingPower: 10_000, active: true, optionsApproved: true, killSwitch: false },
   });
-  // risk budget $250 / $50 stop loss = 5 contracts.
-  assert.equal(decision.quantity, 5);
-  const filled = manager.createFilledPosition("SPY260722C00500000", "BULLISH", 5, 2.20, timestamp);
+  // The risk budget could support five contracts, but production entry sizing is fixed at one.
+  assert.equal(decision.maxLossPerContract, 50);
+  assert.equal(decision.quantity, 1);
+  const filled = manager.createFilledPosition("SPY260722C00500000", "BULLISH", 1, 2.20, timestamp);
   assert.ok(Math.abs(filled.stopPrice - 1.65) < 1e-12);
   assert.ok(Math.abs(filled.targetPrice - 2.97) < 1e-12);
   for (let i = 0; i < riskConfig.risk.maxTradesPerDay - 1; i += 1) manager.recordEntry(timestamp);
