@@ -4,6 +4,7 @@ import { parseClock } from "./utils/time.js";
 export type FollowThroughScope = "BULLISH_IMPULSE" | "IMPULSE" | "ALL";
 export type EntryQualityMode = "SHADOW" | "ENFORCE";
 export type LateEntryGuardMode = "DISABLED" | "ENFORCE";
+export type MorningEntryGuardMode = "DISABLED" | "ENFORCE";
 
 export interface EngineConfig {
   version: string;
@@ -65,6 +66,14 @@ export interface EngineConfig {
     followThroughMinimumBps: number;
     followThroughScope: FollowThroughScope;
     shadowFollowThroughScope: FollowThroughScope | "DISABLED";
+    morningEntryGuard: {
+      mode: MorningEntryGuardMode;
+      start: string;
+      end: string;
+      minProjectedMoveBps: number;
+      minCostMarginBps: number;
+      maxOptionSpreadPct: number;
+    };
     lateEntryGuard: {
       mode: LateEntryGuardMode;
       start: string;
@@ -192,6 +201,8 @@ export function validateConfig(config: EngineConfig): void {
   const entryStart = parseClock(config.session.entryStart);
   const lateBullishImpulseStart = parseClock(config.signals.lateBullishImpulseStart);
   const bullishImpulseCutoff = parseClock(config.signals.bullishImpulseCutoff);
+  const morningEntryGuardStart = parseClock(config.signals.morningEntryGuard.start);
+  const morningEntryGuardEnd = parseClock(config.signals.morningEntryGuard.end);
   const lateEntryGuardStart = parseClock(config.signals.lateEntryGuard.start);
   const zeroDteCutoff = parseClock(config.options.zeroDteEntryCutoff);
   const entryEnd = parseClock(config.session.entryEnd);
@@ -208,6 +219,11 @@ export function validateConfig(config: EngineConfig): void {
   if (!(entryStart <= lateEntryGuardStart && lateEntryGuardStart <= zeroDteCutoff)) {
     throw new Error("Late-entry guard must start inside the executable entry window");
   }
+  if (!(entryStart <= morningEntryGuardStart &&
+        morningEntryGuardStart < morningEntryGuardEnd &&
+        morningEntryGuardEnd === lateEntryGuardStart)) {
+    throw new Error("Morning-entry guard must satisfy entryStart <= start < end = late-entry guard start");
+  }
   if (!(config.signals.followThroughMinSec >= 0 &&
         config.signals.followThroughMaxSec >= config.signals.followThroughMinSec &&
         config.signals.followThroughMinimumBps >= 0)) {
@@ -223,6 +239,15 @@ export function validateConfig(config: EngineConfig): void {
   }
   if (!new Set<LateEntryGuardMode>(["DISABLED", "ENFORCE"]).has(config.signals.lateEntryGuard.mode)) {
     throw new Error("Late-entry guard mode must be DISABLED or ENFORCE");
+  }
+  if (!new Set<MorningEntryGuardMode>(["DISABLED", "ENFORCE"]).has(config.signals.morningEntryGuard.mode)) {
+    throw new Error("Morning-entry guard mode must be DISABLED or ENFORCE");
+  }
+  if (!(config.signals.morningEntryGuard.minProjectedMoveBps > 0 &&
+        config.signals.morningEntryGuard.minCostMarginBps >= 0 &&
+        config.signals.morningEntryGuard.maxOptionSpreadPct > 0 &&
+        config.signals.morningEntryGuard.maxOptionSpreadPct <= config.dataQuality.maxOptionSpreadPct)) {
+    throw new Error("Morning-entry guard thresholds are invalid");
   }
   if (!(config.signals.lateEntryGuard.minProjectedMoveBps > 0 &&
         config.signals.lateEntryGuard.minCostMarginBps >= 0 &&

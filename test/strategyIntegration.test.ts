@@ -211,6 +211,21 @@ test("late-session entries require stronger projection and causal follow-through
   const morning = feature(1);
   const up: RegimeDecision = { regime: "STRONG_UP", confidence: 1, reasons: [] };
   assert.equal(new SignalEngine(defaultConfig).evaluate(morning, up)?.direction, "BULLISH");
+  const weakMorningProjection = {
+    ...morning,
+    fast: {
+      ...morning.fast,
+      regression: {
+        ...morning.fast.regression,
+        slopeBpsPerSec: 0.1,
+        accelerationBpsPerSec2: 0,
+      },
+    },
+  };
+  const weakMorning = new SignalEngine(defaultConfig).evaluateDetailed(weakMorningProjection, up);
+  assert.equal(weakMorning.signal, undefined);
+  assert.ok(weakMorning.directions.find((item) => item.direction === "BULLISH")?.reasons
+    .includes("MORNING_ENTRY_PROJECTED_MOVE_BELOW_MINIMUM"));
 
   const late = {
     ...morning,
@@ -374,7 +389,7 @@ test("option selector rejects wide cost and ranks an eligible liquid contract", 
   const bad: OptionContract = { ...good, symbol: "SPY260722C00502000", strike: 502 };
   const book = new OptionBook();
   for (const contract of [good, bad]) book.upsertContract(contract);
-  book.updateQuote({ symbol: good.symbol, timestamp: signal.timestamp, bidPrice: 1.99, askPrice: 2.01, bidSize: 100, askSize: 100 });
+  book.updateQuote({ symbol: good.symbol, timestamp: signal.timestamp, bidPrice: 1.995, askPrice: 2.005, bidSize: 100, askSize: 100 });
   book.updateSnapshot({ symbol: good.symbol, timestamp: signal.timestamp, impliedVolatility: 0.22, greeks: { delta: 0.52, gamma: 0.02 }, dailyVolume: 1000, openInterest: 5000 });
   book.updateQuote({ symbol: bad.symbol, timestamp: signal.timestamp, bidPrice: 1.60, askPrice: 2.20, bidSize: 100, askSize: 100 });
   book.updateSnapshot({ symbol: bad.symbol, timestamp: signal.timestamp, impliedVolatility: 0.22, greeks: { delta: 0.52, gamma: 0.02 }, dailyVolume: 1000, openInterest: 5000 });
@@ -383,6 +398,69 @@ test("option selector rejects wide cost and ranks an eligible liquid contract", 
   assert.ok(selection.evaluations.find((item) => item.symbol === bad.symbol)!.rejectionReasons.includes("QUOTE_SPREAD_TOO_WIDE"));
   const laterDated = { ...good, symbol: "SPY260724C00501000", expirationDate: "2026-07-24" };
   assert.ok(new OptionSelector(defaultConfig).evaluate(laterDated, undefined, signal).rejectionReasons.includes("NOT_SAME_DAY_EXPIRATION"));
+});
+
+test("morning option selection applies static gates without a follow-through delay", () => {
+  const morning = feature();
+  const signal = new SignalEngine(defaultConfig).evaluate(
+    morning,
+    classifyRegime(morning, defaultConfig.regimes),
+  )!;
+  assert.equal(signal.direction, "BULLISH");
+  const contract: OptionContract = {
+    symbol: "SPY260722C00501000",
+    underlying: "SPY",
+    expirationDate: "2026-07-22",
+    strike: 501,
+    type: "call",
+    active: true,
+    tradable: true,
+  };
+  const book = new OptionBook();
+  book.upsertContract(contract);
+  book.updateSnapshot({
+    symbol: contract.symbol,
+    timestamp: signal.timestamp,
+    impliedVolatility: 0.22,
+    greeks: { delta: 0.52, gamma: 0.02 },
+    dailyVolume: 1_000,
+    openInterest: 5_000,
+  });
+  book.updateQuote({
+    symbol: contract.symbol,
+    timestamp: signal.timestamp,
+    bidPrice: 1.993,
+    askPrice: 2.007,
+    bidSize: 100,
+    askSize: 100,
+  });
+  assert.equal(new OptionSelector(defaultConfig).select(signal, [contract], book).selected?.symbol, contract.symbol);
+
+  book.updateQuote({
+    symbol: contract.symbol,
+    timestamp: signal.timestamp + 1,
+    bidPrice: 1.992,
+    askPrice: 2.008,
+    bidSize: 100,
+    askSize: 100,
+  });
+  const wide = new OptionSelector(defaultConfig).evaluate(
+    contract, book.get(contract.symbol), signal, signal.timestamp + 1,
+  );
+  assert.ok(wide.rejectionReasons.includes("MORNING_ENTRY_OPTION_SPREAD_TOO_WIDE"));
+
+  const strictMarginConfig = structuredClone(defaultConfig);
+  strictMarginConfig.signals.morningEntryGuard.minCostMarginBps = 10;
+  const lowMargin = new OptionSelector(strictMarginConfig).evaluate(
+    contract, book.get(contract.symbol), signal, signal.timestamp + 1,
+  );
+  assert.ok(lowMargin.rejectionReasons.includes("MORNING_ENTRY_COST_MARGIN_BELOW_MINIMUM"));
+
+  const weakSignal = { ...signal, projectedMoveBps: 1.69 };
+  const weak = new OptionSelector(defaultConfig).evaluate(
+    contract, book.get(contract.symbol), weakSignal, signal.timestamp + 1,
+  );
+  assert.ok(weak.rejectionReasons.includes("MORNING_ENTRY_PROJECTED_MOVE_BELOW_MINIMUM"));
 });
 
 test("late-session option selection requires tighter spread, post-cost margin, and projected movement", () => {
@@ -463,7 +541,7 @@ test("option selection uses an explicit causal decision timestamp", () => {
   book.upsertContract(contract);
   book.updateQuote({
     symbol: contract.symbol, timestamp: signal.timestamp + 100,
-    bidPrice: 1.99, askPrice: 2.01, bidSize: 100, askSize: 100,
+    bidPrice: 1.995, askPrice: 2.005, bidSize: 100, askSize: 100,
   });
   book.updateSnapshot({
     symbol: contract.symbol, timestamp: signal.timestamp,
