@@ -3,7 +3,7 @@ import type { Direction, FeatureSnapshot, RegimeDecision, SignalVote, TradeSigna
 import { inSessionWindow, parseClock, secondsSinceMidnight } from "../utils/time.js";
 import { hashString, stableStringify } from "../utils/statistics.js";
 import { boundedProjectionBps } from "./projection.js";
-import { lateEntryGuardActive } from "./lateEntryGuard.js";
+import { activeStaticEntryGuard, lateEntryGuardActive } from "./lateEntryGuard.js";
 
 export interface SignalDirectionEvaluation {
   direction: Direction;
@@ -251,9 +251,9 @@ export class SignalEngine {
       blockedReasons.push("PROJECTED_MOVE_NOT_DIRECTIONAL");
       return undefined;
     }
-    if (lateEntryGuardActive(this.#config, f.timestamp) &&
-        directionalProjection < this.#config.signals.lateEntryGuard.minProjectedMoveBps) {
-      blockedReasons.push("LATE_ENTRY_PROJECTED_MOVE_BELOW_MINIMUM");
+    const staticEntryGuard = activeStaticEntryGuard(this.#config, f.timestamp);
+    if (staticEntryGuard && directionalProjection < staticEntryGuard.minProjectedMoveBps) {
+      blockedReasons.push(`${staticEntryGuard.reasonPrefix}PROJECTED_MOVE_BELOW_MINIMUM`);
       return undefined;
     }
 

@@ -42,6 +42,17 @@ test("configuration cannot enable later-dated or overnight option trading", () =
   invalidLateSpread.signals.lateEntryGuard.maxOptionSpreadPct =
     defaultConfig.dataQuality.maxOptionSpreadPct + 0.01;
   assert.throws(() => validateConfig(invalidLateSpread), /Late-entry guard thresholds/);
+  const invalidMorningMode = structuredClone(defaultConfig);
+  invalidMorningMode.signals.morningEntryGuard.mode =
+    "INVALID" as typeof invalidMorningMode.signals.morningEntryGuard.mode;
+  assert.throws(() => validateConfig(invalidMorningMode), /Morning-entry guard mode/);
+  const invalidMorningWindow = structuredClone(defaultConfig);
+  invalidMorningWindow.signals.morningEntryGuard.end = "12:01:00";
+  assert.throws(() => validateConfig(invalidMorningWindow), /Morning-entry guard must satisfy/);
+  const invalidMorningSpread = structuredClone(defaultConfig);
+  invalidMorningSpread.signals.morningEntryGuard.maxOptionSpreadPct =
+    defaultConfig.dataQuality.maxOptionSpreadPct + 0.01;
+  assert.throws(() => validateConfig(invalidMorningSpread), /Morning-entry guard thresholds/);
   const invalidShadowCap = structuredClone(defaultConfig);
   invalidShadowCap.risk.entryQualityMaxTradesPerDay = 0;
   assert.throws(() => validateConfig(invalidShadowCap), /Daily entry caps/);

@@ -1,5 +1,5 @@
 {
-  "version": "spy-0dte-entry-quality-4",
+  "version": "spy-0dte-entry-quality-5",
   "symbol": "SPY",
   "timeZone": "America/New_York",
   "session": {
@@ -58,6 +58,14 @@
     "followThroughMinimumBps": 0,
     "followThroughScope": "BULLISH_IMPULSE",
     "shadowFollowThroughScope": "BULLISH_IMPULSE",
+    "morningEntryGuard": {
+      "mode": "ENFORCE",
+      "start": "10:15:00",
+      "end": "12:00:00",
+      "minProjectedMoveBps": 1.7,
+      "minCostMarginBps": 1.0,
+      "maxOptionSpreadPct": 0.0075
+    },
     "lateEntryGuard": {
       "mode": "ENFORCE",
       "start": "12:00:00",

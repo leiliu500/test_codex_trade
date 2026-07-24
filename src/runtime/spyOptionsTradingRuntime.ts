@@ -21,7 +21,7 @@ import { classifyRegime } from "../strategy/regimeClassifier.js";
 import { SpySipReceiver } from "./spySipReceiver.js";
 import { isAtOrAfter, marketDate, parseClock, secondsSinceMidnight, zonedDateTimeToEpoch } from "../utils/time.js";
 import type { DailyRiskState } from "../risk/riskManager.js";
-import { lateEntryGuardAudit } from "../strategy/lateEntryGuard.js";
+import { lateEntryGuardAudit, morningEntryGuardAudit } from "../strategy/lateEntryGuard.js";
 
 export interface SpyOptionsRuntimeClient extends TradingRestClient {
   getLatestSpySipQuote(): Promise<StockQuote>;
@@ -136,9 +136,11 @@ export class SpyOptionsTradingRuntime {
     this.#selector = new OptionSelector(options.config);
     this.#universe = new OptionUniverseManager(options.config);
     this.#signals = new SignalEngine(options.config);
-    if (options.config.signals.lateEntryGuard.mode === "ENFORCE") {
+    if (options.config.signals.lateEntryGuard.mode === "ENFORCE" ||
+        options.config.signals.morningEntryGuard.mode === "ENFORCE") {
       const lateEntryBaselineConfig = structuredClone(options.config);
       lateEntryBaselineConfig.signals.lateEntryGuard.mode = "DISABLED";
+      lateEntryBaselineConfig.signals.morningEntryGuard.mode = "DISABLED";
       this.#lateEntryBaselineSignals = new SignalEngine(lateEntryBaselineConfig);
     }
     if (options.config.signals.shadowFollowThroughScope !== "DISABLED") {
@@ -345,6 +347,8 @@ export class SpyOptionsTradingRuntime {
             directions: [],
             shadowEvaluation: shadowAudit,
             shadowEvaluations,
+            morningEntryGuard: morningEntryGuardAudit(this.#config, feature.timestamp),
+            morningEntryBaseline: lateEntryBaseline,
             lateEntryGuard: lateEntryGuardAudit(this.#config, feature.timestamp),
             lateEntryBaseline,
             feature: entryFeatureSummary(feature),
@@ -369,6 +373,8 @@ export class SpyOptionsTradingRuntime {
           directions: evaluation.directions,
           shadowEvaluation: shadowAudit,
           shadowEvaluations,
+          morningEntryGuard: morningEntryGuardAudit(this.#config, feature.timestamp),
+          morningEntryBaseline: lateEntryBaseline,
           lateEntryGuard: lateEntryGuardAudit(this.#config, feature.timestamp),
           lateEntryBaseline,
           ...(signal ? {
@@ -393,6 +399,7 @@ export class SpyOptionsTradingRuntime {
           kind: signal.kind,
           regime: signal.regime,
           projectedMoveBps: signal.projectedMoveBps,
+          morningEntryGuard: morningEntryGuardAudit(this.#config, signal.timestamp),
           lateEntryGuard: lateEntryGuardAudit(this.#config, signal.timestamp),
           candidate: candidate?.symbol ?? null,
           candidateMetrics: candidate ? {
@@ -445,6 +452,7 @@ export class SpyOptionsTradingRuntime {
           timestamp: this.#now(),
           symbol: candidate.symbol,
           direction: signal.direction,
+          morningEntryGuard: morningEntryGuardAudit(this.#config, signal.timestamp),
           lateEntryGuard: lateEntryGuardAudit(this.#config, signal.timestamp),
           submitted: result.submitted,
           reasons: result.reasons,

@@ -288,7 +288,7 @@ test("end-to-end paper runtime arms SIP/OPRA and routes an eligible signal to a 
   assert.deepEqual([...optionStream.subscribed], [callSymbol]);
 
   await optionStream.quote({
-    symbol: callSymbol, timestamp: now, bidPrice: 1.99, askPrice: 2.01, bidSize: 100, askSize: 100,
+    symbol: callSymbol, timestamp: now, bidPrice: 1.995, askPrice: 2.005, bidSize: 100, askSize: 100,
   });
   await runtime.ingestFeature(bullishFeature());
 
@@ -310,7 +310,10 @@ test("end-to-end paper runtime arms SIP/OPRA and routes an eligible signal to a 
   assert.ok(Array.isArray(evaluation?.data.directions));
   const selection = recorder.events.find((event) => event.type === "live_signal_selection");
   assert.equal(selection?.data.candidate, callSymbol);
-  assert.deepEqual(selection?.data.candidateQuote, { timestamp: now, bidPrice: 1.99, askPrice: 2.01 });
+  assert.deepEqual(selection?.data.candidateQuote, { timestamp: now, bidPrice: 1.995, askPrice: 2.005 });
+  assert.equal((evaluation?.data.morningEntryGuard as Record<string, unknown>).active, true);
+  assert.equal((evaluation?.data.morningEntryGuard as Record<string, unknown>).followThrough, "DISABLED");
+  assert.equal((evaluation?.data.morningEntryBaseline as Record<string, unknown>).decision, "SIGNAL");
   assert.equal(typeof (selection?.data.candidateMetrics as Record<string, unknown> | undefined)?.spreadPct, "number");
   const orderRequest = recorder.events.find((event) => event.type === "broker_order_request");
   assert.equal(orderRequest?.data.signalId, selection?.data.signalId);
@@ -417,7 +420,7 @@ test("shadow confirmation observes a pending candidate without delaying the pape
   });
   await runtime.start();
   await optionStream.quote({
-    symbol: callSymbol, timestamp: now, bidPrice: 1.99, askPrice: 2.01, bidSize: 100, askSize: 100,
+    symbol: callSymbol, timestamp: now, bidPrice: 1.995, askPrice: 2.005, bidSize: 100, askSize: 100,
   });
   await runtime.ingestFeature(bullishFeature());
   assert.equal(client.requests.length, 1);
@@ -549,7 +552,7 @@ test("enforced opt-in waits for causal follow-through before submitting an entry
   });
   await runtime.start();
   await optionStream.quote({
-    symbol: callSymbol, timestamp: decisionTime, bidPrice: 1.99, askPrice: 2.01, bidSize: 100, askSize: 100,
+    symbol: callSymbol, timestamp: decisionTime, bidPrice: 1.995, askPrice: 2.005, bidSize: 100, askSize: 100,
   });
   await runtime.ingestFeature(bullishFeature());
   assert.equal(client.requests.length, 0);
@@ -558,7 +561,7 @@ test("enforced opt-in waits for causal follow-through before submitting an entry
   decisionTime += defaultConfig.signals.followThroughMinSec * 1000;
   client.clock.timestamp = decisionTime;
   await optionStream.quote({
-    symbol: callSymbol, timestamp: decisionTime, bidPrice: 1.99, askPrice: 2.01, bidSize: 100, askSize: 100,
+    symbol: callSymbol, timestamp: decisionTime, bidPrice: 1.995, askPrice: 2.005, bidSize: 100, askSize: 100,
   });
   await runtime.ingestFeature({
     ...bullishFeature(), timestamp: decisionTime, price: 501.02, mid: 501.02,

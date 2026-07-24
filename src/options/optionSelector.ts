@@ -6,7 +6,7 @@ import { blackScholes, impliedVolatility } from "./blackScholes.js";
 import { evaluateOptionCost, gammaAwareProjectedOptionMove } from "./costGate.js";
 import type { OptionBook, OptionBookEntry } from "./optionBook.js";
 import { sameDaySpyOptionContractReasons } from "./tradingInvariants.js";
-import { lateEntryGuardActive } from "../strategy/lateEntryGuard.js";
+import { activeStaticEntryGuard } from "../strategy/lateEntryGuard.js";
 
 export interface SelectionResult {
   selected?: OptionCandidateEvaluation;
@@ -61,11 +61,11 @@ export class OptionSelector {
     const quote = entry?.quote;
     const mid = quote ? (quote.bidPrice + quote.askPrice) / 2 : undefined;
     const spreadPct = quote && mid ? (quote.askPrice - quote.bidPrice) / mid : undefined;
-    const lateGuardActive = lateEntryGuardActive(this.#config, signal.timestamp);
+    const staticEntryGuard = activeStaticEntryGuard(this.#config, signal.timestamp);
     if (mid !== undefined && (mid < this.#config.options.minOptionMid || mid > this.#config.options.maxOptionMid)) rejectionReasons.push("MIDPOINT_OUTSIDE_RANGE");
-    if (lateGuardActive && spreadPct !== undefined &&
-        spreadPct > this.#config.signals.lateEntryGuard.maxOptionSpreadPct) {
-      rejectionReasons.push("LATE_ENTRY_OPTION_SPREAD_TOO_WIDE");
+    if (staticEntryGuard && spreadPct !== undefined &&
+        spreadPct > staticEntryGuard.maxOptionSpreadPct) {
+      rejectionReasons.push(`${staticEntryGuard.reasonPrefix}OPTION_SPREAD_TOO_WIDE`);
     }
     if ((entry?.snapshot?.dailyVolume ?? -Infinity) < this.#config.options.minDailyVolume) rejectionReasons.push("INSUFFICIENT_DAILY_VOLUME");
     if ((entry?.snapshot?.openInterest ?? -Infinity) < this.#config.options.minOpenInterest) rejectionReasons.push("INSUFFICIENT_OPEN_INTEREST");
@@ -103,12 +103,12 @@ export class OptionSelector {
         this.#config.options.slippagePerSidePctOfSpread, this.#config.signals.costMultiplier,
       );
       if (!cost.passes) rejectionReasons.push("PROJECTED_MOVE_FAILS_COST_GATE");
-      if (lateGuardActive && cost.costMarginBps < this.#config.signals.lateEntryGuard.minCostMarginBps) {
-        rejectionReasons.push("LATE_ENTRY_COST_MARGIN_BELOW_MINIMUM");
+      if (staticEntryGuard && cost.costMarginBps < staticEntryGuard.minCostMarginBps) {
+        rejectionReasons.push(`${staticEntryGuard.reasonPrefix}COST_MARGIN_BELOW_MINIMUM`);
       }
     }
-    if (lateGuardActive && signal.projectedMoveBps < this.#config.signals.lateEntryGuard.minProjectedMoveBps) {
-      rejectionReasons.push("LATE_ENTRY_PROJECTED_MOVE_BELOW_MINIMUM");
+    if (staticEntryGuard && signal.projectedMoveBps < staticEntryGuard.minProjectedMoveBps) {
+      rejectionReasons.push(`${staticEntryGuard.reasonPrefix}PROJECTED_MOVE_BELOW_MINIMUM`);
     }
     const eligible = rejectionReasons.length === 0;
     const liquidity = 0.12 * (
