@@ -4,6 +4,7 @@ import { decode, encode } from "@msgpack/msgpack";
 
 export interface OptionStreamHandlers {
   onQuote(quote: OptionQuote): void | Promise<void>;
+  onQuotes?(quotes: readonly OptionQuote[]): void | Promise<void>;
   onState?(connected: boolean): void;
   onError?(error: unknown): void;
 }
@@ -27,8 +28,12 @@ export interface AlpacaOptionStreamConfig {
 export class AlpacaOptionWebSocket implements OptionStream {
   readonly #config: Required<Omit<AlpacaOptionStreamConfig, "url">> & { url: string };
   readonly #symbols = new Set<string>();
+  readonly #pendingQuotes: OptionQuote[] = [];
   #socket: WebSocket | undefined;
+  #handlers: OptionStreamHandlers | undefined;
   #authenticated = false;
+  #dispatching = false;
+  #dispatchTail: Promise<void> = Promise.resolve();
 
   constructor(config: AlpacaOptionStreamConfig) {
     const feed = config.feed ?? "indicative";
@@ -56,6 +61,7 @@ export class AlpacaOptionWebSocket implements OptionStream {
 
   connect(handlers: OptionStreamHandlers): Promise<void> {
     if (this.#socket) throw new Error("Option stream is already connected");
+    this.#handlers = handlers;
     return new Promise((resolve, reject) => {
       let settled = false;
       const socket = new WebSocket(this.#config.url, {
@@ -87,6 +93,7 @@ export class AlpacaOptionWebSocket implements OptionStream {
         try {
           const binary = data instanceof ArrayBuffer ? new Uint8Array(data) : new Uint8Array(data as Buffer);
           const decoded = decode(binary) as Array<Record<string, unknown>>;
+          const quotes: OptionQuote[] = [];
           for (const message of decoded) {
             if (message.T === "success" && message.msg === "authenticated") {
               this.#authenticated = true;
@@ -99,9 +106,10 @@ export class AlpacaOptionWebSocket implements OptionStream {
                 throw new Error(`${this.#config.feed.toUpperCase()} option subscription acknowledgement is missing ${missing.length} symbols`);
               }
               resolveOnce();
-            } else if (message.T === "q") void handlers.onQuote(adaptAlpacaOptionQuote(message));
+            } else if (message.T === "q") quotes.push(adaptAlpacaOptionQuote(message));
             else if (message.T === "error") throw new Error(`Alpaca option stream error ${String(message.code)}: ${String(message.msg)}`);
           }
+          if (quotes.length > 0) this.#enqueueQuotes(quotes);
         } catch (error) {
           handlers.onError?.(error);
           rejectOnce(error);
@@ -123,8 +131,36 @@ export class AlpacaOptionWebSocket implements OptionStream {
 
   async close(): Promise<void> {
     const socket = this.#socket;
-    if (!socket) return;
-    await new Promise<void>((resolve) => { socket.once("close", () => resolve()); socket.close(); });
+    if (socket) {
+      await new Promise<void>((resolve) => { socket.once("close", () => resolve()); socket.close(); });
+    }
+    await this.#dispatchTail;
+  }
+
+  #enqueueQuotes(quotes: readonly OptionQuote[]): void {
+    this.#pendingQuotes.push(...quotes);
+    if (this.#dispatching) return;
+    this.#dispatching = true;
+    this.#dispatchTail = this.#drainQuotes();
+  }
+
+  async #drainQuotes(): Promise<void> {
+    try {
+      while (this.#pendingQuotes.length > 0) {
+        const quotes = this.#pendingQuotes.splice(0);
+        const handlers = this.#handlers;
+        if (!handlers) continue;
+        if (handlers.onQuotes) await handlers.onQuotes(quotes);
+        else for (const quote of quotes) await handlers.onQuote(quote);
+      }
+    } catch (error) {
+      this.#pendingQuotes.length = 0;
+      this.#handlers?.onError?.(error);
+      this.#socket?.close();
+    } finally {
+      this.#dispatching = false;
+      if (this.#pendingQuotes.length > 0) this.#enqueueQuotes([]);
+    }
   }
 
   #send(message: Record<string, unknown>): void {

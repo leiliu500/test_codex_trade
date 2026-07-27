@@ -82,6 +82,14 @@ test("dashboard starts a new empty display day at 10 PM Pacific without restorin
     symbol: "SPY",
     data: { bidPrice: 500, askPrice: 500.01 },
   });
+  dashboard.recordMarketEvents([{
+    type: "stock_trade",
+    providerTimestamp: beforeRollover,
+    receivedTimestamp: beforeRollover,
+    marketDate: "2026-07-22",
+    symbol: "SPY",
+    data: { price: 500.005, size: 10 },
+  }]);
   let snapshot = dashboard.snapshot();
   assert.equal(dashboardDisplayDate(beforeRollover), "2026-07-22");
   assert.equal(nextDashboardDisplayRollover(beforeRollover), rollover);
@@ -89,7 +97,7 @@ test("dashboard starts a new empty display day at 10 PM Pacific without restorin
   assert.equal(snapshot.displayTimeZone, "America/Los_Angeles");
   assert.equal(snapshot.nextDisplayRolloverAt, rollover);
   assert.equal(snapshot.signals.length, 1);
-  assert.equal(snapshot.liveData.totalEvents, 1);
+  assert.equal(snapshot.liveData.totalEvents, 2);
 
   now = rollover;
   snapshot = dashboard.snapshot();

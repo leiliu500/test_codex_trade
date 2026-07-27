@@ -70,6 +70,10 @@ class FakeOptionStream implements OptionStream {
     this.handlers?.onState?.(false);
   }
   async quote(quote: OptionQuote): Promise<void> { await this.handlers?.onQuote(quote); }
+  async quotes(quotes: readonly OptionQuote[]): Promise<void> {
+    if (this.handlers?.onQuotes) await this.handlers.onQuotes(quotes);
+    else for (const quote of quotes) await this.handlers?.onQuote(quote);
+  }
 }
 
 class FakeHistory implements MarketHistorySink {
@@ -92,6 +96,7 @@ class FakeRuntimeClient implements SpyOptionsRuntimeClient {
   clock = { timestamp: now, isOpen: true };
   latestQuoteCalls = 0;
   listContractCalls = 0;
+  contractListGate: Promise<void> | undefined;
   async getAccount(): Promise<AccountState> { return { ...this.account }; }
   async getMarketClock(): Promise<{ timestamp: number; isOpen: boolean }> { return { ...this.clock }; }
   async getLatestSpySipQuote(): Promise<StockQuote> {
@@ -100,6 +105,7 @@ class FakeRuntimeClient implements SpyOptionsRuntimeClient {
   }
   async listOptionContracts(): Promise<OptionContract[]> {
     this.listContractCalls += 1;
+    await this.contractListGate;
     return [{ ...this.contract }];
   }
   async getOptionSnapshots(symbols: readonly string[]): Promise<OptionSnapshot[]> {
@@ -323,6 +329,70 @@ test("end-to-end paper runtime arms SIP/OPRA and routes an eligible signal to a 
   assert.equal(riskRecovery?.data.shadowMaxTradesPerDay, defaultConfig.risk.entryQualityMaxTradesPerDay);
   await runtime.close();
   assert.deepEqual(history.priorityChanges.at(-1), []);
+});
+
+test("slow option-universe refresh does not block causal SIP feature evaluation", async () => {
+  let decisionTime = now;
+  const client = new FakeRuntimeClient();
+  const recorder = new MemoryRecorder();
+  const runtime = new SpyOptionsTradingRuntime({
+    config: defaultConfig,
+    client,
+    stockStream: new FakeStockStream(),
+    optionStream: new FakeOptionStream(),
+    executionEnabled: true,
+    executionMode: "paper",
+    now: () => decisionTime,
+    executionTickMs: 60_000,
+    recorder,
+  });
+  await runtime.start();
+
+  let releaseRefresh!: () => void;
+  client.contractListGate = new Promise<void>((resolve) => { releaseRefresh = resolve; });
+  decisionTime += defaultConfig.options.chainRefreshSec * 1_000 + 1;
+  const evaluation = runtime.ingestFeature({ ...bullishFeature(), timestamp: decisionTime });
+  await Promise.race([
+    evaluation,
+    new Promise<never>((_resolve, reject) =>
+      setTimeout(() => reject(new Error("Feature evaluation waited for option-universe REST I/O")), 250)),
+  ]);
+
+  assert.equal(client.listContractCalls, 2);
+  assert.ok(recorder.events.some((event) =>
+    event.type === "live_entry_evaluation" && event.timestamp === decisionTime));
+  releaseRefresh();
+  await waitFor(() => client.contractListGate !== undefined && runtime.healthState().subscribedOptionContracts > 0);
+  await runtime.close();
+});
+
+test("OPRA quote bursts update the option book through one causal batch without dropping history", async () => {
+  const client = new FakeRuntimeClient();
+  const optionStream = new FakeOptionStream();
+  const history = new FakeHistory();
+  const runtime = new SpyOptionsTradingRuntime({
+    config: defaultConfig,
+    client,
+    stockStream: new FakeStockStream(),
+    optionStream,
+    executionEnabled: true,
+    executionMode: "paper",
+    now: () => now,
+    executionTickMs: 60_000,
+    history,
+    recorder: new MemoryRecorder(),
+  });
+  await runtime.start();
+  const before = runtime.healthState().receivedOptionQuotes ?? 0;
+  await optionStream.quotes([
+    { symbol: callSymbol, timestamp: now - 2, bidPrice: 1.99, askPrice: 2.01, bidSize: 10, askSize: 12 },
+    { symbol: callSymbol, timestamp: now - 1, bidPrice: 2, askPrice: 2.02, bidSize: 11, askSize: 13 },
+    { symbol: callSymbol, timestamp: now, bidPrice: 2.01, askPrice: 2.03, bidSize: 12, askSize: 14 },
+  ]);
+
+  assert.equal(runtime.healthState().receivedOptionQuotes, before + 3);
+  assert.equal(history.events.filter((event) => event.type === "option_quote").length, 3);
+  await runtime.close();
 });
 
 test("restart restoration deduplicates partial entry fills and preserves the daily cap", () => {

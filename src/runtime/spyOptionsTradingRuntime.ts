@@ -1,6 +1,7 @@
 import type { EngineConfig, FollowThroughScope } from "../config.js";
 import type { OptionStream } from "../alpaca/optionStream.js";
 import type { StockStream } from "../alpaca/stockStream.js";
+import type { StockStreamEvent } from "../alpaca/stockStream.js";
 import type { TradingRestClient } from "../alpaca/restClient.js";
 import type {
   AccountState, FeatureSnapshot, OptionContract, OptionQuote, RegimeDecision, StockQuote,
@@ -97,6 +98,7 @@ export class SpyOptionsTradingRuntime {
   #marketOpen = false;
   #marketDataIdle = false;
   #marketDataTransition: Promise<void> = Promise.resolve();
+  #universeRefreshInFlight: Promise<void> | undefined;
   #lastSpot: number | undefined;
   #lastFeature: FeatureSnapshot | undefined;
   #lastRegime: RegimeDecision | undefined;
@@ -174,8 +176,7 @@ export class SpyOptionsTradingRuntime {
       config: options.config,
       stream: options.stockStream,
       now: this.#now,
-      onStockQuote: (quote) => this.#onStockQuote(quote),
-      onStockTrade: (trade) => this.#recordHistory("stock_trade", trade.timestamp, trade.symbol, { ...trade }),
+      onStockEvents: (events) => this.#onStockEvents(events),
       onFeature: (feature) => this.ingestFeature(feature),
       onError: (error) => this.#recordError(error),
       ...(options.restoredFeatureCheckpoint ? { featureCheckpoint: options.restoredFeatureCheckpoint } : {}),
@@ -233,7 +234,7 @@ export class SpyOptionsTradingRuntime {
       if (clock.isOpen) {
         const latestQuote = await this.#client.getLatestSpySipQuote();
         this.#lastSpot = (latestQuote.bidPrice + latestQuote.askPrice) / 2;
-        await this.#refreshUniverse(this.#lastSpot, clock.timestamp, true);
+        await this.#startUniverseRefresh(this.#lastSpot, clock.timestamp, true);
         const streamStarts = await Promise.allSettled([this.#connectOptionStream()]);
         for (const result of streamStarts) {
           if (result.status === "rejected") this.#recordError(result.reason);
@@ -299,6 +300,7 @@ export class SpyOptionsTradingRuntime {
     this.#tickTimer = undefined;
     this.#optionReconnectTimer = undefined;
     await this.#marketDataTransition;
+    await Promise.allSettled(this.#universeRefreshInFlight ? [this.#universeRefreshInFlight] : []);
     await Promise.allSettled([this.#stockReceiver.close(), this.#optionStream.close()]);
     await this.#queue.drained();
     this.#optionConnected = false;
@@ -314,7 +316,7 @@ export class SpyOptionsTradingRuntime {
         this.#lastSpot = feature.price;
         this.#lastRegime = classifyRegime(feature, this.#config.regimes);
         this.#updateStrategyState(feature);
-        await this.#refreshUniverse(feature.price, this.#now());
+        this.#scheduleUniverseRefresh(feature.price, this.#now());
         await this.#tickExecution(this.#now());
         const shadowEvaluations = Object.fromEntries([...this.#shadowSignals.entries()].map(([scope, engine]) => [
           scope,
@@ -601,13 +603,20 @@ export class SpyOptionsTradingRuntime {
       : "INCOMPLETE_SESSION_STATE";
   }
 
-  async #onStockQuote(quote: StockQuote): Promise<void> {
+  async #onStockEvents(events: readonly StockStreamEvent[]): Promise<void> {
     try {
       await this.#queue.enqueue(async () => {
         if (this.#marketDataIdle || !this.#marketOpen) return;
-        this.#recordHistory("stock_quote", quote.timestamp, quote.symbol, { ...quote });
-        this.#lastSpot = (quote.bidPrice + quote.askPrice) / 2;
-        await this.#refreshUniverse(this.#lastSpot, this.#now());
+        this.#recordStockHistory(events);
+        let latestQuote: Extract<StockStreamEvent, { type: "quote" }> | undefined;
+        for (let index = events.length - 1; index >= 0; index -= 1) {
+          const event = events[index]!;
+          if (event.type === "quote") { latestQuote = event; break; }
+        }
+        if (latestQuote) {
+          this.#lastSpot = (latestQuote.value.bidPrice + latestQuote.value.askPrice) / 2;
+          this.#scheduleUniverseRefresh(this.#lastSpot, this.#now());
+        }
       });
     } catch (error) {
       this.#recordError(error);
@@ -615,41 +624,75 @@ export class SpyOptionsTradingRuntime {
   }
 
   async #onOptionQuote(quote: OptionQuote): Promise<void> {
+    await this.#onOptionQuotes([quote]);
+  }
+
+  async #onOptionQuotes(quotes: readonly OptionQuote[]): Promise<void> {
     try {
       await this.#queue.enqueue(async () => {
         if (this.#marketDataIdle || !this.#marketOpen) return;
-        this.#recordHistory("option_quote", quote.timestamp, quote.symbol, { ...quote });
-        this.#optionQuoteCount += 1;
-        this.#lastOptionQuoteTimestamp = quote.timestamp;
-        if (!this.#book.updateQuote(quote)) this.#rejectedOptionQuotes += 1;
-        await this.#tickExecution(this.#now(), quote);
+        this.#recordOptionHistory(quotes);
+        let activeSymbol = this.#execution.position?.symbol ?? this.#execution.pending?.order.symbol;
+        for (const quote of quotes) {
+          this.#optionQuoteCount += 1;
+          this.#lastOptionQuoteTimestamp = Math.max(this.#lastOptionQuoteTimestamp ?? -Infinity, quote.timestamp);
+          if (!this.#book.updateQuote(quote)) {
+            this.#rejectedOptionQuotes += 1;
+            continue;
+          }
+          if (activeSymbol === quote.symbol) {
+            await this.#tickExecution(this.#now(), quote);
+            activeSymbol = this.#execution.position?.symbol ?? this.#execution.pending?.order.symbol;
+          }
+        }
       });
     } catch (error) {
       this.#recordError(error);
     }
   }
 
-  async #refreshUniverse(spot: number, timestamp: number, force = false): Promise<void> {
+  #scheduleUniverseRefresh(spot: number, timestamp: number): void {
+    void this.#startUniverseRefresh(spot, timestamp).catch((error: unknown) => this.#recordError(error));
+  }
+
+  #startUniverseRefresh(spot: number, timestamp: number, force = false): Promise<void> {
+    if (this.#universeRefreshInFlight) return this.#universeRefreshInFlight;
+    if (this.#marketDataIdle || !this.#marketOpen ||
+        (!force && !this.#universe.shouldRefresh(timestamp))) return Promise.resolve();
+    const refresh = this.#refreshUniverse(spot, timestamp);
+    this.#universeRefreshInFlight = refresh;
+    void refresh.finally(() => {
+      if (this.#universeRefreshInFlight === refresh) this.#universeRefreshInFlight = undefined;
+    }).catch(() => undefined);
+    return refresh;
+  }
+
+  async #refreshUniverse(spot: number, timestamp: number): Promise<void> {
     if (this.#marketDataIdle || !this.#marketOpen) return;
-    if (!force && !this.#universe.shouldRefresh(timestamp)) return;
     const contracts = await this.#client.listOptionContracts();
+    if (this.#stopping || this.#marketDataIdle || !this.#marketOpen) return;
+    const nextSymbols = new Set(this.#universe.plan(contracts, spot, timestamp));
+    const snapshots = nextSymbols.size > 0
+      ? await this.#client.getOptionSnapshots([...nextSymbols])
+      : [];
+    if (this.#stopping || this.#marketDataIdle || !this.#marketOpen) return;
+
+    const remove = [...this.#subscribedSymbols].filter((symbol) => !nextSymbols.has(symbol));
+    const add = [...nextSymbols].filter((symbol) => !this.#subscribedSymbols.has(symbol));
+    const subscriptionUpdates: Promise<void>[] = [];
+    if (remove.length > 0) subscriptionUpdates.push(this.#optionStream.unsubscribe(remove));
+    if (add.length > 0) subscriptionUpdates.push(this.#optionStream.subscribe(add));
+
     this.#contracts = contracts;
     for (const contract of contracts) {
       this.#book.upsertContract(contract);
       this.#recordHistory("option_contract", timestamp, contract.symbol, { ...contract });
     }
-    const nextSymbols = new Set(this.#universe.refresh(contracts, spot, timestamp));
-    const remove = [...this.#subscribedSymbols].filter((symbol) => !nextSymbols.has(symbol));
-    const add = [...nextSymbols].filter((symbol) => !this.#subscribedSymbols.has(symbol));
-    if (remove.length > 0) await this.#optionStream.unsubscribe(remove);
-    if (add.length > 0) await this.#optionStream.subscribe(add);
+    this.#universe.commitRefresh(this.#now());
     this.#subscribedSymbols = nextSymbols;
-    if (nextSymbols.size > 0) {
-      const snapshots = await this.#client.getOptionSnapshots([...nextSymbols]);
-      for (const snapshot of snapshots) {
-        this.#book.updateSnapshot(snapshot);
-        this.#recordHistory("option_snapshot", snapshot.timestamp ?? timestamp, snapshot.symbol, { ...snapshot });
-      }
+    for (const snapshot of snapshots) {
+      this.#book.updateSnapshot(snapshot);
+      this.#recordHistory("option_snapshot", snapshot.timestamp ?? timestamp, snapshot.symbol, { ...snapshot });
     }
     this.#emit("option_universe_refreshed", {
       contractCount: contracts.length,
@@ -657,6 +700,7 @@ export class SpyOptionsTradingRuntime {
       added: add.length,
       removed: remove.length,
     });
+    await Promise.all(subscriptionUpdates);
   }
 
   #scheduleExecutionTick(): void {
@@ -673,6 +717,7 @@ export class SpyOptionsTradingRuntime {
   async #connectOptionStream(): Promise<void> {
     await this.#optionStream.connect({
       onQuote: (quote) => this.#onOptionQuote(quote),
+      onQuotes: (quotes) => this.#onOptionQuotes(quotes),
       onState: (connected) => {
         this.#optionConnected = connected;
         if (connected) {
@@ -763,7 +808,7 @@ export class SpyOptionsTradingRuntime {
     const latestQuote = await this.#client.getLatestSpySipQuote();
     this.#lastSpot = (latestQuote.bidPrice + latestQuote.askPrice) / 2;
     await this.#stockReceiver.start();
-    await this.#refreshUniverse(this.#lastSpot, timestamp, true);
+    await this.#startUniverseRefresh(this.#lastSpot, timestamp, true);
     try {
       await this.#connectOptionStream();
     } catch (error) {
@@ -832,6 +877,38 @@ export class SpyOptionsTradingRuntime {
       symbol,
       data,
     });
+  }
+
+  #recordStockHistory(events: readonly StockStreamEvent[]): void {
+    if (!this.#history || events.length === 0) return;
+    const receivedTimestamp = this.#now();
+    const date = marketDate(receivedTimestamp, this.#config.timeZone);
+    const historyEvents: HistoricalMarketEvent[] = events.map((event) => ({
+      type: event.type === "quote" ? "stock_quote" : "stock_trade",
+      providerTimestamp: event.value.timestamp,
+      receivedTimestamp,
+      marketDate: date,
+      symbol: event.value.symbol,
+      data: { ...event.value },
+    }));
+    if (this.#history.recordMarketEvents) this.#history.recordMarketEvents(historyEvents);
+    else for (const event of historyEvents) this.#history.recordMarketEvent(event);
+  }
+
+  #recordOptionHistory(quotes: readonly OptionQuote[]): void {
+    if (!this.#history || quotes.length === 0) return;
+    const receivedTimestamp = this.#now();
+    const date = marketDate(receivedTimestamp, this.#config.timeZone);
+    const historyEvents: HistoricalMarketEvent[] = quotes.map((quote) => ({
+      type: "option_quote",
+      providerTimestamp: quote.timestamp,
+      receivedTimestamp,
+      marketDate: date,
+      symbol: quote.symbol,
+      data: { ...quote },
+    }));
+    if (this.#history.recordMarketEvents) this.#history.recordMarketEvents(historyEvents);
+    else for (const event of historyEvents) this.#history.recordMarketEvent(event);
   }
 
   #emit(type: string, data: Record<string, unknown>): void { this.#onEvent?.(type, data); }
