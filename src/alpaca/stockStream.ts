@@ -4,9 +4,14 @@ import WebSocket, { type RawData } from "ws";
 export interface StockStreamHandlers {
   onQuote(quote: StockQuote): void | Promise<void>;
   onTrade(trade: StockTrade): void | Promise<void>;
+  onEvents?(events: readonly StockStreamEvent[]): void | Promise<void>;
   onState?(connected: boolean): void;
   onError?(error: unknown): void;
 }
+
+export type StockStreamEvent =
+  | { type: "quote"; value: StockQuote }
+  | { type: "trade"; value: StockTrade };
 
 export interface StockStream {
   connect(handlers: StockStreamHandlers): Promise<void>;
@@ -26,6 +31,9 @@ export class AlpacaStockWebSocket implements StockStream {
   readonly #config: Required<Omit<AlpacaStockStreamConfig, "url">> & { url: string };
   #socket: WebSocket | undefined;
   #handlers: StockStreamHandlers | undefined;
+  readonly #pendingEvents: StockStreamEvent[] = [];
+  #dispatching = false;
+  #dispatchTail: Promise<void> = Promise.resolve();
 
   constructor(config: AlpacaStockStreamConfig) {
     const feed = config.feed ?? "iex";
@@ -71,6 +79,7 @@ export class AlpacaStockWebSocket implements StockStream {
       socket.on("message", (data: RawData) => {
         try {
           const messages = JSON.parse(data.toString()) as Array<Record<string, unknown>>;
+          const events: StockStreamEvent[] = [];
           for (const message of messages) {
             if (message.T === "success" && message.msg === "authenticated") {
               socket.send(JSON.stringify({
@@ -83,10 +92,11 @@ export class AlpacaStockWebSocket implements StockStream {
                 throw new Error(`SPY ${this.#config.feed.toUpperCase()} subscription acknowledgement is incomplete`);
               }
               resolveOnce();
-            } else if (message.T === "q") void handlers.onQuote(adaptAlpacaStockQuote(message));
-            else if (message.T === "t") void handlers.onTrade(adaptAlpacaStockTrade(message));
+            } else if (message.T === "q") events.push({ type: "quote", value: adaptAlpacaStockQuote(message) });
+            else if (message.T === "t") events.push({ type: "trade", value: adaptAlpacaStockTrade(message) });
             else if (message.T === "error") throw new Error(`Alpaca stock stream error ${String(message.code)}: ${String(message.msg)}`);
           }
+          if (events.length > 0) this.#enqueueEvents(events);
         } catch (error) {
           handlers.onError?.(error);
           rejectOnce(error);
@@ -106,11 +116,45 @@ export class AlpacaStockWebSocket implements StockStream {
 
   async close(): Promise<void> {
     const socket = this.#socket;
-    if (!socket) return;
-    await new Promise<void>((resolve) => {
-      socket.once("close", () => resolve());
-      socket.close();
-    });
+    if (socket) {
+      await new Promise<void>((resolve) => {
+        socket.once("close", () => resolve());
+        socket.close();
+      });
+    }
+    await this.#dispatchTail;
+  }
+
+  #enqueueEvents(events: readonly StockStreamEvent[]): void {
+    this.#pendingEvents.push(...events);
+    if (this.#dispatching) return;
+    this.#dispatching = true;
+    this.#dispatchTail = this.#drainEvents();
+  }
+
+  async #drainEvents(): Promise<void> {
+    try {
+      while (this.#pendingEvents.length > 0) {
+        const events = this.#pendingEvents.splice(0);
+        const handlers = this.#handlers;
+        if (!handlers) continue;
+        if (handlers.onEvents) {
+          await handlers.onEvents(events);
+          continue;
+        }
+        for (const event of events) {
+          if (event.type === "quote") await handlers.onQuote(event.value);
+          else await handlers.onTrade(event.value);
+        }
+      }
+    } catch (error) {
+      this.#pendingEvents.length = 0;
+      this.#handlers?.onError?.(error);
+      this.#socket?.close();
+    } finally {
+      this.#dispatching = false;
+      if (this.#pendingEvents.length > 0) this.#enqueueEvents([]);
+    }
   }
 }
 

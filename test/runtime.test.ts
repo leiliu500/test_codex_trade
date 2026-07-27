@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import type { AddressInfo } from "node:net";
 import { readEnvironment } from "../src/utils/env.js";
 import { healthReadiness, startHealthServer, type HealthState } from "../src/ops/healthServer.js";
-import type { StockStream, StockStreamHandlers } from "../src/alpaca/stockStream.js";
+import type { StockStream, StockStreamEvent, StockStreamHandlers } from "../src/alpaca/stockStream.js";
 import type { StockQuote, StockTrade } from "../src/types.js";
 import { SpySipReceiver } from "../src/runtime/spySipReceiver.js";
 import { defaultConfig } from "../src/config.js";
@@ -99,6 +99,15 @@ class FakeStockStream implements StockStream {
   async close(): Promise<void> { this.handlers?.onState?.(false); }
   async quote(value: StockQuote): Promise<void> { await this.handlers?.onQuote(value); }
   async trade(value: StockTrade): Promise<void> { await this.handlers?.onTrade(value); }
+  async events(values: readonly StockStreamEvent[]): Promise<void> {
+    if (this.handlers?.onEvents) await this.handlers.onEvents(values);
+    else {
+      for (const event of values) {
+        if (event.type === "quote") await this.handlers?.onQuote(event.value);
+        else await this.handlers?.onTrade(event.value);
+      }
+    }
+  }
 }
 
 test("SPY SIP receiver serializes quotes and trades into completed feature bars", async () => {
@@ -128,6 +137,49 @@ test("SPY SIP receiver serializes quotes and trades into completed feature bars"
   assert.equal(health.completedBars, 1);
   assert.equal(health.lastFeatureTimestamp, start + 1_000);
   assert.equal(health.brokerAvailable, false);
+  await receiver.close();
+});
+
+test("SPY SIP receiver processes burst events in causal batches without dropping feature inputs", async () => {
+  const stream = new FakeStockStream();
+  const start = Date.parse("2026-07-22T14:30:00Z");
+  const callbackBatchSizes: number[] = [];
+  const callbackOrder: string[] = [];
+  const receiver = new SpySipReceiver({
+    config: defaultConfig,
+    stream,
+    now: () => start + 3_000,
+    flushIntervalMs: 60_000,
+    onStockEvents: (events) => {
+      callbackBatchSizes.push(events.length);
+      callbackOrder.push(`raw:${events.length}`);
+    },
+    onFeature: (feature) => { callbackOrder.push(`feature:${feature.timestamp - start}`); },
+  });
+  await receiver.start();
+  await stream.events([
+    { type: "quote", value: {
+      symbol: "SPY", timestamp: start + 100, bidPrice: 500, askPrice: 500.01, bidSize: 100, askSize: 120,
+    } },
+    { type: "quote", value: {
+      symbol: "SPY", timestamp: start + 200, bidPrice: 500.01, askPrice: 500.02, bidSize: 110, askSize: 100,
+    } },
+    { type: "trade", value: {
+      symbol: "SPY", timestamp: start + 250, price: 500.015, size: 50,
+    } },
+    { type: "quote", value: {
+      symbol: "SPY", timestamp: start + 1_100, bidPrice: 500.02, askPrice: 500.03, bidSize: 120, askSize: 90,
+    } },
+    { type: "quote", value: {
+      symbol: "SPY", timestamp: start + 2_100, bidPrice: 500.03, askPrice: 500.04, bidSize: 130, askSize: 80,
+    } },
+  ]);
+
+  assert.deepEqual(callbackBatchSizes, [3, 1, 1]);
+  assert.deepEqual(callbackOrder, ["raw:3", "feature:1000", "raw:1", "feature:2000", "raw:1"]);
+  assert.equal(receiver.healthState().receivedStockQuotes, 4);
+  assert.equal(receiver.healthState().receivedStockTrades, 1);
+  assert.equal(receiver.healthState().completedBars, 2);
   await receiver.close();
 });
 

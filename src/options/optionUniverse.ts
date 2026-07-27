@@ -40,8 +40,12 @@ export class OptionUniverseManager {
   }
   releaseClosedPosition(symbol: string): void { this.#retained.delete(symbol); }
   shouldRefresh(now: number): boolean { return now - this.#lastRefresh >= this.#config.options.chainRefreshSec * 1000; }
+  plan(contracts: readonly OptionContract[], spot: number, now: number): string[] {
+    return chooseSubscriptions(contracts, spot, now, this.#config, this.#retained);
+  }
+  commitRefresh(now: number): void { this.#lastRefresh = now; }
   refresh(contracts: readonly OptionContract[], spot: number, now: number): string[] {
     this.#lastRefresh = now;
-    return chooseSubscriptions(contracts, spot, now, this.#config, this.#retained);
+    return this.plan(contracts, spot, now);
   }
 }

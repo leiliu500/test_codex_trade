@@ -196,13 +196,9 @@ test("PostgreSQL history samples quote baselines but preserves priority option q
     symbol: "SPY260722C00500000",
     data: { bidPrice: 2, askPrice: 2.01 },
   });
-  store.recordMarketEvent(quote(1_000));
-  store.recordMarketEvent(quote(1_100));
-  store.recordMarketEvent(quote(1_249));
-  store.recordMarketEvent(quote(1_250));
+  store.recordMarketEvents([quote(1_000), quote(1_100), quote(1_249), quote(1_250)]);
   store.setPrioritySymbols(new Set(["SPY260722C00500000"]));
-  store.recordMarketEvent(quote(1_251));
-  store.recordMarketEvent(quote(1_252));
+  store.recordMarketEvents([quote(1_251), quote(1_252)]);
   store.setPrioritySymbols(new Set());
   store.recordMarketEvent(quote(1_300));
   store.recordMarketEvent({

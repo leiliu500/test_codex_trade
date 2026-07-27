@@ -20,6 +20,18 @@ test("quote sanitizer rejects invalid, duplicate, out-of-order and excessive spr
   assert.equal(sanitizer.sanitize(quote(3_000, 500, 500)).reasons.includes("LOCKED_OR_CROSSED"), true);
 });
 
+test("quote sanitizer maintains the exact rolling nearest-rank size cap", () => {
+  const config = structuredClone(defaultConfig.dataQuality);
+  config.sizeWinsorWindow = 4;
+  config.sizeWinsorQuantile = 0.5;
+  const sanitizer = new StockQuoteSanitizer(config);
+  const sizes = [40, 10, 30, 20, 50, 5];
+  const expectedCaps = [40, 10, 30, 20, 20, 5];
+  const actualCaps = sizes.map((size, index) =>
+    sanitizer.sanitize(quote(1_000 + index, 500, 500.01, size, size)).value!.bidSize);
+  assert.deepEqual(actualCaps, expectedCaps);
+});
+
 test("one-second aggregation uses medians, VWAP, OFI and qualified forward fill", () => {
   const aggregator = new SecondAggregator(defaultConfig.dataQuality);
   aggregator.ingestQuote(quote(100, 500, 500.01, 200, 100));

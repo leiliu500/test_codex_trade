@@ -242,15 +242,23 @@ export class PostgresHistoryStore implements HistoryStore, AuditRecorder {
   }
 
   recordMarketEvent(event: HistoricalMarketEvent): void {
+    this.recordMarketEvents([event]);
+  }
+
+  recordMarketEvents(events: readonly HistoricalMarketEvent[]): void {
     if (this.#closed) throw new Error("Cannot record market history after the database store is closed");
-    if (!this.#shouldPersistMarketEvent(event)) return;
-    if (this.#queue.length >= this.#maxQueuedEvents) {
-      const error = new Error(`Market history queue exceeded ${this.#maxQueuedEvents} events`);
-      this.#recordError(error, "market");
-      throw error;
+    let added = 0;
+    for (const event of events) {
+      if (!this.#shouldPersistMarketEvent(event)) continue;
+      if (this.#queue.length >= this.#maxQueuedEvents) {
+        const error = new Error(`Market history queue exceeded ${this.#maxQueuedEvents} events`);
+        this.#recordError(error, "market");
+        throw error;
+      }
+      this.#queue.push(event);
+      added += 1;
     }
-    this.#queue.push(event);
-    if (this.#queue.length >= this.#batchSize) {
+    if (added > 0 && this.#queue.length >= this.#batchSize) {
       void this.flush().catch((error: unknown) => this.#recordError(error, "market"));
     }
   }

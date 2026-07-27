@@ -1,5 +1,5 @@
 import type { EngineConfig } from "../config.js";
-import type { StockStream, StockStreamHandlers } from "../alpaca/stockStream.js";
+import type { StockStream, StockStreamEvent, StockStreamHandlers } from "../alpaca/stockStream.js";
 import type { FeatureSnapshot, SecondBar, StockQuote, StockTrade } from "../types.js";
 import type { HealthState } from "../ops/healthServer.js";
 import type { HistoricalMarketEvent } from "../history/types.js";
@@ -16,6 +16,7 @@ export interface SpySipReceiverOptions {
   reconnectMaximumMs?: number;
   onStockQuote?: (quote: StockQuote) => void | Promise<void>;
   onStockTrade?: (trade: StockTrade) => void | Promise<void>;
+  onStockEvents?: (events: readonly StockStreamEvent[]) => void | Promise<void>;
   onFeature?: (feature: FeatureSnapshot) => void | Promise<void>;
   onError?: (error: unknown) => void;
   featureCheckpoint?: FeatureSnapshot;
@@ -45,6 +46,7 @@ export class SpySipReceiver {
   readonly #reconnectMaximumMs: number;
   readonly #onStockQuote: ((quote: StockQuote) => void | Promise<void>) | undefined;
   readonly #onStockTrade: ((trade: StockTrade) => void | Promise<void>) | undefined;
+  readonly #onStockEvents: ((events: readonly StockStreamEvent[]) => void | Promise<void>) | undefined;
   readonly #onFeature: ((feature: FeatureSnapshot) => void | Promise<void>) | undefined;
   readonly #onError: ((error: unknown) => void) | undefined;
   readonly #aggregator: SecondAggregator;
@@ -54,7 +56,7 @@ export class SpySipReceiver {
   #reconnectTimer: ReturnType<typeof setTimeout> | undefined;
   #started = false;
   #buffering = false;
-  readonly #bufferedEvents: Array<{ type: "quote"; value: StockQuote } | { type: "trade"; value: StockTrade }> = [];
+  readonly #bufferedEvents: StockStreamEvent[] = [];
   #stopping = false;
   #connected = false;
   #lastQuoteTimestamp: number | undefined;
@@ -81,6 +83,7 @@ export class SpySipReceiver {
     this.#reconnectMaximumMs = options.reconnectMaximumMs ?? 30_000;
     this.#onStockQuote = options.onStockQuote;
     this.#onStockTrade = options.onStockTrade;
+    this.#onStockEvents = options.onStockEvents;
     this.#onFeature = options.onFeature;
     this.#onError = options.onError;
     this.#aggregator = new SecondAggregator(options.config.dataQuality);
@@ -106,13 +109,13 @@ export class SpySipReceiver {
     let rejectedEvents = 0;
     let lastProviderTimestamp: number | undefined;
     while (this.#bufferedEvents.length > 0) {
-      const event = this.#bufferedEvents.shift()!;
-      lastProviderTimestamp = Math.max(lastProviderTimestamp ?? -Infinity, event.value.timestamp);
-      const result = event.type === "quote"
-        ? await this.#ingestQuote(event.value, false)
-        : await this.#ingestTrade(event.value, false);
-      if (event.type === "quote") quotes += 1;
-      else trades += 1;
+      const events = this.#bufferedEvents.splice(0, 10_000);
+      for (const event of events) {
+        lastProviderTimestamp = Math.max(lastProviderTimestamp ?? -Infinity, event.value.timestamp);
+      }
+      const result = await this.#ingestEvents(events, false);
+      quotes += result.quotes;
+      trades += result.trades;
       bars += result.bars;
       rejectedEvents += result.rejectedEvents;
     }
@@ -271,6 +274,10 @@ export class SpySipReceiver {
         if (this.#buffering) { this.#bufferedEvents.push({ type: "trade", value: trade }); return; }
         await this.#ingestTrade(trade);
       },
+      onEvents: async (events) => {
+        if (this.#buffering) { this.#bufferedEvents.push(...events); return; }
+        await this.#ingestEvents(events);
+      },
       onState: (connected) => {
         this.#connected = connected;
         if (connected) {
@@ -286,43 +293,69 @@ export class SpySipReceiver {
   }
 
   async #ingestQuote(quote: StockQuote, emitFeatures = true): Promise<{ bars: number; rejectedEvents: number }> {
-    try {
-      let bars = 0;
-      let rejectedEvents = 0;
-      await this.#queue.enqueue(async () => {
-        this.#quoteCount += 1;
-        this.#lastQuoteTimestamp = quote.timestamp;
-        this.#lastProviderTimestamp = Math.max(this.#lastProviderTimestamp ?? -Infinity, quote.timestamp);
-        const result = this.#aggregator.ingestQuote(quote);
-        if (result.rejected) { this.#rejectedCount += 1; rejectedEvents += 1; }
-        bars += result.bars.length;
-        if (emitFeatures) await this.#handleBars(result.bars);
-        else { this.#barCount += result.bars.length; this.#restoreBars(result.bars); }
-        await this.#onStockQuote?.(quote);
-      });
-      return { bars, rejectedEvents };
-    } catch (error) {
-      this.#recordError(error);
-      throw error;
-    }
+    const result = await this.#ingestEvents([{ type: "quote", value: quote }], emitFeatures);
+    return { bars: result.bars, rejectedEvents: result.rejectedEvents };
   }
 
   async #ingestTrade(trade: StockTrade, emitFeatures = true): Promise<{ bars: number; rejectedEvents: number }> {
+    const result = await this.#ingestEvents([{ type: "trade", value: trade }], emitFeatures);
+    return { bars: result.bars, rejectedEvents: result.rejectedEvents };
+  }
+
+  async #ingestEvents(
+    events: readonly StockStreamEvent[],
+    emitFeatures = true,
+  ): Promise<{ quotes: number; trades: number; bars: number; rejectedEvents: number }> {
     try {
+      let quotes = 0;
+      let trades = 0;
       let bars = 0;
       let rejectedEvents = 0;
       await this.#queue.enqueue(async () => {
-        this.#tradeCount += 1;
-        this.#lastTradeTimestamp = trade.timestamp;
-        this.#lastProviderTimestamp = Math.max(this.#lastProviderTimestamp ?? -Infinity, trade.timestamp);
-        const result = this.#aggregator.ingestTrade(trade);
-        if (result.rejected) { this.#rejectedCount += 1; rejectedEvents += 1; }
-        bars += result.bars.length;
-        if (emitFeatures) await this.#handleBars(result.bars);
-        else { this.#barCount += result.bars.length; this.#restoreBars(result.bars); }
-        await this.#onStockTrade?.(trade);
+        let pendingCallbacks: StockStreamEvent[] = [];
+        const flushCallbacks = async (): Promise<void> => {
+          if (!emitFeatures || pendingCallbacks.length === 0) return;
+          const batch = pendingCallbacks;
+          pendingCallbacks = [];
+          if (this.#onStockEvents) {
+            await this.#onStockEvents(batch);
+            return;
+          }
+          for (const event of batch) {
+            if (event.type === "quote") await this.#onStockQuote?.(event.value);
+            else await this.#onStockTrade?.(event.value);
+          }
+        };
+        for (const event of events) {
+          let result;
+          if (event.type === "quote") {
+            quotes += 1;
+            this.#quoteCount += 1;
+            this.#lastQuoteTimestamp = event.value.timestamp;
+            result = this.#aggregator.ingestQuote(event.value);
+          } else {
+            trades += 1;
+            this.#tradeCount += 1;
+            this.#lastTradeTimestamp = event.value.timestamp;
+            result = this.#aggregator.ingestTrade(event.value);
+          }
+          this.#lastProviderTimestamp = Math.max(this.#lastProviderTimestamp ?? -Infinity, event.value.timestamp);
+          if (result.rejected) { this.#rejectedCount += 1; rejectedEvents += 1; }
+          bars += result.bars.length;
+          if (emitFeatures) {
+            if (result.bars.length > 0) {
+              await flushCallbacks();
+              await this.#handleBars(result.bars);
+            }
+            pendingCallbacks.push(event);
+          } else {
+            this.#barCount += result.bars.length;
+            this.#restoreBars(result.bars);
+          }
+        }
+        await flushCallbacks();
       });
-      return { bars, rejectedEvents };
+      return { quotes, trades, bars, rejectedEvents };
     } catch (error) {
       this.#recordError(error);
       throw error;

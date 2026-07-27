@@ -456,8 +456,27 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
   }
 
   recordMarketEvent(event: HistoricalMarketEvent): void {
+    this.recordMarketEvents([event]);
+  }
+
+  recordMarketEvents(events: readonly HistoricalMarketEvent[]): void {
+    if (events.length === 0) return;
     this.#synchronizeDisplayWindow();
-    if (dashboardDisplayDate(event.receivedTimestamp) !== this.#displayDate) return;
+    const firstDisplayDate = dashboardDisplayDate(events[0]!.receivedTimestamp);
+    const receivedDisplayDate = dashboardDisplayDate(events.at(-1)!.receivedTimestamp);
+    if (firstDisplayDate === receivedDisplayDate) {
+      if (receivedDisplayDate !== this.#displayDate) return;
+      for (const event of events) this.#recordCurrentDisplayMarketEvent(event);
+      return;
+    }
+    for (const event of events) {
+      if (dashboardDisplayDate(event.receivedTimestamp) === this.#displayDate) {
+        this.#recordCurrentDisplayMarketEvent(event);
+      }
+    }
+  }
+
+  #recordCurrentDisplayMarketEvent(event: HistoricalMarketEvent): void {
     this.#lastMarketDate = event.marketDate;
     this.#marketEventCounts[event.type] += 1;
     this.#lastMarketEventReceivedAt = Math.max(this.#lastMarketEventReceivedAt ?? -Infinity, event.receivedTimestamp);

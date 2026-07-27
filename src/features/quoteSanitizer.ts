@@ -1,6 +1,6 @@
 import type { EngineConfig } from "../config.js";
 import type { OptionQuote, StockQuote } from "../types.js";
-import { quantileNearestRank, stableStringify } from "../utils/statistics.js";
+import { stableStringify } from "../utils/statistics.js";
 import { spreadBps } from "./quoteMath.js";
 
 export interface SanitizationResult<T> {
@@ -12,12 +12,39 @@ export interface SanitizationResult<T> {
 class RollingSizes {
   readonly #window: number;
   readonly #values: number[] = [];
+  readonly #sorted: number[] = [];
   constructor(window: number) { this.#window = window; }
   cap(value: number, p: number, fixed: number): number {
     this.#values.push(value);
-    if (this.#values.length > this.#window) this.#values.shift();
-    return Math.min(value, quantileNearestRank(this.#values, p), fixed);
+    insertSorted(this.#sorted, value);
+    if (this.#values.length > this.#window) {
+      const removed = this.#values.shift()!;
+      const index = lowerBound(this.#sorted, removed);
+      this.#sorted.splice(index, 1);
+    }
+    return Math.min(value, quantileFromSorted(this.#sorted, p), fixed);
   }
+}
+
+function lowerBound(values: readonly number[], target: number): number {
+  let low = 0;
+  let high = values.length;
+  while (low < high) {
+    const middle = (low + high) >>> 1;
+    if (values[middle]! < target) low = middle + 1;
+    else high = middle;
+  }
+  return low;
+}
+
+function insertSorted(values: number[], value: number): void {
+  values.splice(lowerBound(values, value), 0, value);
+}
+
+function quantileFromSorted(values: readonly number[], p: number): number {
+  if (p <= 0) return values[0]!;
+  if (p >= 1) return values.at(-1)!;
+  return values[Math.ceil(p * values.length) - 1]!;
 }
 
 export class StockQuoteSanitizer {
