@@ -75,11 +75,24 @@ export function lateEntryGuardAudit(
     mode: config.signals.lateEntryGuard.mode,
     active: lateEntryGuardActive(config, timestamp),
     start: config.signals.lateEntryGuard.start,
+    maxDailyEntries: config.signals.lateEntryGuard.maxDailyEntries,
     minProjectedMoveBps: config.signals.lateEntryGuard.minProjectedMoveBps,
     minCostMarginBps: config.signals.lateEntryGuard.minCostMarginBps,
     maxOptionSpreadPct: config.signals.lateEntryGuard.maxOptionSpreadPct,
     followThroughMinSec: config.signals.lateEntryGuard.followThroughMinSec,
     followThroughMaxSec: config.signals.lateEntryGuard.followThroughMaxSec,
     followThroughMinimumBps: config.signals.lateEntryGuard.followThroughMinimumBps,
+    bearishGrindRequiresFollowThrough:
+      config.signals.lateEntryGuard.bearishGrindRequiresFollowThrough,
+    bearishUnclassifiedImpulseFollowThroughStart:
+      config.signals.lateEntryGuard.bearishUnclassifiedImpulseFollowThroughStart,
+    bearishStrongDownImpulse: {
+      followThroughMinSec:
+        config.signals.lateEntryGuard.bearishStrongDownImpulse.followThroughMinSec,
+      followThroughMaxSec:
+        config.signals.lateEntryGuard.bearishStrongDownImpulse.followThroughMaxSec,
+      followThroughMinimumBps:
+        config.signals.lateEntryGuard.bearishStrongDownImpulse.followThroughMinimumBps,
+    },
   };
 }

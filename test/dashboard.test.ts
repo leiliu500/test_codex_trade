@@ -51,6 +51,15 @@ test("dashboard exposes liveness and feed tabs before any entries, orders, or hi
   assert.match(html, /scheduleDisplayRollover/);
   assert.match(html, /window\.location\.reload/);
   assert.match(html, /resets at 10:00 PM Pacific/);
+  assert.match(html, /h\.receivedOptionQuotes/);
+  assert.match(html, /h\.lastOptionQuoteAgeMs/);
+  assert.match(html, /h\.optionQuoteStalled/);
+  assert.match(html, /h\.stockWebsocketConnected/);
+  assert.match(html, /SIP restored at startup/);
+  assert.match(html, /live SIP events/);
+  const script = html.match(/<script>([\s\S]*)<\/script>/)?.[1];
+  assert.ok(script);
+  assert.doesNotThrow(() => new Function(script));
 });
 
 test("dashboard starts a new empty display day at 10 PM Pacific without restoring older rows", () => {

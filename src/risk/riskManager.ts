@@ -2,6 +2,7 @@ import type { EngineConfig } from "../config.js";
 import type { AccountState, Direction, PositionState, RiskDecision } from "../types.js";
 import { marketDate } from "../utils/time.js";
 import { sameDaySpyOptionSymbolReasons } from "../options/tradingInvariants.js";
+import { lateEntryGuardActive } from "../strategy/lateEntryGuard.js";
 
 export interface DailyRiskState {
   marketDate: string;
@@ -32,6 +33,10 @@ export class RiskManager {
     const maxTradesPerDay = this.#config.signals.entryQualityMode === "ENFORCE"
       ? this.#config.risk.entryQualityMaxTradesPerDay : this.#config.risk.maxTradesPerDay;
     if (daily.entries >= maxTradesPerDay) reasons.push("MAX_DAILY_ENTRIES_REACHED");
+    if (lateEntryGuardActive(this.#config, request.timestamp) &&
+        daily.entries >= this.#config.signals.lateEntryGuard.maxDailyEntries) {
+      reasons.push("LATE_ENTRY_MAX_DAILY_ENTRIES_REACHED");
+    }
     if (daily.realizedPnl <= -this.#config.risk.maxDailyLossDollars) reasons.push("MAX_DAILY_LOSS_REACHED");
     if (this.#config.risk.onePositionAtATime && request.hasOpenPosition) reasons.push("POSITION_ALREADY_OPEN");
 

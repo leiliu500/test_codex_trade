@@ -187,10 +187,25 @@ export class SignalEngine {
   #followThroughRequirement(signal: TradeSignal): FollowThroughRequirement | undefined {
     if (lateEntryGuardActive(this.#config, signal.timestamp)) {
       const guard = this.#config.signals.lateEntryGuard;
+      if (signal.direction === "BEARISH" && signal.kind === "GRIND" &&
+          !guard.bearishGrindRequiresFollowThrough) {
+        return undefined;
+      }
+      if (signal.direction === "BEARISH" && signal.kind === "IMPULSE" &&
+          signal.regime === "UNCLASSIFIED" &&
+          secondsSinceMidnight(signal.timestamp, this.#config.timeZone) <
+            parseClock(guard.bearishUnclassifiedImpulseFollowThroughStart)) {
+        return undefined;
+      }
+      const profile = signal.direction === "BEARISH" &&
+        signal.kind === "IMPULSE" &&
+        signal.regime === "STRONG_DOWN"
+        ? guard.bearishStrongDownImpulse
+        : guard;
       return {
-        minSec: guard.followThroughMinSec,
-        maxSec: guard.followThroughMaxSec,
-        minimumBps: guard.followThroughMinimumBps,
+        minSec: profile.followThroughMinSec,
+        maxSec: profile.followThroughMaxSec,
+        minimumBps: profile.followThroughMinimumBps,
         reasonPrefix: "LATE_ENTRY_",
       };
     }

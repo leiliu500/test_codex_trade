@@ -77,12 +77,20 @@ export interface EngineConfig {
     lateEntryGuard: {
       mode: LateEntryGuardMode;
       start: string;
+      maxDailyEntries: number;
       minProjectedMoveBps: number;
       minCostMarginBps: number;
       maxOptionSpreadPct: number;
       followThroughMinSec: number;
       followThroughMaxSec: number;
       followThroughMinimumBps: number;
+      bearishGrindRequiresFollowThrough: boolean;
+      bearishUnclassifiedImpulseFollowThroughStart: string;
+      bearishStrongDownImpulse: {
+        followThroughMinSec: number;
+        followThroughMaxSec: number;
+        followThroughMinimumBps: number;
+      };
     };
     blockWhipsaw: boolean;
   };
@@ -204,6 +212,9 @@ export function validateConfig(config: EngineConfig): void {
   const morningEntryGuardStart = parseClock(config.signals.morningEntryGuard.start);
   const morningEntryGuardEnd = parseClock(config.signals.morningEntryGuard.end);
   const lateEntryGuardStart = parseClock(config.signals.lateEntryGuard.start);
+  const bearishUnclassifiedImpulseFollowThroughStart = parseClock(
+    config.signals.lateEntryGuard.bearishUnclassifiedImpulseFollowThroughStart,
+  );
   const zeroDteCutoff = parseClock(config.options.zeroDteEntryCutoff);
   const entryEnd = parseClock(config.session.entryEnd);
   const forceExit = parseClock(config.session.forceExit);
@@ -218,6 +229,12 @@ export function validateConfig(config: EngineConfig): void {
   }
   if (!(entryStart <= lateEntryGuardStart && lateEntryGuardStart <= zeroDteCutoff)) {
     throw new Error("Late-entry guard must start inside the executable entry window");
+  }
+  if (!(lateEntryGuardStart <= bearishUnclassifiedImpulseFollowThroughStart &&
+        bearishUnclassifiedImpulseFollowThroughStart <= zeroDteCutoff)) {
+    throw new Error(
+      "Late bearish unclassified impulse confirmation must begin between the late-entry start and 0DTE cutoff",
+    );
   }
   if (!(entryStart <= morningEntryGuardStart &&
         morningEntryGuardStart < morningEntryGuardEnd &&
@@ -249,13 +266,21 @@ export function validateConfig(config: EngineConfig): void {
         config.signals.morningEntryGuard.maxOptionSpreadPct <= config.dataQuality.maxOptionSpreadPct)) {
     throw new Error("Morning-entry guard thresholds are invalid");
   }
-  if (!(config.signals.lateEntryGuard.minProjectedMoveBps > 0 &&
+  if (!(Number.isInteger(config.signals.lateEntryGuard.maxDailyEntries) &&
+        config.signals.lateEntryGuard.maxDailyEntries > 0 &&
+        config.signals.lateEntryGuard.maxDailyEntries <= config.risk.maxTradesPerDay &&
+        config.signals.lateEntryGuard.minProjectedMoveBps > 0 &&
         config.signals.lateEntryGuard.minCostMarginBps >= 0 &&
         config.signals.lateEntryGuard.maxOptionSpreadPct > 0 &&
         config.signals.lateEntryGuard.maxOptionSpreadPct <= config.dataQuality.maxOptionSpreadPct &&
         config.signals.lateEntryGuard.followThroughMinSec >= 0 &&
         config.signals.lateEntryGuard.followThroughMaxSec >= config.signals.lateEntryGuard.followThroughMinSec &&
-        config.signals.lateEntryGuard.followThroughMinimumBps >= 0)) {
+        config.signals.lateEntryGuard.followThroughMinimumBps >= 0 &&
+        typeof config.signals.lateEntryGuard.bearishGrindRequiresFollowThrough === "boolean" &&
+        config.signals.lateEntryGuard.bearishStrongDownImpulse.followThroughMinSec >= 0 &&
+        config.signals.lateEntryGuard.bearishStrongDownImpulse.followThroughMaxSec >=
+          config.signals.lateEntryGuard.bearishStrongDownImpulse.followThroughMinSec &&
+        config.signals.lateEntryGuard.bearishStrongDownImpulse.followThroughMinimumBps >= 0)) {
     throw new Error("Late-entry guard thresholds or follow-through window are invalid");
   }
   if (!(Number.isInteger(config.risk.maxTradesPerDay) && config.risk.maxTradesPerDay > 0 &&

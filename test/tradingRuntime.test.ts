@@ -6,7 +6,7 @@ import type { StockStream, StockStreamHandlers } from "../src/alpaca/stockStream
 import type { OptionStream, OptionStreamHandlers } from "../src/alpaca/optionStream.js";
 import type { SpyOptionsRuntimeClient } from "../src/runtime/spyOptionsTradingRuntime.js";
 import {
-  optionUniverseRequired, restoreRuntimeState, SpyOptionsTradingRuntime,
+  OPTION_QUOTE_STALL_TIMEOUT_MS, optionUniverseRequired, restoreRuntimeState, SpyOptionsTradingRuntime,
 } from "../src/runtime/spyOptionsTradingRuntime.js";
 import type {
   AccountState, FeatureSnapshot, OptionContract, OptionQuote, OptionSnapshot, PositionState, StockQuote,
@@ -264,6 +264,7 @@ test("market close disconnects activity and the next open reconnects automatical
   client.clock = { timestamp: decisionTime, isOpen: false };
   await waitFor(() => runtime.healthState().marketDataIdle === true);
   await waitFor(() => stockStream.closeCalls > 0 && optionStream.closeCalls > 0);
+  await waitFor(() => optionStream.subscribed.size === 0);
   assert.equal(runtime.healthState().websocketConnected, false);
   assert.equal(runtime.healthState().ready, true);
   const evaluationCount = recorder.events.filter((event) => event.type === "live_entry_evaluation").length;
@@ -275,6 +276,60 @@ test("market close disconnects activity and the next open reconnects automatical
   await waitFor(() => stockStream.connectCalls === 2 && optionStream.connectCalls === 2);
   assert.equal(runtime.healthState().marketDataIdle, false);
   assert.ok(recorder.events.some((event) => event.type === "market_session_resumed"));
+  await runtime.close();
+});
+
+test("OPRA quote silence fails readiness and reconnects the option stream", async () => {
+  let decisionTime = now;
+  const client = new FakeRuntimeClient();
+  const optionStream = new FakeOptionStream();
+  const recorder = new MemoryRecorder();
+  const runtime = new SpyOptionsTradingRuntime({
+    config: defaultConfig,
+    client,
+    stockStream: new FakeStockStream(),
+    optionStream,
+    executionEnabled: true,
+    executionMode: "paper",
+    now: () => decisionTime,
+    executionTickMs: 10,
+    recorder,
+  });
+  await runtime.start();
+  assert.equal(runtime.healthState().lastOptionQuoteAgeMs, 0);
+
+  decisionTime += OPTION_QUOTE_STALL_TIMEOUT_MS + 1;
+  client.clock.timestamp = decisionTime;
+  await waitFor(() => recorder.events.some((event) => event.type === "option_stream_stalled"));
+  const stalled = runtime.healthState();
+  assert.equal(stalled.ready, false);
+  assert.equal(stalled.optionQuoteStalled, true);
+  assert.equal(stalled.optionWebsocketConnected, false);
+  assert.equal(stalled.lastOptionQuoteAgeMs, OPTION_QUOTE_STALL_TIMEOUT_MS + 1);
+  assert.equal(stalled.optionQuoteStallThresholdMs, OPTION_QUOTE_STALL_TIMEOUT_MS);
+  assert.equal(stalled.reconnectAttempt, 1);
+  assert.match(stalled.lastStreamError ?? "", /OPRA option quote stream stalled/);
+  await runtime.ingestFeature({ ...bullishFeature(), timestamp: decisionTime });
+  const blockedEvaluation = recorder.events
+    .filter((event) => event.type === "live_entry_evaluation")
+    .at(-1);
+  assert.deepEqual(blockedEvaluation?.data.reasons, ["OPTION_FEED_STALLED"]);
+
+  await waitFor(() => optionStream.connectCalls === 2, 2_000);
+  assert.equal(runtime.healthState().optionQuoteStalled, false);
+  assert.equal(runtime.healthState().optionWebsocketConnected, true);
+  assert.equal(runtime.healthState().ready, true);
+  await optionStream.quote({
+    symbol: callSymbol,
+    timestamp: decisionTime,
+    bidPrice: 1.995,
+    askPrice: 2.005,
+    bidSize: 100,
+    askSize: 100,
+  });
+  assert.equal(runtime.healthState().receivedOptionQuotes, 1);
+  assert.equal(runtime.healthState().lastOptionQuoteAgeMs, 0);
+  assert.equal(runtime.healthState().lastOptionQuoteProviderAgeMs, 0);
   await runtime.close();
 });
 
@@ -535,7 +590,10 @@ test("late-session runtime audits and blocks an option whose spread exceeds the 
 
   const evaluation = recorder.events.find((event) => event.type === "live_entry_evaluation");
   assert.equal(evaluation?.data.decision, "SIGNAL");
-  assert.equal((evaluation?.data.lateEntryGuard as Record<string, unknown>).active, true);
+  const lateEntryGuard = evaluation?.data.lateEntryGuard as Record<string, unknown>;
+  assert.equal(lateEntryGuard.active, true);
+  assert.equal(lateEntryGuard.bearishGrindRequiresFollowThrough, false);
+  assert.equal(lateEntryGuard.bearishUnclassifiedImpulseFollowThroughStart, "13:00:00");
   assert.equal((evaluation?.data.lateEntryBaseline as Record<string, unknown>).decision, "SIGNAL");
   const selection = recorder.events.find((event) => event.type === "live_signal_selection");
   assert.equal(selection?.data.candidate, null);

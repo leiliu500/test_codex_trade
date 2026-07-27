@@ -35,9 +35,18 @@ test("configuration cannot enable later-dated or overnight option trading", () =
   const invalidLateStart = structuredClone(defaultConfig);
   invalidLateStart.signals.lateEntryGuard.start = "15:00:00";
   assert.throws(() => validateConfig(invalidLateStart), /Late-entry guard must start/);
+  const invalidLateUnclassifiedStart = structuredClone(defaultConfig);
+  invalidLateUnclassifiedStart.signals.lateEntryGuard.bearishUnclassifiedImpulseFollowThroughStart = "11:59:59";
+  assert.throws(() => validateConfig(invalidLateUnclassifiedStart), /unclassified impulse confirmation/);
   const invalidLateWindow = structuredClone(defaultConfig);
   invalidLateWindow.signals.lateEntryGuard.followThroughMinSec = 16;
   assert.throws(() => validateConfig(invalidLateWindow), /Late-entry guard thresholds/);
+  const invalidLateCap = structuredClone(defaultConfig);
+  invalidLateCap.signals.lateEntryGuard.maxDailyEntries = 0;
+  assert.throws(() => validateConfig(invalidLateCap), /Late-entry guard thresholds/);
+  const invalidLateBearishProfile = structuredClone(defaultConfig);
+  invalidLateBearishProfile.signals.lateEntryGuard.bearishStrongDownImpulse.followThroughMinSec = 6;
+  assert.throws(() => validateConfig(invalidLateBearishProfile), /Late-entry guard thresholds/);
   const invalidLateSpread = structuredClone(defaultConfig);
   invalidLateSpread.signals.lateEntryGuard.maxOptionSpreadPct =
     defaultConfig.dataQuality.maxOptionSpreadPct + 0.01;
@@ -133,6 +142,44 @@ test("six restored fills block the shadow profile without blocking active paper 
   const shadowDecision = shadow.evaluate(request);
   assert.equal(shadowDecision.allowed, false);
   assert.ok(shadowDecision.reasons.includes("MAX_DAILY_ENTRIES_REACHED"));
+});
+
+test("the high late-entry cap leaves six restored fills executable", () => {
+  const restored = { marketDate: "2026-07-22", entries: 6, realizedPnl: 0 };
+  const account = {
+    equity: 100_000, optionBuyingPower: 10_000, active: true, optionsApproved: true, killSwitch: false,
+  };
+  const manager = new RiskManager(defaultConfig);
+  manager.restoreState(restored);
+
+  const morning = manager.evaluate({
+    timestamp: zonedDateTimeToEpoch("2026-07-22", "11:59:59"),
+    optionMid: 2,
+    hasOpenPosition: false,
+    account,
+  });
+  assert.equal(morning.allowed, true);
+
+  const late = manager.evaluate({
+    timestamp: zonedDateTimeToEpoch("2026-07-22", "12:00:00"),
+    optionMid: 2,
+    hasOpenPosition: false,
+    account,
+  });
+  assert.equal(late.allowed, true);
+
+  const isolatedCapConfig = structuredClone(defaultConfig);
+  isolatedCapConfig.risk.maxTradesPerDay = 2_000;
+  const capped = new RiskManager(isolatedCapConfig);
+  capped.restoreState({ ...restored, entries: defaultConfig.signals.lateEntryGuard.maxDailyEntries });
+  const cappedDecision = capped.evaluate({
+    timestamp: zonedDateTimeToEpoch("2026-07-22", "12:00:00"),
+    optionMid: 2,
+    hasOpenPosition: false,
+    account,
+  });
+  assert.equal(cappedDecision.allowed, false);
+  assert.ok(cappedDecision.reasons.includes("LATE_ENTRY_MAX_DAILY_ENTRIES_REACHED"));
 });
 
 const exitContext = (position: PositionState, timestamp: number, mid: number) => ({
