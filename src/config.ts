@@ -57,6 +57,7 @@ export interface EngineConfig {
     projectionAccelerationRvCap: number;
     costMultiplier: number;
     sameDirectionCooldownSec: number;
+    oppositeDirectionCooldownSec: number;
     minimumSignalIntervalSec: number;
     lateBullishImpulseStart: string;
     lateBullishImpulseRequiresUpRegime: boolean;
@@ -272,6 +273,14 @@ export function validateConfig(config: EngineConfig): void {
     throw new Error(
       "Follow-through confirmation requires 0 <= minSec <= maxSec and non-negative bps/noise multiplier",
     );
+  }
+  if (!(Number.isFinite(config.signals.sameDirectionCooldownSec) &&
+        config.signals.sameDirectionCooldownSec >= 0 &&
+        Number.isFinite(config.signals.oppositeDirectionCooldownSec) &&
+        config.signals.oppositeDirectionCooldownSec >= 0 &&
+        Number.isFinite(config.signals.minimumSignalIntervalSec) &&
+        config.signals.minimumSignalIntervalSec >= 0)) {
+    throw new Error("Signal cooldowns and minimum interval must be finite and non-negative");
   }
   const scopes = new Set<FollowThroughScope>(["BULLISH_IMPULSE", "IMPULSE", "ALL"]);
   if (!scopes.has(config.signals.followThroughScope) ||

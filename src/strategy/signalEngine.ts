@@ -252,6 +252,13 @@ export class SignalEngine {
       blockedReasons.push("SAME_DIRECTION_COOLDOWN");
       return undefined;
     }
+    const oppositeDirection: Direction = direction === "BULLISH" ? "BEARISH" : "BULLISH";
+    const oppositeEntry = this.#lastEntries[oppositeDirection];
+    if (oppositeEntry !== undefined &&
+        f.timestamp - oppositeEntry < this.#config.signals.oppositeDirectionCooldownSec * 1000) {
+      blockedReasons.push("OPPOSITE_DIRECTION_COOLDOWN");
+      return undefined;
+    }
     const s = direction === "BULLISH" ? 1 : -1;
     const sessionVwap = f.vwap.sessionVwap;
     if (sessionVwap === undefined) {
