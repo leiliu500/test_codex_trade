@@ -698,7 +698,7 @@ test("enforced opt-in waits for causal follow-through before submitting an entry
     symbol: callSymbol, timestamp: decisionTime, bidPrice: 1.995, askPrice: 2.005, bidSize: 100, askSize: 100,
   });
   await runtime.ingestFeature({
-    ...bullishFeature(), timestamp: decisionTime, price: 501.11, mid: 501.11,
+    ...bullishFeature(), timestamp: decisionTime, price: 501.14, mid: 501.14,
   });
   assert.equal(client.requests.length, 1);
   const signalEvaluation = recorder.events.find(

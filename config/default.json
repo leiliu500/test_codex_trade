@@ -1,5 +1,5 @@
 {
-  "version": "spy-0dte-entry-confirmation-9-unified-order-management-4",
+  "version": "spy-0dte-entry-confirmation-10-unified-order-management-4",
   "symbol": "SPY",
   "timeZone": "America/New_York",
   "session": {
@@ -49,6 +49,7 @@
     "projectionAccelerationRvCap": 0.5,
     "costMultiplier": 1.75,
     "sameDirectionCooldownSec": 600,
+    "oppositeDirectionCooldownSec": 60,
     "minimumSignalIntervalSec": 5,
     "lateBullishImpulseStart": "12:45:00",
     "lateBullishImpulseRequiresUpRegime": true,
@@ -56,7 +57,7 @@
     "followThroughMinSec": 5,
     "followThroughMaxSec": 15,
     "followThroughMinimumBps": 0,
-    "followThroughNoiseMultiplier": 1.0,
+    "followThroughNoiseMultiplier": 1.25,
     "followThroughScope": "BULLISH_IMPULSE",
     "shadowFollowThroughScope": "BULLISH_IMPULSE",
     "morningEntryGuard": {

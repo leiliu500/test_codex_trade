@@ -169,16 +169,16 @@ test("causal follow-through confirms only aligned movement observed 5-15 seconds
   assert.deepEqual(armed.reasons, ["FOLLOW_THROUGH_PENDING"]);
   assert.equal(winnerEngine.evaluate({ ...first, timestamp: first.timestamp + 4_000, price: 501.01 }, regime), undefined);
   const belowNoise = winnerEngine.evaluateDetailed(
-    { ...first, timestamp: first.timestamp + 5_000, price: 501.02 }, regime,
+    { ...first, timestamp: first.timestamp + 5_000, price: first.price * (1 + 2.4 / 10_000) }, regime,
   );
   assert.equal(belowNoise.signal, undefined);
   assert.deepEqual(belowNoise.reasons, ["FOLLOW_THROUGH_NOT_CONFIRMED"]);
   const confirmed = winnerEngine.evaluateDetailed(
-    { ...first, timestamp: first.timestamp + 10_000, price: 501.11 }, regime,
+    { ...first, timestamp: first.timestamp + 10_000, price: first.price * (1 + 2.6 / 10_000) }, regime,
   );
   assert.equal(confirmed.signal?.timestamp, first.timestamp + 10_000);
   assert.ok(confirmed.signal?.reasons.some((reason) => reason.includes("causal follow-through confirmed")));
-  assert.ok(confirmed.signal?.reasons.some((reason) => reason.includes("2.000 bps required")));
+  assert.ok(confirmed.signal?.reasons.some((reason) => reason.includes("2.500 bps required")));
 
   const loserEngine = new SignalEngine(enforcedSignalConfig);
   assert.equal(loserEngine.evaluate(first, regime), undefined);
@@ -253,7 +253,7 @@ test("morning bullish impulses and late-session entries require causal follow-th
   const confirmed = engine.evaluateDetailed({
     ...late,
     timestamp: late.timestamp + 5_000,
-    price: late.price + 0.11,
+    price: late.price * (1 + 2.6 / 10_000),
   }, up);
   assert.equal(confirmed.signal?.direction, "BULLISH");
   assert.ok(confirmed.signal?.reasons.some((reason) => reason.includes("causal follow-through confirmed")));
@@ -272,7 +272,7 @@ test("morning bullish impulses and late-session entries require causal follow-th
   const delayedWinner = july24Engine.evaluateDetailed({
     ...late,
     timestamp: late.timestamp + 15_000,
-    price: late.price * (1 + 2.2 / 10_000),
+    price: late.price * (1 + 2.7 / 10_000),
   }, up);
   assert.equal(delayedWinner.signal?.direction, "BULLISH");
   assert.ok(delayedWinner.signal?.reasons.some((reason) =>
@@ -297,7 +297,7 @@ test("morning bullish impulses and late-session entries require causal follow-th
   const immediateBearish = strictWinnerEngine.evaluateDetailed({
     ...lateBearish,
     timestamp: lateBearish.timestamp + 5_000,
-    price: lateBearish.price - 0.11,
+    price: lateBearish.price * (1 - 2.6 / 10_000),
   }, down);
   assert.equal(immediateBearish.signal?.direction, "BEARISH");
 
@@ -390,7 +390,7 @@ test("steady grind passes with acceleration near zero, but excessive adverse acc
   assert.equal(new SignalEngine(immediateSignalConfig).evaluate(adverse, regime), undefined);
 });
 
-test("global gates block stale data, whipsaw, time violations, and cooldown only after entry", () => {
+test("global gates block stale data, whipsaw, time violations, and fill-based direction cooldowns", () => {
   const base = feature();
   const engine = new SignalEngine(immediateSignalConfig);
   assert.equal(engine.evaluate({ ...base, dataValid: false }, classifyRegime(base, defaultConfig.regimes)), undefined);
@@ -404,6 +404,19 @@ test("global gates block stale data, whipsaw, time violations, and cooldown only
   assert.ok(first.evaluate(later, classifyRegime(later, defaultConfig.regimes)));
   first.recordEntry("BULLISH", later.timestamp);
   assert.equal(first.evaluate({ ...later, timestamp: later.timestamp + 6_000 }, classifyRegime(later, defaultConfig.regimes)), undefined);
+  const earlyOpposite = { ...feature(-1), timestamp: later.timestamp + 30_000 };
+  const oppositeEvaluation = first.evaluateDetailed(
+    earlyOpposite,
+    classifyRegime(earlyOpposite, defaultConfig.regimes),
+  );
+  assert.equal(oppositeEvaluation.signal, undefined);
+  assert.ok(oppositeEvaluation.directions.find((item) => item.direction === "BEARISH")?.reasons
+    .includes("OPPOSITE_DIRECTION_COOLDOWN"));
+  const eligibleOpposite = { ...earlyOpposite, timestamp: later.timestamp + 60_000 };
+  assert.equal(
+    first.evaluate(eligibleOpposite, classifyRegime(eligibleOpposite, defaultConfig.regimes))?.direction,
+    "BEARISH",
+  );
 });
 
 test("opening range cannot become complete from a late-started partial session", () => {
@@ -423,6 +436,18 @@ test("restored entry and signal timestamps preserve restart cooldowns", () => {
   });
   const evaluation = engine.evaluateDetailed(base, classifyRegime(base, defaultConfig.regimes));
   assert.ok(evaluation.reasons.includes("MINIMUM_SIGNAL_INTERVAL"));
+
+  const oppositeEngine = new SignalEngine(immediateSignalConfig);
+  oppositeEngine.restoreState({
+    lastEntries: { BULLISH: base.timestamp - 30_000 },
+  });
+  const bearish = feature(-1);
+  const oppositeEvaluation = oppositeEngine.evaluateDetailed(
+    bearish,
+    classifyRegime(bearish, defaultConfig.regimes),
+  );
+  assert.ok(oppositeEvaluation.directions.find((item) => item.direction === "BEARISH")?.reasons
+    .includes("OPPOSITE_DIRECTION_COOLDOWN"));
 });
 
 test("feature checkpoint restores exact opening range while trade-only history rebuilds session VWAP", () => {
