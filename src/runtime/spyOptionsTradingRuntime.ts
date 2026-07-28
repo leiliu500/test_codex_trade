@@ -109,7 +109,7 @@ export class SpyOptionsTradingRuntime {
   #optionQuoteCount = 0;
   #rejectedOptionQuotes = 0;
   #optionQuoteStalled = false;
-  #execution: LiveExecutionSnapshot = { halted: false };
+  #execution: LiveExecutionSnapshot = { halted: false, lifecycle: "FLAT", safeMode: false };
   #retainedPositionSymbol: string | undefined;
   #lastError: string | undefined;
   #lastClockCheck = -Infinity;
@@ -457,7 +457,14 @@ export class SpyOptionsTradingRuntime {
         let result;
         try {
           result = await this.#orders.submitEntry({
-            timestamp: this.#now(), signal, candidate, quote, killSwitch: this.#killSwitch,
+            timestamp: this.#now(),
+            signal,
+            candidate,
+            quote,
+            ...(this.#book.get(candidate.symbol)?.snapshot
+              ? { optionSnapshot: this.#book.get(candidate.symbol)!.snapshot! }
+              : {}),
+            killSwitch: this.#killSwitch,
           });
         } finally {
           this.#execution = this.#orders.snapshot();
@@ -847,9 +854,12 @@ export class SpyOptionsTradingRuntime {
 
   async #tickExecution(timestamp: number, optionQuote?: OptionQuote): Promise<void> {
     if (this.#marketDataIdle || !this.#marketOpen || !this.#executionEnabled || this.#execution.halted) return;
+    const activeSymbol = this.#execution.position?.symbol ?? this.#execution.pending?.order.symbol;
+    const optionSnapshot = activeSymbol ? this.#book.get(activeSymbol)?.snapshot : undefined;
     this.#execution = await this.#orders.tick({
       timestamp,
       ...(optionQuote ? { optionQuote } : {}),
+      ...(optionSnapshot ? { optionSnapshot } : {}),
       ...(this.#lastFeature ? { feature: this.#lastFeature } : {}),
       ...(this.#lastRegime ? { regime: this.#lastRegime } : {}),
       killSwitch: this.#killSwitch,

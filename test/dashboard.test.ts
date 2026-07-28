@@ -47,6 +47,16 @@ test("dashboard exposes liveness and feed tabs before any entries, orders, or hi
   assert.match(html, /Potential Missed Entry Review/);
   assert.match(html, /Entry Gate Blocks/);
   assert.match(html, /Strategy state/);
+  assert.match(html, /Order manager/);
+  assert.match(html, /Executable P&L/);
+  assert.match(html, /Profit floor/);
+  assert.match(html, /Recovery/);
+  assert.match(html, /Continuation LCB/);
+  assert.match(html, /STATE NOT RECORDED/);
+  assert.match(html, /DECISION NOT RECORDED/);
+  assert.doesNotMatch(html, /x\.tradeState\|\|\(!x\.entryPrice\?'AWAITING FILL':'OPEN UNPROTECTED'\)/);
+  assert.doesNotMatch(html, /x\.managementDecision\|\|\(\(x\.stage==='EXIT_WORKING'/);
+  assert.match(html, /complete timeline is stored in PostgreSQL/);
   assert.match(html, /Actionable stages only/);
   assert.match(html, /scheduleDisplayRollover/);
   assert.match(html, /window\.location\.reload/);
@@ -160,7 +170,10 @@ test("dashboard clears order cards at 10 PM Pacific and does not restore prior-d
   };
   dashboard.restoreOrderCards([completedCard]);
 
-  assert.equal(dashboard.snapshot().orderCards[0]?.id, "historical-entry");
+  const restored = dashboard.snapshot().orderCards[0];
+  assert.equal(restored?.id, "historical-entry");
+  assert.equal(restored?.tradeState, undefined);
+  assert.equal(restored?.managementDecision, undefined);
   now = rollover;
   assert.equal(dashboard.snapshot().orderCards.length, 0);
   dashboard.restoreOrderCards([completedCard]);
@@ -206,6 +219,128 @@ test("dashboard persists a completed card with all captured P&L updates", async 
     [10, 20],
   );
   assert.equal(saved[0]?.updates.at(-1)?.totalPnl, 25);
+});
+
+test("order cards expose and persist unified order-management state changes", async () => {
+  const dashboard = historicalDashboard();
+  const saved: DashboardOrderCard[] = [];
+  dashboard.setOrderCardPersistence({
+    async saveOrderCard(card) { saved.push(card); },
+  });
+  await dashboard.record(event("entry_fill", {
+    position: {
+      symbol, direction: "BULLISH", quantity: 1, averageEntryPrice: 2,
+      entryTimestamp: timestamp, stopPrice: 1.5, targetPrice: 2.7,
+      highWaterMark: 2, lowWaterMark: 2, tradeState: "OPEN_UNPROTECTED",
+      executablePnl: -3, highWaterPnl: 0, lowWaterPnl: -3,
+    },
+  }));
+  await dashboard.record(event("order_management_state", {
+    symbol,
+    direction: "BULLISH",
+    entryTimestamp: timestamp,
+    lifecycle: "PROTECTED_RECOVERED",
+    tradeState: "PROTECTED_RECOVERED",
+    decision: "HOLD",
+    triggers: [],
+    liquidationPrice: 2.24,
+    executablePnl: 24,
+    protectedFloorPnl: 9,
+    floorBufferDollars: 15,
+    highWaterPnl: 31,
+    lowWaterPnl: -8,
+    recoveryProbability: 0.78,
+    continuationLcbDollars: 6.5,
+    reversalCusum: 0.4,
+    zeroCrossings: 2,
+    pnlObservationCount: 8,
+    optionContinuation: {
+      deltaDollars: 9,
+      gammaDollars: 2,
+      vegaDollars: -1,
+      thetaDollars: -0.5,
+      holdingCostDollars: 1,
+      uncertaintyDollars: 2,
+      expectedChangeDollars: 9.5,
+      lcbDollars: 6.5,
+      ivCrushDetected: false,
+    },
+  }, 100));
+
+  let card = dashboard.snapshot().orderCards[0]!;
+  assert.equal(card.lifecycle, "PROTECTED_RECOVERED");
+  assert.equal(card.tradeState, "PROTECTED_RECOVERED");
+  assert.equal(card.managementDecision, "HOLD");
+  assert.equal(card.executablePnl, 24);
+  assert.equal(card.protectedFloorPnl, 9);
+  assert.equal(card.recoveryProbability, 0.78);
+  assert.equal(card.optionContinuation?.thetaDollars, -0.5);
+  assert.ok(card.updates.some((update) =>
+    update.tradeState === "PROTECTED_RECOVERED" &&
+    update.protectedFloorPnl === 9 &&
+    update.continuationLcbDollars === 6.5));
+
+  await dashboard.record(event("order_management_state", {
+    symbol,
+    direction: "BULLISH",
+    entryTimestamp: timestamp,
+    lifecycle: "EXIT_PENDING",
+    tradeState: "PROTECTED_RECOVERED",
+    decision: "EXIT",
+    reason: "REVERSAL_CUSUM",
+    triggers: ["REVERSAL_CUSUM", "CONTINUATION_LCB_NON_POSITIVE"],
+    liquidationPrice: 2.18,
+    executablePnl: 18,
+    protectedFloorPnl: 9,
+    floorBufferDollars: 9,
+    continuationLcbDollars: -1.5,
+    reversalCusum: 2.8,
+  }, 200));
+  await dashboard.record(event("broker_order_request", {
+    purpose: "EXIT",
+    reason: "REVERSAL_CUSUM",
+    triggers: ["REVERSAL_CUSUM", "CONTINUATION_LCB_NON_POSITIVE"],
+    exitIntentId: "exit-intent-1",
+    attempt: 2,
+    urgency: 0.85,
+    order: {
+      clientOrderId: "exit-1", intentId: "exit-intent-1", symbol, side: "sell",
+      requestedQuantity: 1, filledQuantity: 0, limitPrice: 2.18,
+      status: "SUBMITTED", submittedAt: timestamp + 201, replacements: 1,
+      urgency: 0.85, actionTtlMs: 483, priceCollar: 1.85, marketable: true,
+    },
+  }, 201));
+
+  card = dashboard.snapshot().orderCards[0]!;
+  assert.equal(card.lifecycle, "EXIT_PENDING");
+  assert.equal(card.managementDecision, "EXIT");
+  assert.deepEqual(card.exitTriggers, [
+    "REVERSAL_CUSUM",
+    "CONTINUATION_LCB_NON_POSITIVE",
+  ]);
+  assert.equal(card.workingOrder?.exitIntentId, "exit-intent-1");
+  assert.equal(card.workingOrder?.attempt, 2);
+  assert.equal(card.workingOrder?.urgency, 0.85);
+  assert.equal(card.workingOrder?.actionTtlMs, 483);
+  assert.equal(card.workingOrder?.priceCollar, 1.85);
+
+  await dashboard.record(event("exit_fill", {
+    reason: "REVERSAL_CUSUM", symbol, direction: "BULLISH",
+    entryTimestamp: timestamp, averageEntryPrice: 2, incrementalQuantity: 1,
+    incrementalPrice: 2.18, realizedPnl: 18, remainingQuantity: 0,
+    tradeState: "PROTECTED_RECOVERED",
+    exitTriggers: ["REVERSAL_CUSUM", "CONTINUATION_LCB_NON_POSITIVE"],
+  }, 300));
+
+  const completed = saved.at(-1)!;
+  assert.equal(completed.lifecycle, "CLOSED");
+  assert.equal(completed.managementReason, "REVERSAL_CUSUM");
+  assert.deepEqual(completed.exitTriggers, [
+    "REVERSAL_CUSUM",
+    "CONTINUATION_LCB_NON_POSITIVE",
+  ]);
+  assert.ok(completed.updates.some((update) =>
+    update.managementDecision === "EXIT" && update.reversalCusum === 2.8));
 });
 
 test("historical order cards rebuild every bid-driven P&L change as a trackable list", () => {
@@ -533,7 +668,7 @@ test("dashboard reconstructs fired entries, broker execution, trades, and perfor
   assert.match(tradingDashboardHtml(), /Orders &amp; Executions/);
   assert.match(tradingDashboardHtml(), /<h2>Orders<\/h2>/);
   assert.doesNotMatch(tradingDashboardHtml(), /<h2>Live Orders<\/h2>/);
-  assert.match(tradingDashboardHtml(), /P&amp;L or status change/);
+  assert.match(tradingDashboardHtml(), /order manager lifecycle/);
   assert.match(tradingDashboardHtml(), /Entry Timing &amp; Quality/);
   assert.match(tradingDashboardHtml(), /Order Execution Quality/);
   assert.match(tradingDashboardHtml(), /Setup Comparison/);

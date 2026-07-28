@@ -134,6 +134,12 @@ export interface EngineConfig {
     cancelAfterMs: number;
     orderPollMs: number;
     optionTickSize: number;
+    entrySignalTtlMs: number;
+    adverseFillSpreadFraction: number;
+    exitTtlMinMs: number;
+    exitTtlMaxMs: number;
+    exitPriceCollarPct: number;
+    exitMarketableOffsetTicks: number;
   };
   risk: {
     riskFractionOfEquity: number;
@@ -156,6 +162,29 @@ export interface EngineConfig {
     earlyScratchUnderlyingReversalBps: number;
     staleDataEmergencySec: number;
     onePositionAtATime: boolean;
+    minimumProfitFloorDollars: number;
+    directWinnerActivationDollars: number;
+    recoveredActivationDollars: number;
+    meaningfulAdverseExcursionDollars: number;
+    recoveryDeadlineSec: number;
+    stallSec: number;
+    profitRetentionBase: number;
+    profitRetentionMax: number;
+    profitRetentionPeakScaleDollars: number;
+    recoveredRetentionBonus: number;
+    timeRetentionBonus: number;
+    pnlEwmaHalfLifeSec: number;
+    pnlNoiseMultiplier: number;
+    reversalCusumReference: number;
+    reversalCusumThreshold: number;
+    recoveryProbabilityMinAgeSec: number;
+    recoveryProbabilityMinObservations: number;
+    recoveryProbabilityGraceSec: number;
+    optionSnapshotMaxAgeSec: number;
+    greeksExitGraceSec: number;
+    continuationConfidenceZ: number;
+    continuationSpreadCostFraction: number;
+    ivCrushThreshold: number;
   };
 }
 
@@ -188,7 +217,14 @@ export function validateConfig(config: EngineConfig): void {
     config.signals.projectionAccelerationRvCap,
     config.execution.entryLimitSpreadFraction,
     config.execution.exitLimitSpreadFraction,
+    config.execution.adverseFillSpreadFraction,
+    config.execution.exitPriceCollarPct,
     config.risk.trailingProfitFloorPct,
+    config.risk.profitRetentionBase,
+    config.risk.profitRetentionMax,
+    config.risk.recoveredRetentionBonus,
+    config.risk.timeRetentionBonus,
+    config.risk.continuationSpreadCostFraction,
   ];
   if (fractions.some((x) => !Number.isFinite(x) || x < 0 || x > 1)) {
     throw new Error("Configuration contains a fraction outside [0, 1]");
@@ -295,5 +331,33 @@ export function validateConfig(config: EngineConfig): void {
         config.risk.earlyScratchMinimumFavorablePct >= 0 &&
         config.risk.earlyScratchUnderlyingReversalBps >= 0)) {
     throw new Error("Early scratch thresholds must be non-negative and use minAgeSec <= maxAgeSec");
+  }
+  if (!(config.execution.entrySignalTtlMs > 0 &&
+        config.execution.exitTtlMinMs > 0 &&
+        config.execution.exitTtlMaxMs >= config.execution.exitTtlMinMs &&
+        config.execution.exitMarketableOffsetTicks >= 0)) {
+    throw new Error("Order-management TTL and marketable-offset settings are invalid");
+  }
+  if (!(config.risk.minimumProfitFloorDollars >= 0 &&
+        config.risk.directWinnerActivationDollars >= config.risk.minimumProfitFloorDollars &&
+        config.risk.recoveredActivationDollars >= config.risk.directWinnerActivationDollars &&
+        config.risk.meaningfulAdverseExcursionDollars >= 0 &&
+        config.risk.recoveryDeadlineSec > 0 &&
+        config.risk.stallSec > 0 &&
+        config.risk.profitRetentionBase <= config.risk.profitRetentionMax &&
+        config.risk.profitRetentionPeakScaleDollars > 0 &&
+        config.risk.pnlEwmaHalfLifeSec > 0 &&
+        config.risk.pnlNoiseMultiplier >= 0 &&
+        config.risk.reversalCusumReference >= 0 &&
+        config.risk.reversalCusumThreshold > 0 &&
+        config.risk.recoveryProbabilityMinAgeSec >= 0 &&
+        Number.isInteger(config.risk.recoveryProbabilityMinObservations) &&
+        config.risk.recoveryProbabilityMinObservations >= 2 &&
+        config.risk.recoveryProbabilityGraceSec >= 0 &&
+        config.risk.optionSnapshotMaxAgeSec > 0 &&
+        config.risk.greeksExitGraceSec >= 0 &&
+        config.risk.continuationConfidenceZ >= 0 &&
+        config.risk.ivCrushThreshold >= 0)) {
+    throw new Error("Unified stopping-controller settings are invalid");
   }
 }

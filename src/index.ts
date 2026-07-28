@@ -23,6 +23,8 @@ export * from "./options/costGate.js";
 export * from "./options/optionSelector.js";
 export * from "./risk/riskManager.js";
 export * from "./risk/exitManager.js";
+export * from "./risk/tradeStateEstimator.js";
+export * from "./risk/optionContinuation.js";
 export * from "./execution/orderExecutor.js";
 export * from "./options/tradingInvariants.js";
 export * from "./execution/tradingEngine.js";

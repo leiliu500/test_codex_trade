@@ -1,6 +1,11 @@
 import type { EngineConfig } from "../config.js";
-import type { ExitDecision, FeatureSnapshot, OptionQuote, PositionState, RegimeDecision } from "../types.js";
+import type {
+  ExitDecision, ExitReason, ExitTrigger, FeatureSnapshot, OptionQuote, OptionSnapshot, PositionState,
+  RegimeDecision,
+} from "../types.js";
 import { isAtOrAfter } from "../utils/time.js";
+import { estimateOptionContinuation } from "./optionContinuation.js";
+import { firstPassageUpperProbability, TradeStateEstimator } from "./tradeStateEstimator.js";
 
 export interface ExitContext {
   timestamp: number;
@@ -9,78 +14,388 @@ export interface ExitContext {
   feature?: FeatureSnapshot;
   regime?: RegimeDecision;
   killSwitch: boolean;
+  brokerStateReliable?: boolean;
+  dailyRealizedPnl?: number;
+  recoveryProbability?: number;
+  continuationLcbDollars?: number;
+  trendProbability?: number;
+  optionSnapshot?: OptionSnapshot;
 }
 
+/**
+ * Optimal-stopping controller. It emits one logical decision; broker order
+ * retries belong to LiveOrderManager and may not turn this decision back into HOLD.
+ */
 export class ExitManager {
   readonly #config: EngineConfig;
-  constructor(config: EngineConfig) { this.#config = config; }
+  readonly #estimator: TradeStateEstimator;
+
+  constructor(config: EngineConfig) {
+    this.#config = config;
+    this.#estimator = new TradeStateEstimator(config);
+  }
 
   evaluate(context: ExitContext): ExitDecision {
-    const position: PositionState = { ...context.position };
+    const wasLegacyPosition = context.position.tradeState === undefined;
+    let position: PositionState = { ...context.position };
     const quote = context.optionQuote;
+    const quoteStale = !quote ||
+      context.timestamp - quote.timestamp > this.#config.risk.staleDataEmergencySec * 1000;
+    const quoteInvalid = quote !== undefined && (
+      !(quote.bidPrice > 0) ||
+      !(quote.askPrice > quote.bidPrice) ||
+      (quote.askPrice - quote.bidPrice) /
+        Math.max(Number.EPSILON, (quote.askPrice + quote.bidPrice) / 2) >
+          this.#config.dataQuality.maxOptionSpreadPct
+    );
     const mark = quote ? (quote.bidPrice + quote.askPrice) / 2 : undefined;
-    const finish = (reason: NonNullable<ExitDecision["reason"]>): ExitDecision => ({
-      exit: true,
-      reason,
-      ...(mark !== undefined ? { markPrice: mark, liquidationPrice: quote!.bidPrice } : {}),
-      updatedPosition: position,
-    });
+    let liquidationPrice = quote?.bidPrice;
+    let executablePnl = position.executablePnl;
 
-    // Emergency precedence is intentionally explicit and ordered.
-    if (context.killSwitch) return finish("KILL_SWITCH");
-    if (isAtOrAfter(context.timestamp, this.#config.session.forceExit, this.#config.timeZone)) return finish("FORCED_SESSION_EXIT");
-    if (!quote || context.timestamp - quote.timestamp > this.#config.risk.staleDataEmergencySec * 1000) return finish("STALE_DATA");
-    position.highWaterMark = Math.max(position.highWaterMark, mark!);
-    position.lowWaterMark = Math.min(position.lowWaterMark, mark!);
-    if (mark! <= position.stopPrice) return finish("HARD_STOP");
-    if (mark! >= position.targetPrice) return finish("PROFIT_TARGET");
+    if (quote) {
+      const estimate = this.#estimator.estimate(position, quote, context.timestamp, context.feature);
+      position = estimate.position;
+      liquidationPrice = estimate.liquidationPrice;
+      executablePnl = estimate.executablePnl;
+    }
 
-    if (position.highWaterMark >= position.averageEntryPrice * (1 + this.#config.risk.trailingActivationPct)) {
-      const trailingStop = Math.max(
-        position.highWaterMark * (1 - this.#config.risk.trailingDrawdownPct),
-        position.averageEntryPrice * (1 + this.#config.risk.trailingProfitFloorPct),
-      );
-      if (mark! <= trailingStop) return finish("TRAILING_STOP");
+    const triggers: ExitTrigger[] = [];
+    const trigger = (value: ExitTrigger): void => {
+      if (!triggers.includes(value)) triggers.push(value);
+    };
+
+    if (context.killSwitch || context.brokerStateReliable === false || quoteStale || quoteInvalid) {
+      trigger("BROKER_OR_POSITION_RISK");
+    }
+    if (isAtOrAfter(context.timestamp, this.#config.session.forceExit, this.#config.timeZone)) {
+      trigger("FORCED_TIME_EXIT");
+    }
+    if (context.dailyRealizedPnl !== undefined &&
+        context.dailyRealizedPnl <= -this.#config.risk.maxDailyLossDollars) {
+      trigger("DAILY_RISK_SHUTDOWN");
+    }
+
+    if (executablePnl !== undefined) {
+      const riskBudget = 100 * position.quantity *
+        Math.max(0, position.averageEntryPrice - position.stopPrice);
+      if (executablePnl <= -riskBudget || liquidationPrice! <= position.stopPrice) {
+        trigger("HARD_LOSS_BOUNDARY");
+      }
+      if ((position.tradeState === "PROTECTED_WINNER" ||
+           position.tradeState === "PROTECTED_RECOVERED") &&
+          position.protectedFloorPnl !== undefined &&
+          executablePnl <= position.protectedFloorPnl) {
+        trigger("PROFIT_FLOOR_BREACH");
+      }
+    }
+
+    const oppositeRegime = context.regime &&
+      isOppositeRegime(position.direction, context.regime.regime);
+    if (oppositeRegime) trigger("STRUCTURAL_INVALIDATION");
+
+    if (context.feature) {
+      const directionSign = position.direction === "BULLISH" ? 1 : -1;
+      const vwap = context.feature.vwap.sessionVwap;
+      const structureValid =
+        directionSign * context.feature.medium.normalizedSlope > 0 &&
+        (vwap === undefined || directionSign * (context.feature.price - vwap) > 0);
+      if (structureValid) {
+        delete position.invalidSince;
+      } else if (position.invalidSince === undefined) {
+        position.invalidSince = context.timestamp;
+      } else if (
+        context.timestamp - position.invalidSince >=
+          this.#config.risk.trendInvalidationGraceSec * 1000
+      ) {
+        trigger("STRUCTURAL_INVALIDATION");
+      }
+    }
+
+    if ((position.reversalCusum ?? 0) >= this.#config.risk.reversalCusumThreshold &&
+        position.tradeState !== "OPEN_UNPROTECTED") {
+      trigger("REVERSAL_CUSUM");
     }
 
     const ageSec = (context.timestamp - position.entryTimestamp) / 1000;
-    if (this.#config.signals.entryQualityMode === "ENFORCE" &&
-        context.feature && position.underlyingEntryPrice !== undefined &&
-        ageSec >= this.#config.risk.earlyScratchMinAgeSec &&
-        ageSec <= this.#config.risk.earlyScratchMaxAgeSec) {
-      const sign = position.direction === "BULLISH" ? 1 : -1;
-      const favorableMoveReached = position.highWaterMark >=
-        position.averageEntryPrice * (1 + this.#config.risk.earlyScratchMinimumFavorablePct);
-      const underlyingMoveBps = sign *
-        (context.feature.price / position.underlyingEntryPrice - 1) * 10_000;
-      const underlyingReversed = underlyingMoveBps <= -this.#config.risk.earlyScratchUnderlyingReversalBps &&
-        sign * context.feature.fast.normalizedSlope < 0;
-      if (!favorableMoveReached && underlyingReversed) return finish("EARLY_SCRATCH");
+    const usingFallbackRecoveryProbability = context.recoveryProbability === undefined;
+    let recoveryProbability = context.recoveryProbability;
+    if (recoveryProbability === undefined &&
+        position.tradeState === "OPEN_UNPROTECTED" &&
+        ageSec >= this.#config.risk.recoveryProbabilityMinAgeSec &&
+        (position.pnlObservationCount ?? 0) >=
+          this.#config.risk.recoveryProbabilityMinObservations) {
+      const riskBudget = positionRiskBudget(position);
+      recoveryProbability = firstPassageUpperProbability(
+        position.executablePnl ?? 0,
+        -riskBudget,
+        this.#config.risk.recoveredActivationDollars,
+        position.pnlEwmaDriftPerSec ?? 0,
+        position.pnlEwmaVariancePerSec ?? 0,
+      );
     }
-    if (context.timestamp - position.entryTimestamp >= this.#config.risk.maxHoldSec * 1000) return finish("MAX_HOLD");
-    if (context.regime && isOppositeRegime(position.direction, context.regime.regime)) return finish("OPPOSITE_REGIME");
+    if (recoveryProbability !== undefined) {
+      position.estimatedRecoveryProbability = recoveryProbability;
+    }
+    if (recoveryProbability !== undefined &&
+        recoveryProbability <= minimumRecoveryProbability(position, this.#config)) {
+      if (!usingFallbackRecoveryProbability) {
+        trigger("RECOVERY_PROBABILITY_TOO_LOW");
+      } else {
+        position.recoveryProbabilityInvalidSince ??= context.timestamp;
+        if (context.timestamp - position.recoveryProbabilityInvalidSince >=
+            this.#config.risk.recoveryProbabilityGraceSec * 1000) {
+          trigger("RECOVERY_PROBABILITY_TOO_LOW");
+        }
+      }
+    } else {
+      delete position.recoveryProbabilityInvalidSince;
+    }
 
-    if (context.feature) {
-      const s = position.direction === "BULLISH" ? 1 : -1;
-      const vwap = context.feature.vwap.sessionVwap;
-      const valid = s * context.feature.medium.normalizedSlope > 0 &&
-        (vwap === undefined || s * (context.feature.price - vwap) > 0);
-      if (valid) delete position.invalidSince;
-      else if (position.invalidSince === undefined) position.invalidSince = context.timestamp;
-      else if (context.timestamp - position.invalidSince >= this.#config.risk.trendInvalidationGraceSec * 1000) {
-        return finish("TREND_INVALIDATION");
+    let greeksContinuationFired = false;
+    if (quote && context.optionSnapshot) {
+      const continuation = estimateOptionContinuation(
+        position,
+        quote,
+        context.optionSnapshot,
+        context.feature,
+        context.timestamp,
+        this.#config,
+      );
+      position = continuation.position;
+      if (continuation.exitReady) {
+        greeksContinuationFired = true;
+        trigger("CONTINUATION_LCB_NON_POSITIVE");
       }
     }
-    return {
-      exit: false,
-      ...(mark !== undefined ? { markPrice: mark, liquidationPrice: quote.bidPrice } : {}),
-      updatedPosition: position,
-    };
+    if (context.continuationLcbDollars !== undefined) {
+      position.optionContinuationLcbDollars = context.continuationLcbDollars;
+      if (context.continuationLcbDollars <= 0) {
+        trigger("CONTINUATION_LCB_NON_POSITIVE");
+      }
+    }
+    if (context.trendProbability !== undefined &&
+        context.trendProbability < 0.5 &&
+        position.tradeState !== "OPEN_UNPROTECTED") {
+      trigger("CONTINUATION_LCB_NON_POSITIVE");
+    }
+
+    const recoveryDeadlineFired = position.tradeState === "OPEN_UNPROTECTED" &&
+      ageSec >= this.#config.risk.recoveryDeadlineSec;
+    if (recoveryDeadlineFired) {
+      trigger("RECOVERY_PROBABILITY_TOO_LOW");
+    }
+    const maxHoldFired = ageSec >= this.#config.risk.maxHoldSec;
+    if (maxHoldFired) trigger("STALL_OR_OPPORTUNITY_COST");
+
+    const timeSinceHighSec =
+      (context.timestamp - (position.lastHighTimestamp ?? position.entryTimestamp)) / 1000;
+    if (executablePnl !== undefined &&
+        executablePnl > 0 &&
+        position.tradeState === "OPEN_UNPROTECTED" &&
+        timeSinceHighSec >= this.#config.risk.stallSec &&
+        context.continuationLcbDollars !== undefined &&
+        context.continuationLcbDollars <= 0) {
+      trigger("STALL_OR_OPPORTUNITY_COST");
+    }
+
+    // Preserve the old scratch gate as an opt-in compatibility policy. The new
+    // controller records it as negative continuation rather than midpoint loss.
+    let earlyScratchFired = false;
+    if (this.#config.signals.entryQualityMode === "ENFORCE" &&
+        context.feature &&
+        position.underlyingEntryPrice !== undefined &&
+        ageSec >= this.#config.risk.earlyScratchMinAgeSec &&
+        ageSec <= this.#config.risk.earlyScratchMaxAgeSec) {
+      const directionSign = position.direction === "BULLISH" ? 1 : -1;
+      const favorableMoveReached = wasLegacyPosition
+        ? context.position.highWaterMark >=
+            context.position.averageEntryPrice *
+              (1 + this.#config.risk.earlyScratchMinimumFavorablePct)
+        : (position.highWaterPnl ?? 0) >=
+            100 * position.quantity * position.averageEntryPrice *
+              this.#config.risk.earlyScratchMinimumFavorablePct;
+      const underlyingMoveBps = directionSign *
+        (context.feature.price / position.underlyingEntryPrice - 1) * 10_000;
+      const underlyingReversed =
+        underlyingMoveBps <= -this.#config.risk.earlyScratchUnderlyingReversalBps &&
+        directionSign * context.feature.fast.normalizedSlope < 0;
+      if (!favorableMoveReached && underlyingReversed) {
+        earlyScratchFired = true;
+        trigger("CONTINUATION_LCB_NON_POSITIVE");
+      }
+    }
+
+    // Compatibility only for restored pre-rewrite positions. Newly filled
+    // positions treat targetPrice as a moving objective, not a profit ceiling.
+    if (wasLegacyPosition && triggers.length === 0 &&
+        mark !== undefined && mark >= position.targetPrice) {
+      return finish(
+        position, "PROFIT_TARGET", [], mark, liquidationPrice, executablePnl,
+      );
+    }
+    if (wasLegacyPosition && mark !== undefined &&
+        context.position.highWaterMark >=
+          context.position.averageEntryPrice *
+            (1 + this.#config.risk.trailingActivationPct)) {
+      const trailingStop = Math.max(
+        context.position.highWaterMark * (1 - this.#config.risk.trailingDrawdownPct),
+        context.position.averageEntryPrice *
+          (1 + this.#config.risk.trailingProfitFloorPct),
+      );
+      if (mark <= trailingStop && triggers.length === 0) {
+        return finish(
+          position,
+          "TRAILING_STOP",
+          ["PROFIT_FLOOR_BREACH"],
+          mark,
+          liquidationPrice,
+          executablePnl,
+        );
+      }
+    }
+
+    if (triggers.length === 0) {
+      return {
+        exit: false,
+        ...(mark !== undefined ? { markPrice: mark } : {}),
+        ...(liquidationPrice !== undefined ? { liquidationPrice } : {}),
+        ...(executablePnl !== undefined ? { executablePnl } : {}),
+        ...(position.protectedFloorPnl !== undefined
+          ? { protectedFloorPnl: position.protectedFloorPnl }
+          : {}),
+        ...(position.estimatedRecoveryProbability !== undefined
+          ? { recoveryProbability: position.estimatedRecoveryProbability }
+          : {}),
+        ...(position.optionContinuationLcbDollars !== undefined
+          ? { continuationLcbDollars: position.optionContinuationLcbDollars }
+          : {}),
+        updatedPosition: position,
+      };
+    }
+
+    triggers.sort((left, right) =>
+      EXIT_TRIGGER_PRIORITY.indexOf(left) - EXIT_TRIGGER_PRIORITY.indexOf(right));
+    const primary = triggers[0]!;
+    return finish(
+      position,
+      compatibleReason(primary, context, {
+        earlyScratchFired,
+        greeksContinuationFired,
+        maxHoldFired,
+        recoveryDeadlineFired,
+      }),
+      triggers,
+      mark,
+      liquidationPrice,
+      executablePnl,
+    );
   }
 }
 
-function isOppositeRegime(direction: PositionState["direction"], regime: RegimeDecision["regime"]): boolean {
+const EXIT_TRIGGER_PRIORITY: readonly ExitTrigger[] = [
+  "BROKER_OR_POSITION_RISK",
+  "FORCED_TIME_EXIT",
+  "HARD_LOSS_BOUNDARY",
+  "STRUCTURAL_INVALIDATION",
+  "PROFIT_FLOOR_BREACH",
+  "REVERSAL_CUSUM",
+  "RECOVERY_PROBABILITY_TOO_LOW",
+  "CONTINUATION_LCB_NON_POSITIVE",
+  "STALL_OR_OPPORTUNITY_COST",
+  "DAILY_RISK_SHUTDOWN",
+];
+
+function finish(
+  position: PositionState,
+  reason: ExitReason,
+  triggers: ExitTrigger[],
+  markPrice?: number,
+  liquidationPrice?: number,
+  executablePnl?: number,
+): ExitDecision {
+  return {
+    exit: true,
+    reason,
+    triggers,
+    ...(markPrice !== undefined ? { markPrice } : {}),
+    ...(liquidationPrice !== undefined ? { liquidationPrice } : {}),
+    ...(executablePnl !== undefined ? { executablePnl } : {}),
+    ...(position.protectedFloorPnl !== undefined
+      ? { protectedFloorPnl: position.protectedFloorPnl }
+      : {}),
+    ...(position.estimatedRecoveryProbability !== undefined
+      ? { recoveryProbability: position.estimatedRecoveryProbability }
+      : {}),
+    ...(position.optionContinuationLcbDollars !== undefined
+      ? { continuationLcbDollars: position.optionContinuationLcbDollars }
+      : {}),
+    updatedPosition: position,
+  };
+}
+
+function compatibleReason(
+  trigger: ExitTrigger,
+  context: ExitContext,
+  flags: {
+    earlyScratchFired: boolean;
+    greeksContinuationFired: boolean;
+    maxHoldFired: boolean;
+    recoveryDeadlineFired: boolean;
+  },
+): ExitReason {
+  switch (trigger) {
+    case "BROKER_OR_POSITION_RISK":
+      if (context.killSwitch) return "KILL_SWITCH";
+      if (context.brokerStateReliable === false) return "BROKER_OR_POSITION_RISK";
+      if (!context.optionQuote ||
+          context.timestamp - context.optionQuote.timestamp > 0) return "STALE_DATA";
+      return "BROKER_OR_POSITION_RISK";
+    case "FORCED_TIME_EXIT": return "FORCED_SESSION_EXIT";
+    case "HARD_LOSS_BOUNDARY": return "HARD_STOP";
+    case "STRUCTURAL_INVALIDATION":
+      return context.regime &&
+        isOppositeRegime(context.position.direction, context.regime.regime)
+        ? "OPPOSITE_REGIME"
+        : "TREND_INVALIDATION";
+    case "PROFIT_FLOOR_BREACH": return "TRAILING_STOP";
+    case "REVERSAL_CUSUM": return "REVERSAL_CUSUM";
+    case "RECOVERY_PROBABILITY_TOO_LOW":
+      return flags.recoveryDeadlineFired ? "RECOVERY_TIMEOUT" : "RECOVERY_PROBABILITY_TOO_LOW";
+    case "CONTINUATION_LCB_NON_POSITIVE":
+      if (flags.earlyScratchFired) return "EARLY_SCRATCH";
+      if (flags.greeksContinuationFired) return "GREEKS_CONTINUATION_LCB_NON_POSITIVE";
+      return "CONTINUATION_LCB_NON_POSITIVE";
+    case "STALL_OR_OPPORTUNITY_COST":
+      return flags.maxHoldFired ? "MAX_HOLD" : "STALL_OR_OPPORTUNITY_COST";
+    case "DAILY_RISK_SHUTDOWN": return "DAILY_RISK_SHUTDOWN";
+  }
+}
+
+function minimumRecoveryProbability(position: PositionState, config: EngineConfig): number {
+  const current = position.executablePnl ?? 0;
+  const riskBudget = positionRiskBudget(position);
+  const activationValue = config.risk.recoveredActivationDollars;
+  return clamp(
+    (current + riskBudget) / Math.max(Number.EPSILON, activationValue + riskBudget),
+    0,
+    1,
+  );
+}
+
+function positionRiskBudget(position: PositionState): number {
+  return 100 * position.quantity *
+    Math.max(0, position.averageEntryPrice - position.stopPrice);
+}
+
+function isOppositeRegime(
+  direction: PositionState["direction"],
+  regime: RegimeDecision["regime"],
+): boolean {
   const down = new Set(["STRONG_DOWN", "GRIND_DOWN", "GAP_AND_GO_DOWN", "REVERSAL_DOWN"]);
   const up = new Set(["STRONG_UP", "GRIND_UP", "GAP_AND_GO_UP", "REVERSAL_UP"]);
   return direction === "BULLISH" ? down.has(regime) : up.has(regime);
+}
+
+function clamp(value: number, minimum: number, maximum: number): number {
+  return Math.min(maximum, Math.max(minimum, value));
 }

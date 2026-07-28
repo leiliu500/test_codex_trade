@@ -6,6 +6,8 @@ import {
   type DashboardOrderEntryQuality,
   type DashboardOrderCard,
   type DashboardOrderDynamicsUpdate,
+  type DashboardOrderManagement,
+  type DashboardOptionContinuation,
   type OrderCardPersistence,
 } from "./orderCards.js";
 
@@ -56,6 +58,13 @@ export interface DashboardOrder {
   filledQuantity: number;
   averageFillPrice?: number;
   replacements: number;
+  urgency?: number;
+  actionTtlMs?: number;
+  priceCollar?: number;
+  marketable?: boolean;
+  exitIntentId?: string;
+  attempt?: number;
+  triggers?: string[];
   firstFillTimestamp?: number;
   completedTimestamp?: number;
   fillPercentage?: number;
@@ -65,7 +74,7 @@ export interface DashboardOrder {
   exitReason?: string;
 }
 
-export interface DashboardTrade {
+export interface DashboardTrade extends DashboardOrderManagement {
   id: string;
   signalId?: string;
   symbol: string;
@@ -183,7 +192,7 @@ export interface DashboardFalseNegativeSummary {
   gateBlocks: Array<{ reason: string; count: number }>;
 }
 
-export interface DashboardActiveOrder {
+export interface DashboardActiveOrder extends DashboardOrderManagement {
   id: string;
   symbol: string;
   direction?: string;
@@ -214,6 +223,13 @@ export interface DashboardActiveOrder {
     requestedQuantity: number;
     filledQuantity: number;
     replacements: number;
+    urgency?: number;
+    actionTtlMs?: number;
+    priceCollar?: number;
+    marketable?: boolean;
+    exitIntentId?: string;
+    attempt?: number;
+    triggers?: string[];
   };
   updates?: DashboardOrderDynamicsUpdate[];
 }
@@ -439,6 +455,7 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
     else if (event.type === "broker_order_state") this.#recordOrderState(event);
     else if (event.type === "broker_order_replaced") this.#recordOrderReplacement(event);
     else if (event.type === "entry_fill") this.#recordEntryFill(event);
+    else if (event.type === "order_management_state") this.#recordOrderManagementState(event);
     else if (event.type === "exit_fill") this.#recordExitFill(event);
     else if (event.type === "execution_halted") {
       this.#lastExecutionError = stringValue(event.data.reason) ?? "Execution halted";
@@ -801,6 +818,12 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
         id: trade.entryOrderId ?? trade.id,
         symbol: trade.symbol,
         direction: trade.direction,
+        ...copyOrderManagement(trade),
+        lifecycle: workingOrder?.purpose === "EXIT"
+          ? "EXIT_PENDING"
+          : workingOrder?.purpose === "ENTRY"
+            ? "ENTRY_PENDING"
+            : trade.lifecycle ?? trade.tradeState ?? "OPEN_UNPROTECTED",
         stage: workingOrder?.purpose === "EXIT" ? "EXIT_WORKING"
           : workingOrder?.purpose === "ENTRY" ? "PARTIAL_ENTRY" : "POSITION_OPEN",
         quantity: trade.quantity,
@@ -833,6 +856,7 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
       cards.push({
         id: order.clientOrderId,
         symbol: order.symbol,
+        lifecycle: order.purpose === "EXIT" ? "EXIT_PENDING" : "ENTRY_PENDING",
         stage: order.purpose === "EXIT" ? "EXIT_WORKING" : "ENTRY_WORKING",
         quantity: order.quantity,
         remainingQuantity: Math.max(0, order.quantity - order.filledQuantity),
@@ -1066,6 +1090,10 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
       ? stringValue(event.data.signalId) ?? this.#matchingSignal(symbol, timestamp)?.id
       : undefined;
     const limitPrice = numberValue(order.limitPrice) ?? 0;
+    const urgency = numberValue(event.data.urgency) ?? numberValue(order.urgency);
+    const exitIntentId =
+      stringValue(event.data.exitIntentId) ?? stringValue(order.intentId);
+    const triggers = stringArray(event.data.triggers);
     this.#orders.set(clientOrderId, {
       clientOrderId,
       ...(signalId ? { signalId } : {}),
@@ -1081,6 +1109,19 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
       filledQuantity: numberValue(order.filledQuantity) ?? 0,
       ...(positiveNumber(order.averageFillPrice) !== undefined ? { averageFillPrice: positiveNumber(order.averageFillPrice)! } : {}),
       replacements: numberValue(order.replacements) ?? 0,
+      ...(urgency !== undefined ? { urgency } : {}),
+      ...(numberValue(order.actionTtlMs) !== undefined
+        ? { actionTtlMs: numberValue(order.actionTtlMs)! }
+        : {}),
+      ...(numberValue(order.priceCollar) !== undefined
+        ? { priceCollar: numberValue(order.priceCollar)! }
+        : {}),
+      ...(typeof order.marketable === "boolean" ? { marketable: order.marketable } : {}),
+      ...(exitIntentId ? { exitIntentId } : {}),
+      ...(numberValue(event.data.attempt) !== undefined
+        ? { attempt: numberValue(event.data.attempt)! }
+        : {}),
+      ...(triggers.length > 0 ? { triggers } : {}),
       ...(stringValue(event.data.reason) ? { exitReason: stringValue(event.data.reason)! } : {}),
     });
     this.#pruneMap(this.#orders, 2_000);
@@ -1142,7 +1183,9 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
     if (order && order.firstFillTimestamp === undefined) order.firstFillTimestamp = event.timestamp;
     const highWaterMark = numberValue(position.highWaterMark) ?? averageEntryPrice;
     const lowWaterMark = numberValue(position.lowWaterMark) ?? averageEntryPrice;
+    const management = orderManagementFields(position);
     if (existing) {
+      Object.assign(existing, management);
       if (order) existing.entryOrderId = order.clientOrderId;
       existing.quantity = Math.max(existing.quantity, quantity);
       existing.averageEntryPrice = averageEntryPrice;
@@ -1167,9 +1210,20 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
         status: "OPEN",
         exitedQuantity: 0,
         exitNotional: 0,
+        ...management,
         ...(order ? { entryOrderId: order.clientOrderId } : {}),
       });
     }
+  }
+
+  #recordOrderManagementState(event: AuditEvent): void {
+    const symbol = stringValue(event.data.symbol);
+    if (!symbol) return;
+    const trade = this.#openTrades.get(symbol);
+    if (!trade) return;
+    const entryTimestamp = numberValue(event.data.entryTimestamp);
+    if (entryTimestamp !== undefined && entryTimestamp !== trade.entryTimestamp) return;
+    Object.assign(trade, orderManagementFields(event.data));
   }
 
   #recordExitFill(event: AuditEvent): void {
@@ -1193,6 +1247,7 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
       };
       this.#openTrades.set(symbol, trade);
     }
+    Object.assign(trade, orderManagementFields(event.data));
     const quantity = numberValue(event.data.incrementalQuantity) ?? 0;
     const price = numberValue(event.data.incrementalPrice) ?? 0;
     const highWaterMark = numberValue(event.data.highWaterMark);
@@ -1298,6 +1353,7 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
       ...(trade?.signalId ? { signalId: trade.signalId } : order?.signalId ? { signalId: order.signalId } : {}),
       symbol: active.symbol,
       ...(active.direction ? { direction: active.direction } : {}),
+      ...copyOrderManagement(active),
       active: true,
       stage: active.stage,
       status: active.workingOrder?.status ?? order?.status ?? trade?.status ?? active.stage,
@@ -1336,6 +1392,8 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
       ...(trade.signalId ? { signalId: trade.signalId } : {}),
       symbol: trade.symbol,
       direction: trade.direction,
+      ...copyOrderManagement(trade),
+      lifecycle: "CLOSED",
       active: false,
       stage: "CLOSED",
       status: exitOrder?.status ?? "CLOSED",
@@ -1386,6 +1444,7 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
       ...(projected.currentAsk !== undefined ? { currentAsk: projected.currentAsk } : {}),
       ...(projected.unrealizedPnl !== undefined ? { unrealizedPnl: projected.unrealizedPnl } : {}),
       ...(projected.totalPnl !== undefined ? { totalPnl: projected.totalPnl } : {}),
+      ...copyOrderManagement(projected),
     };
     const duplicate = updates.some((update) =>
       update.timestamp === next.timestamp && sameDynamics(update, next));
@@ -1606,6 +1665,13 @@ function publicWorkingOrder(order: DashboardOrder): NonNullable<DashboardActiveO
     requestedQuantity: order.quantity,
     filledQuantity: order.filledQuantity,
     replacements: order.replacements,
+    ...(order.urgency !== undefined ? { urgency: order.urgency } : {}),
+    ...(order.actionTtlMs !== undefined ? { actionTtlMs: order.actionTtlMs } : {}),
+    ...(order.priceCollar !== undefined ? { priceCollar: order.priceCollar } : {}),
+    ...(order.marketable !== undefined ? { marketable: order.marketable } : {}),
+    ...(order.exitIntentId ? { exitIntentId: order.exitIntentId } : {}),
+    ...(order.attempt !== undefined ? { attempt: order.attempt } : {}),
+    ...(order.triggers ? { triggers: [...order.triggers] } : {}),
   };
 }
 
@@ -1616,7 +1682,8 @@ function sameDynamics(left: DashboardOrderDynamicsUpdate, right: DashboardOrderD
     left.realizedPnl === right.realizedPnl &&
     left.currentBid === right.currentBid &&
     left.unrealizedPnl === right.unrealizedPnl &&
-    left.totalPnl === right.totalPnl;
+    left.totalPnl === right.totalPnl &&
+    sameOrderManagement(left, right);
 }
 
 function cloneOrderCard(card: DashboardOrderCard): DashboardOrderCard {
@@ -1624,9 +1691,164 @@ function cloneOrderCard(card: DashboardOrderCard): DashboardOrderCard {
   return {
     ...card,
     ...quality,
-    ...(card.workingOrder ? { workingOrder: { ...card.workingOrder } } : {}),
-    updates: card.updates.map((update) => ({ ...update })),
+    ...(card.exitTriggers ? { exitTriggers: [...card.exitTriggers] } : {}),
+    ...(card.optionContinuation
+      ? { optionContinuation: { ...card.optionContinuation } }
+      : {}),
+    ...(card.workingOrder ? {
+      workingOrder: {
+        ...card.workingOrder,
+        ...(card.workingOrder.triggers
+          ? { triggers: [...card.workingOrder.triggers] }
+          : {}),
+      },
+    } : {}),
+    updates: card.updates.map((update) => ({
+      ...update,
+      ...(update.exitTriggers ? { exitTriggers: [...update.exitTriggers] } : {}),
+      ...(update.optionContinuation
+        ? { optionContinuation: { ...update.optionContinuation } }
+        : {}),
+    })),
   };
+}
+
+function orderManagementFields(
+  value: Record<string, unknown>,
+): DashboardOrderManagement {
+  const option = recordValue(value.optionContinuation);
+  const optionContinuation: DashboardOptionContinuation = {
+    ...(numberValue(option.deltaDollars) !== undefined
+      ? { deltaDollars: numberValue(option.deltaDollars)! }
+      : {}),
+    ...(numberValue(option.gammaDollars) !== undefined
+      ? { gammaDollars: numberValue(option.gammaDollars)! }
+      : {}),
+    ...(numberValue(option.vegaDollars) !== undefined
+      ? { vegaDollars: numberValue(option.vegaDollars)! }
+      : {}),
+    ...(numberValue(option.thetaDollars) !== undefined
+      ? { thetaDollars: numberValue(option.thetaDollars)! }
+      : {}),
+    ...(numberValue(option.holdingCostDollars) !== undefined
+      ? { holdingCostDollars: numberValue(option.holdingCostDollars)! }
+      : {}),
+    ...(numberValue(option.uncertaintyDollars) !== undefined
+      ? { uncertaintyDollars: numberValue(option.uncertaintyDollars)! }
+      : {}),
+    ...(numberValue(option.expectedChangeDollars) !== undefined
+      ? { expectedChangeDollars: numberValue(option.expectedChangeDollars)! }
+      : {}),
+    ...(numberValue(option.lcbDollars) !== undefined
+      ? { lcbDollars: numberValue(option.lcbDollars)! }
+      : {}),
+    ...(typeof option.ivCrushDetected === "boolean"
+      ? { ivCrushDetected: option.ivCrushDetected }
+      : {}),
+  };
+  const triggers = stringArray(value.triggers ?? value.exitTriggers);
+  const decision = stringValue(value.decision ?? value.managementDecision);
+  return {
+    ...(stringValue(value.lifecycle) ? { lifecycle: stringValue(value.lifecycle)! } : {}),
+    ...(stringValue(value.tradeState) ? { tradeState: stringValue(value.tradeState)! } : {}),
+    ...(decision === "HOLD" || decision === "EXIT"
+      ? { managementDecision: decision }
+      : {}),
+    ...(stringValue(value.reason ?? value.managementReason)
+      ? { managementReason: stringValue(value.reason ?? value.managementReason)! }
+      : {}),
+    ...(triggers.length > 0 ? { exitTriggers: triggers } : {}),
+    ...(numberValue(value.executablePnl) !== undefined
+      ? { executablePnl: numberValue(value.executablePnl)! }
+      : {}),
+    ...(numberValue(value.liquidationPrice) !== undefined
+      ? { liquidationPrice: numberValue(value.liquidationPrice)! }
+      : {}),
+    ...(numberValue(value.protectedFloorPnl) !== undefined
+      ? { protectedFloorPnl: numberValue(value.protectedFloorPnl)! }
+      : {}),
+    ...(numberValue(value.floorBufferDollars) !== undefined
+      ? { floorBufferDollars: numberValue(value.floorBufferDollars)! }
+      : {}),
+    ...(numberValue(value.highWaterPnl) !== undefined
+      ? { highWaterPnl: numberValue(value.highWaterPnl)! }
+      : {}),
+    ...(numberValue(value.lowWaterPnl) !== undefined
+      ? { lowWaterPnl: numberValue(value.lowWaterPnl)! }
+      : {}),
+    ...(numberValue(value.recoveryProbability ?? value.estimatedRecoveryProbability) !== undefined
+      ? {
+          recoveryProbability:
+            numberValue(value.recoveryProbability ?? value.estimatedRecoveryProbability)!,
+        }
+      : {}),
+    ...(numberValue(value.continuationLcbDollars ?? value.optionContinuationLcbDollars) !== undefined
+      ? {
+          continuationLcbDollars:
+            numberValue(value.continuationLcbDollars ?? value.optionContinuationLcbDollars)!,
+        }
+      : {}),
+    ...(numberValue(value.reversalCusum) !== undefined
+      ? { reversalCusum: numberValue(value.reversalCusum)! }
+      : {}),
+    ...(numberValue(value.zeroCrossings) !== undefined
+      ? { zeroCrossings: numberValue(value.zeroCrossings)! }
+      : {}),
+    ...(numberValue(value.pnlObservationCount) !== undefined
+      ? { pnlObservationCount: numberValue(value.pnlObservationCount)! }
+      : {}),
+    ...(Object.keys(optionContinuation).length > 0 ? { optionContinuation } : {}),
+  };
+}
+
+function copyOrderManagement(
+  value: DashboardOrderManagement,
+): DashboardOrderManagement {
+  return {
+    ...(value.lifecycle ? { lifecycle: value.lifecycle } : {}),
+    ...(value.tradeState ? { tradeState: value.tradeState } : {}),
+    ...(value.managementDecision
+      ? { managementDecision: value.managementDecision }
+      : {}),
+    ...(value.managementReason ? { managementReason: value.managementReason } : {}),
+    ...(value.exitTriggers ? { exitTriggers: [...value.exitTriggers] } : {}),
+    ...(value.executablePnl !== undefined
+      ? { executablePnl: value.executablePnl }
+      : {}),
+    ...(value.liquidationPrice !== undefined
+      ? { liquidationPrice: value.liquidationPrice }
+      : {}),
+    ...(value.protectedFloorPnl !== undefined
+      ? { protectedFloorPnl: value.protectedFloorPnl }
+      : {}),
+    ...(value.floorBufferDollars !== undefined
+      ? { floorBufferDollars: value.floorBufferDollars }
+      : {}),
+    ...(value.highWaterPnl !== undefined ? { highWaterPnl: value.highWaterPnl } : {}),
+    ...(value.lowWaterPnl !== undefined ? { lowWaterPnl: value.lowWaterPnl } : {}),
+    ...(value.recoveryProbability !== undefined
+      ? { recoveryProbability: value.recoveryProbability }
+      : {}),
+    ...(value.continuationLcbDollars !== undefined
+      ? { continuationLcbDollars: value.continuationLcbDollars }
+      : {}),
+    ...(value.reversalCusum !== undefined ? { reversalCusum: value.reversalCusum } : {}),
+    ...(value.zeroCrossings !== undefined ? { zeroCrossings: value.zeroCrossings } : {}),
+    ...(value.pnlObservationCount !== undefined
+      ? { pnlObservationCount: value.pnlObservationCount }
+      : {}),
+    ...(value.optionContinuation
+      ? { optionContinuation: { ...value.optionContinuation } }
+      : {}),
+  };
+}
+
+function sameOrderManagement(
+  left: DashboardOrderManagement,
+  right: DashboardOrderManagement,
+): boolean {
+  return JSON.stringify(copyOrderManagement(left)) ===
+    JSON.stringify(copyOrderManagement(right));
 }
 
 function recordValue(value: unknown): Record<string, unknown> {
@@ -1655,6 +1877,8 @@ export function tradingDashboardHtml(): string {
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>SPY 0DTE Trading Dashboard</title><style>
 :root{color-scheme:dark;--bg:#07111f;--panel:#0e1b2e;--line:#20324b;--text:#e7eef9;--muted:#91a4bd;--green:#35d07f;--red:#ff667a;--blue:#58a6ff;--amber:#f5c451}*{box-sizing:border-box}body{margin:0;background:linear-gradient(135deg,#06101c,#0a1830);color:var(--text);font:14px ui-sans-serif,system-ui,sans-serif}main{max-width:1500px;margin:auto;padding:24px}header{display:flex;justify-content:space-between;gap:18px;align-items:center;margin-bottom:18px}h1{font-size:24px;margin:0}h2{font-size:16px;margin:0 0 12px}.sub,.muted{color:var(--muted)}#state{display:flex;align-items:center;gap:8px;font-weight:700;padding:8px 12px;border:1px solid var(--line);border-radius:999px}.pulse-dot{width:9px;height:9px;border-radius:50%;background:currentColor;box-shadow:0 0 0 0 currentColor;animation:pulse 1.8s infinite}@keyframes pulse{70%{box-shadow:0 0 0 7px transparent}}.ok{color:var(--green)}.degraded{color:var(--amber)}.halted{color:var(--red)}.liveness-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(185px,1fr));gap:10px;margin-bottom:18px}.status-card{background:#0b192b;border:1px solid var(--line);border-radius:10px;padding:12px}.status-card .label{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.05em}.status-card strong{display:block;margin:5px 0 3px;font-size:14px}.status-detail{color:var(--muted);font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.tabs{display:flex;gap:5px;border-bottom:1px solid var(--line);margin-bottom:16px}.tab{appearance:none;border:0;border-bottom:2px solid transparent;background:transparent;color:var(--muted);font:inherit;font-weight:700;padding:11px 16px;cursor:pointer}.tab:hover{color:var(--text)}.tab.active{color:var(--blue);border-bottom-color:var(--blue)}.tab-panel{display:none}.tab-panel.active{display:block}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:12px;margin-bottom:18px}.card,.panel{background:rgba(14,27,46,.94);border:1px solid var(--line);border-radius:12px;box-shadow:0 10px 30px #0003}.card{padding:14px}.card .value{font-size:23px;font-weight:750;margin-top:6px}.card-detail{font-size:11px;margin-top:4px}.panel{padding:16px;margin:14px 0;overflow:auto}.live-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(360px,1fr));gap:14px}.live-card{background:linear-gradient(145deg,#12243d,#0b1729);border:1px solid #294262;border-radius:13px;padding:16px;min-width:0;box-shadow:inset 3px 0 0 var(--blue)}.live-card.profit{box-shadow:inset 3px 0 0 var(--green)}.live-card.loss{box-shadow:inset 3px 0 0 var(--red)}.live-card.completed{background:linear-gradient(145deg,#101d30,#091421)}.live-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}.live-symbol{font-weight:750;font-size:16px;overflow-wrap:anywhere}.badge,.source{display:inline-block;margin-top:5px;padding:3px 7px;border-radius:999px;background:#58a6ff1c;color:var(--blue);font-size:11px;font-weight:700;letter-spacing:.04em}.source{margin:0}.live-pnl{text-align:right;font-size:22px;font-weight:800}.live-return{text-align:right;font-size:12px;margin-top:3px}.entry-quality{display:grid;gap:3px;border:1px solid var(--line);border-radius:8px;margin-top:13px;padding:9px 11px;background:#07111f80}.entry-quality strong{font-size:11px;letter-spacing:.05em}.entry-quality span{color:var(--muted);font-size:11px}.entry-quality.good{border-color:#35d07f66}.entry-quality.good strong{color:var(--green)}.entry-quality.good-entry-poor-exit,.entry-quality.marginal{border-color:#f5c45166}.entry-quality.good-entry-poor-exit strong,.entry-quality.marginal strong{color:var(--amber)}.entry-quality.poor{border-color:#ff667a66}.entry-quality.poor strong{color:var(--red)}.entry-quality.evaluating strong{color:var(--blue)}.entry-quality.not-rated strong{color:var(--muted)}.live-fields{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin-top:16px}.live-field span{display:block;color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.04em;margin-bottom:4px}.live-field strong{font-size:14px}.order-strip{border-top:1px solid var(--line);margin-top:15px;padding-top:12px;display:flex;justify-content:space-between;gap:10px;color:var(--muted);font-size:12px}.dynamics{border-top:1px solid var(--line);margin-top:14px;padding-top:12px}.dynamics-title{color:var(--muted);font-size:11px;font-weight:750;text-transform:uppercase;letter-spacing:.05em;margin-bottom:7px}.dynamics-list{display:grid;gap:5px}.dynamics-row{display:grid;grid-template-columns:72px minmax(105px,1fr) 82px 76px;gap:7px;align-items:center;border-radius:6px;background:#07111f80;padding:7px;font-size:11px}.dynamics-row .dynamics-time,.dynamics-row .dynamics-state{color:var(--muted)}.dynamics-row .dynamics-pnl,.dynamics-row .dynamics-change{text-align:right;font-variant-numeric:tabular-nums}.empty{color:var(--muted);padding:22px;text-align:center;border:1px dashed var(--line);border-radius:10px}.section-note{color:var(--muted);font-size:12px;margin:-6px 0 12px}.decision-reasons{max-width:560px;white-space:normal;line-height:1.45}.outcome{font-weight:750}.outcome.pass{color:var(--green)}.outcome.block{color:var(--amber)}.tune-controls{display:flex;align-items:end;gap:12px;flex-wrap:wrap;margin-bottom:14px}.tune-control{display:grid;gap:5px}.tune-control label{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.04em}.tune-control select{min-width:150px;background:#0a1728;color:var(--text);border:1px solid var(--line);border-radius:7px;padding:8px 10px}.legend{display:flex;gap:16px;flex-wrap:wrap;color:var(--muted);font-size:11px;margin:8px 0}.quality-status{font-weight:750}.quality-status.WIN,.quality-status.FILLED,.quality-status.OPEN{color:var(--green)}.quality-status.LOSS,.quality-status.BLOCKED{color:var(--red)}.quality-status.WORKING,.quality-status.NO_OPTION{color:var(--amber)}table{border-collapse:collapse;width:100%;min-width:850px}th,td{text-align:left;padding:9px 10px;border-bottom:1px solid var(--line);white-space:nowrap}th{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.04em}tbody tr:hover{background:#ffffff08}.positive{color:var(--green)}.negative{color:var(--red)}@media(max-width:700px){main{padding:14px}header{align-items:flex-start;flex-direction:column}.live-grid{grid-template-columns:1fr}.live-fields{grid-template-columns:repeat(2,minmax(0,1fr))}.dynamics-row{grid-template-columns:64px 1fr 72px}.dynamics-change{display:none}.tab{padding:10px}.tune-control{width:100%}.tune-control select{width:100%}}
+</style><style>
+.management{margin-top:13px;border:1px solid #294262;border-radius:9px;background:#081526b8;padding:10px}.management-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:9px}.management-title{color:var(--muted);font-size:11px;font-weight:750;text-transform:uppercase;letter-spacing:.05em}.management-badges{display:flex;gap:5px;flex-wrap:wrap;justify-content:flex-end}.management-badges .badge{margin:0}.management-badges .exit{background:#ff667a1c;color:var(--red)}.management-badges .protected{background:#35d07f1c;color:var(--green)}.management-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:9px}.management-detail{grid-column:1/-1;color:var(--muted);font-size:11px;line-height:1.45;overflow-wrap:anywhere}.order-strip{flex-direction:column}.order-strip-row{display:flex;justify-content:space-between;gap:10px}.order-strip-detail{color:var(--muted);font-size:11px;overflow-wrap:anywhere}.dynamics-state{white-space:normal;line-height:1.35}@media(max-width:700px){.management-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
 </style></head><body><main><header><div><h1>SPY 0DTE Option Day-Trade Dashboard</h1><div class="sub">Live SIP signals · OPRA options · Alpaca paper execution · PostgreSQL history</div></div><div id="state"><span class="pulse-dot"></span><span id="stateText">Loading…</span></div></header>
 <section class="liveness-grid" aria-label="System liveness">
 <div class="status-card"><div class="label">Engine heartbeat</div><strong id="engineState">Connecting</strong><div class="status-detail" id="engineDetail">Waiting for dashboard API</div></div>
@@ -1684,7 +1908,7 @@ export function tradingDashboardHtml(): string {
 <div class="card"><div class="muted">Open Trades</div><div class="value" id="openTrades">0</div></div>
 <div class="card"><div class="muted">Option Subs</div><div class="value" id="subscriptions">0</div></div>
 </section>
-<section class="panel"><h2>Orders</h2><div class="section-note">Active orders update with every observed P&amp;L or status change. Completed timelines remain in PostgreSQL, while visible cards reset with the rest of the dashboard at 10:00 PM Pacific.</div><div id="orderCards" class="live-grid"><div class="empty">Waiting for an option order…</div></div></section>
+<section class="panel"><h2>Orders</h2><div class="section-note">Cards show broker execution plus the order manager lifecycle, direct/recovered protection state, executable P&amp;L, profit floor, recovery and continuation evidence, exit triggers, urgency, and retries. The complete timeline is stored in PostgreSQL for order-history restoration.</div><div id="orderCards" class="live-grid"><div class="empty">Waiting for an option order…</div></div></section>
 <section class="panel"><h2>Signal → Trade Funnel</h2><div class="section-note">A fired signal is not an order. Each row shows option selection, risk, and submission status explicitly.</div><table><thead><tr><th>Time</th><th>Direction</th><th>Kind</th><th>Regime</th><th>Projected</th><th>Option</th><th>Risk</th><th>Status</th><th>Reason</th></tr></thead><tbody id="signals"></tbody></table></section>
 <section class="panel"><h2>Potential Missed Entry Review</h2><div class="section-note">Hindsight diagnostic, not an automatic trade recommendation. A row appears only when directional gates produced NO SIGNAL and SPY subsequently moved at least ${MISSED_ENTRY_MOVE_THRESHOLD_BPS.toFixed(1)} bps in one direction over the ${MISSED_ENTRY_HORIZON_SEC}-second projection horizon. Consecutive rows are clustered for readability.</div><table><thead><tr><th>Evaluation</th><th>Direction</th><th>Regime</th><th>SPY Start</th><th>SPY +${MISSED_ENTRY_HORIZON_SEC}s</th><th>Forward Move</th><th>Failed Gates / Votes</th><th>Decision Reason</th></tr></thead><tbody id="potentialMissRows"></tbody></table></section>
 <section class="panel"><h2>Entry Gate Blocks</h2><div class="section-note">Counts every top-level reason that prevented an entry evaluation. This exposes global state failures such as incomplete opening-range recovery even when no hindsight row is created.</div><table><thead><tr><th>Gate / Reason</th><th>Blocked Evaluations</th><th>Share of Evaluations</th></tr></thead><tbody id="gateBlockRows"></tbody></table></section>
@@ -1726,10 +1950,47 @@ export function tradingDashboardHtml(): string {
 <section class="panel"><h2>Live Feed Into System</h2><div class="section-note">The UI is sampled for readability. PostgreSQL retains quote baselines, full-resolution quotes for working/open options, and every trade, feature, decision, order, and fill.</div><table><thead><tr><th>Received</th><th>Feed</th><th>Type</th><th>Symbol</th><th>Value</th><th>Provider Latency</th><th>Storage Policy</th></tr></thead><tbody id="feedEventsBody"></tbody></table></section>
 </div>
 <div class="muted" id="updated"></div></main><script>
-const $=id=>document.getElementById(id),money=n=>new Intl.NumberFormat('en-US',{style:'currency',currency:'USD'}).format(n||0),num=(n,d=2)=>Number.isFinite(n)?n.toFixed(d):'—',count=n=>Number(n||0).toLocaleString(),time=n=>n?new Date(n).toLocaleString('en-US',{timeZone:'America/New_York'}):'—';
+const $=id=>document.getElementById(id),money=n=>new Intl.NumberFormat('en-US',{style:'currency',currency:'USD'}).format(n||0),optionalMoney=n=>Number.isFinite(n)?money(n):'—',num=(n,d=2)=>Number.isFinite(n)?n.toFixed(d):'—',count=n=>Number(n||0).toLocaleString(),time=n=>n?new Date(n).toLocaleString('en-US',{timeZone:'America/New_York'}):'—';
 function cell(value,cls=''){const td=document.createElement('td');td.textContent=String(value??'—');if(cls)td.className=cls;return td}function rows(id,data,fields,empty=''){const body=$(id);if(data.length===0&&empty){const tr=document.createElement('tr'),td=cell(empty,'muted');td.colSpan=fields.length;tr.append(td);body.replaceChildren(tr);return}body.replaceChildren(...data.map(item=>{const tr=document.createElement('tr');for(const field of fields){const result=field(item);tr.append(cell(result.value,result.cls||''))}return tr}))}
 function node(tag,cls,text){const value=document.createElement(tag);if(cls)value.className=cls;if(text!==undefined)value.textContent=String(text);return value}function field(label,value){const wrap=node('div','live-field'),caption=node('span','',label),content=node('strong','',value);wrap.append(caption,content);return wrap}function duration(ms){if(!Number.isFinite(ms))return '—';const seconds=Math.floor(ms/1000),minutes=Math.floor(seconds/60),hours=Math.floor(minutes/60);return hours>0?hours+'h '+(minutes%60)+'m':minutes>0?minutes+'m '+(seconds%60)+'s':seconds+'s'}
-function renderOrders(items){const root=$('orderCards');if(!items||items.length===0){root.replaceChildren(node('div','empty','No option orders have been recorded.'));return}const cards=items.map(x=>{const pnl=x.totalPnl===undefined?x.unrealizedPnl:x.totalPnl,pnlClass=pnl>0?'positive':pnl<0?'negative':'',card=node('article','live-card '+(x.active?'':'completed ')+(pnl>0?'profit':pnl<0?'loss':'')),head=node('div','live-head'),identity=node('div'),symbol=node('div','live-symbol',x.symbol),badge=node('div','badge',x.stage.replaceAll('_',' ')),pnlBox=node('div'),pnlValue=node('div','live-pnl '+pnlClass,pnl===undefined?'AWAITING FILL':money(pnl)),returnLabel=x.active?' open return':' final return',pnlReturn=node('div','live-return '+pnlClass,x.unrealizedReturnPct===undefined?(x.active?'P&L from executable bid':'Completed order'):num(x.unrealizedReturnPct)+'%'+returnLabel);identity.append(symbol,badge);pnlBox.append(pnlValue,pnlReturn);head.append(identity,pnlBox);const qualityKey=x.entryQuality||'NOT_RATED',qualityClass=qualityKey.toLowerCase().replaceAll('_','-'),quality=node('div','entry-quality '+qualityClass),qualityLabel=node('strong','','ENTRY QUALITY · '+qualityKey.replaceAll('_',' ')),qualityReason=node('span','',x.entryQualityReason||'No quality classification is available.');quality.append(qualityLabel,qualityReason);const fields=node('div','live-fields');fields.append(field('Position',x.remainingQuantity+' / '+x.quantity+' contracts'),field('Entry',x.entryPrice===undefined?'—':money(x.entryPrice)),field(x.active?'Bid / Ask':'Exit',x.active?(x.currentBid===undefined?'—':money(x.currentBid)+' / '+money(x.currentAsk)):(x.exitPrice===undefined?'—':money(x.exitPrice))),field('Stop',x.stopPrice===undefined?'—':money(x.stopPrice)),field('Target',x.targetPrice===undefined?'—':money(x.targetPrice)),field('Elapsed',duration(x.elapsedMs)),field('Realized',money(x.realizedPnl)),field(x.active?'Quote age':'Exit reason',x.active?(x.quoteAgeMs===undefined?'Waiting for quote':duration(x.quoteAgeMs)):(x.exitReason||x.status)),field('Direction',x.direction||'Pending entry'));card.append(head,quality,fields);if(x.workingOrder){const strip=node('div','order-strip'),left=node('span','',x.workingOrder.purpose+' '+x.workingOrder.status+' · '+x.workingOrder.filledQuantity+'/'+x.workingOrder.requestedQuantity+' filled'),right=node('span','',money(x.workingOrder.limitPrice)+' limit · '+x.workingOrder.replacements+' replaces');strip.append(left,right);card.append(strip)}const updates=x.updates||[],pnlUpdates=updates.filter(update=>(update.totalPnl===undefined?update.unrealizedPnl:update.totalPnl)!==undefined).length,statusUpdates=updates.length-pnlUpdates,dynamics=node('div','dynamics'),title=node('div','dynamics-title','Trackable timeline · '+pnlUpdates+' P&L · '+statusUpdates+' status'),list=node('div','dynamics-list');for(const update of [...updates].reverse()){const total=update.totalPnl===undefined?update.unrealizedPnl:update.totalPnl,change=update.pnlChange,row=node('div','dynamics-row'),at=node('span','dynamics-time',new Date(update.timestamp).toLocaleTimeString('en-US',{timeZone:'America/New_York'})),stateText=update.stage.replaceAll('_',' ')+' · '+update.status+(update.currentBid===undefined?'':' · bid '+money(update.currentBid)),state=node('span','dynamics-state',stateText),value=node('span','dynamics-pnl '+(total>0?'positive':total<0?'negative':''),total===undefined?'—':money(total)),delta=node('span','dynamics-change '+(change>0?'positive':change<0?'negative':''),change===undefined?'—':(change>0?'+':'')+money(change));row.append(at,state,value,delta);list.append(row)}if(updates.length===0)list.append(node('div','muted','Waiting for the first P&L or status update.'));dynamics.append(title,list);card.append(dynamics);return card});root.replaceChildren(...cards)}
+function renderOrders(items){
+const root=$('orderCards');
+if(!items||items.length===0){root.replaceChildren(node('div','empty','No option orders have been recorded.'));return}
+const cards=items.map(x=>{
+const pnl=x.totalPnl===undefined?x.unrealizedPnl:x.totalPnl,pnlClass=pnl>0?'positive':pnl<0?'negative':'',card=node('article','live-card '+(x.active?'':'completed ')+(pnl>0?'profit':pnl<0?'loss':'')),head=node('div','live-head'),identity=node('div'),symbol=node('div','live-symbol',x.symbol),badge=node('div','badge',x.stage.replaceAll('_',' ')),pnlBox=node('div'),pnlValue=node('div','live-pnl '+pnlClass,pnl===undefined?'AWAITING FILL':money(pnl)),returnLabel=x.active?' open return':' final return',pnlReturn=node('div','live-return '+pnlClass,x.unrealizedReturnPct===undefined?(x.active?'P&L from executable bid':'Completed order'):num(x.unrealizedReturnPct)+'%'+returnLabel);
+identity.append(symbol,badge);pnlBox.append(pnlValue,pnlReturn);head.append(identity,pnlBox);
+const qualityKey=x.entryQuality||'NOT_RATED',qualityClass=qualityKey.toLowerCase().replaceAll('_','-'),quality=node('div','entry-quality '+qualityClass),qualityLabel=node('strong','','ENTRY QUALITY · '+qualityKey.replaceAll('_',' ')),qualityReason=node('span','',x.entryQualityReason||'No quality classification is available.');
+quality.append(qualityLabel,qualityReason);
+const management=node('div','management'),managementHead=node('div','management-head'),managementTitle=node('div','management-title','Order manager'),managementBadges=node('div','management-badges'),lifecycleBadge=node('span','badge',(x.lifecycle||x.stage).replaceAll('_',' ')),tradeState=x.tradeState||(x.stage==='ENTRY_WORKING'?'AWAITING FILL':'STATE NOT RECORDED'),tradeClass=tradeState.startsWith('PROTECTED')?'badge protected':'badge',tradeBadge=node('span',tradeClass,tradeState.replaceAll('_',' ')),decision=x.managementDecision||(x.stage==='ENTRY_WORKING'?'DECISION PENDING':'DECISION NOT RECORDED'),decisionBadge=node('span','badge '+(decision==='EXIT'?'exit':''),decision.replaceAll('_',' '));
+managementBadges.append(lifecycleBadge,tradeBadge,decisionBadge);managementHead.append(managementTitle,managementBadges);
+const managementGrid=node('div','management-grid');
+managementGrid.append(
+field('Executable P&L',x.executablePnl===undefined?'—':money(x.executablePnl)),
+field('Liquidation',x.liquidationPrice===undefined?'—':money(x.liquidationPrice)),
+field('Profit floor',x.protectedFloorPnl===undefined?'Not active':money(x.protectedFloorPnl)),
+field('Floor buffer',x.floorBufferDollars===undefined?'—':money(x.floorBufferDollars)),
+field('Recovery',x.recoveryProbability===undefined?'—':percent(100*x.recoveryProbability,1)),
+field('Continuation LCB',x.continuationLcbDollars===undefined?'—':money(x.continuationLcbDollars)),
+field('Reversal CUSUM',num(x.reversalCusum)),
+field('MFE / MAE',(x.highWaterPnl===undefined?'—':money(x.highWaterPnl))+' / '+(x.lowWaterPnl===undefined?'—':money(x.lowWaterPnl))),
+field('Observations',(x.pnlObservationCount??0)+' · '+(x.zeroCrossings??0)+' crossings')
+);
+const managementDetails=[];
+if(x.managementReason)managementDetails.push('Reason: '+x.managementReason.replaceAll('_',' '));
+if((x.exitTriggers||[]).length)managementDetails.push('Triggers: '+x.exitTriggers.map(value=>value.replaceAll('_',' ')).join(' · '));
+if(x.optionContinuation){const o=x.optionContinuation;managementDetails.push('Greeks $: Δ '+optionalMoney(o.deltaDollars)+' · Γ '+optionalMoney(o.gammaDollars)+' · Vega '+optionalMoney(o.vegaDollars)+' · Theta '+optionalMoney(o.thetaDollars)+' · cost '+optionalMoney(o.holdingCostDollars)+' · uncertainty '+optionalMoney(o.uncertaintyDollars)+(o.ivCrushDetected?' · IV CRUSH':''))}
+management.append(managementHead,managementGrid);
+if(managementDetails.length)management.append(node('div','management-detail',managementDetails.join(' | ')));
+const fields=node('div','live-fields');
+fields.append(field('Position',x.remainingQuantity+' / '+x.quantity+' contracts'),field('Entry',x.entryPrice===undefined?'—':money(x.entryPrice)),field(x.active?'Bid / Ask':'Exit',x.active?(x.currentBid===undefined?'—':money(x.currentBid)+' / '+money(x.currentAsk)):(x.exitPrice===undefined?'—':money(x.exitPrice))),field('Stop',x.stopPrice===undefined?'—':money(x.stopPrice)),field('Target / objective',x.targetPrice===undefined?'—':money(x.targetPrice)),field('Elapsed',duration(x.elapsedMs)),field('Realized',money(x.realizedPnl)),field(x.active?'Quote age':'Exit reason',x.active?(x.quoteAgeMs===undefined?'Waiting for quote':duration(x.quoteAgeMs)):(x.exitReason||x.managementReason||x.status)),field('Direction',x.direction||'Pending entry'));
+card.append(head,quality,management,fields);
+if(x.workingOrder){const order=x.workingOrder,strip=node('div','order-strip'),row=node('div','order-strip-row'),left=node('span','',order.purpose+' '+order.status+' · '+order.filledQuantity+'/'+order.requestedQuantity+' filled'),right=node('span','',money(order.limitPrice)+' limit · '+order.replacements+' replaces'),details=[],triggerText=(order.triggers||x.exitTriggers||[]).map(value=>value.replaceAll('_',' ')).join(' · ');row.append(left,right);if(order.urgency!==undefined)details.push('urgency '+percent(100*order.urgency,0));if(order.actionTtlMs!==undefined)details.push('TTL '+order.actionTtlMs+' ms');if(order.priceCollar!==undefined)details.push('collar '+money(order.priceCollar));if(order.attempt!==undefined)details.push('attempt '+order.attempt);if(order.exitIntentId)details.push('intent '+order.exitIntentId);strip.append(row);if(details.length)strip.append(node('div','order-strip-detail',details.join(' · ')));if(triggerText)strip.append(node('div','order-strip-detail','Exit triggers · '+triggerText));card.append(strip)}
+const updates=x.updates||[],managementUpdates=updates.filter(update=>update.lifecycle||update.tradeState||update.managementDecision).length,dynamics=node('div','dynamics'),title=node('div','dynamics-title','Durable timeline · '+updates.length+' changes · '+managementUpdates+' manager states'),list=node('div','dynamics-list');
+for(const update of [...updates].reverse()){const total=update.totalPnl===undefined?update.unrealizedPnl:update.totalPnl,change=update.pnlChange,row=node('div','dynamics-row'),at=node('span','dynamics-time',new Date(update.timestamp).toLocaleTimeString('en-US',{timeZone:'America/New_York'})),stateParts=[update.tradeState||update.lifecycle||update.stage,update.managementDecision||update.status];if(update.managementReason)stateParts.push(update.managementReason);if(update.currentBid!==undefined)stateParts.push('bid '+money(update.currentBid));if(update.protectedFloorPnl!==undefined)stateParts.push('floor '+money(update.protectedFloorPnl));const state=node('span','dynamics-state',stateParts.map(value=>String(value).replaceAll('_',' ')).join(' · ')),value=node('span','dynamics-pnl '+(total>0?'positive':total<0?'negative':''),total===undefined?(update.executablePnl===undefined?'—':money(update.executablePnl)):money(total)),delta=node('span','dynamics-change '+(change>0?'positive':change<0?'negative':''),change===undefined?'—':(change>0?'+':'')+money(change));row.append(at,state,value,delta);list.append(row)}
+if(updates.length===0)list.append(node('div','muted','Waiting for the first P&L, controller, or broker-state update.'));
+dynamics.append(title,list);card.append(dynamics);return card});
+root.replaceChildren(...cards)
+}
 function setStatus(valueId,detailId,value,detail,level){$(valueId).textContent=value;$(valueId).className=level;$(detailId).textContent=detail}function age(ms){return Number.isFinite(ms)?duration(ms)+' ago':'No events yet'}function storagePolicy(event,live){if(!live.persistenceEnabled)return 'Disabled';if(event.type==='stock_quote'||event.type==='option_quote')return (live.quoteSampleIntervalMs||0)+' ms baseline · active option full';return 'Full retention'}
 function outcomeClass(value){return ['SIGNAL','SELECTED','ALLOWED','SUBMITTED','REQUESTED','FILLED'].includes(value)?'outcome pass':['NO_SIGNAL','NO_ELIGIBLE_OPTION','BLOCKED','SKIPPED'].includes(value)?'outcome block':'outcome'}
 function decisionDetail(item){const details=[...(item.reasons||[])];for(const direction of item.directions||[]){const failedVotes=(direction.votes||[]).filter(v=>!v.passed).map(v=>v.name);const result=direction.passed?'PASS':(direction.reasons||[]).slice(0,6).join(', ');details.push(direction.direction+': '+result+(failedVotes.length?' · failed votes '+failedVotes.join(', '):''))}return details.join(' · ')||'All configured gates passed'}

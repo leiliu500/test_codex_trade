@@ -1,7 +1,7 @@
 import type { EngineConfig } from "../config.js";
 import type {
-  AccountState, ExitReason, FeatureSnapshot, OptionCandidateEvaluation, OptionQuote, PositionState,
-  RegimeDecision, RiskDecision, TradeSignal,
+  AccountState, ExitDecision, ExitReason, ExitTrigger, FeatureSnapshot, OptionCandidateEvaluation,
+  OptionQuote, OptionSnapshot, PositionState, RegimeDecision, RiskDecision, TradeSignal,
 } from "../types.js";
 import type { BrokerOrder, TradingRestClient } from "../alpaca/restClient.js";
 import { reconcileBrokerState } from "../alpaca/restClient.js";
@@ -27,6 +27,30 @@ interface PendingBrokerExecution {
   exitReason?: ExitReason;
   cancelRequested?: boolean;
   lastPolledAt: number;
+  signalTimestamp?: number;
+  maxEntryPremium?: number;
+  exitIntentId?: string;
+  entryImpliedVolatility?: number;
+  entrySnapshotTimestamp?: number;
+}
+
+export type TradeLifecycleState =
+  | "FLAT"
+  | "ENTRY_PENDING"
+  | "OPEN_UNPROTECTED"
+  | "PROTECTED_WINNER"
+  | "PROTECTED_RECOVERED"
+  | "EXIT_PENDING"
+  | "CLOSED"
+  | "SAFE_MODE";
+
+interface LogicalExitIntent {
+  id: string;
+  createdAt: number;
+  reason: ExitReason;
+  triggers: ExitTrigger[];
+  urgency: number;
+  attempts: number;
 }
 
 export interface EntryExecutionRequest {
@@ -34,6 +58,7 @@ export interface EntryExecutionRequest {
   signal: TradeSignal;
   candidate: OptionCandidateEvaluation;
   quote: OptionQuote;
+  optionSnapshot?: OptionSnapshot;
   killSwitch?: boolean;
 }
 
@@ -43,6 +68,11 @@ export interface ExecutionTick {
   feature?: FeatureSnapshot;
   regime?: RegimeDecision;
   killSwitch?: boolean;
+  brokerStateReliable?: boolean;
+  recoveryProbability?: number;
+  continuationLcbDollars?: number;
+  trendProbability?: number;
+  optionSnapshot?: OptionSnapshot;
 }
 
 export interface EntryExecutionResult {
@@ -55,11 +85,22 @@ export interface EntryExecutionResult {
 export interface LiveExecutionSnapshot {
   halted: boolean;
   haltReason?: string;
+  lifecycle: TradeLifecycleState;
+  safeMode: boolean;
   position?: PositionState;
+  exitIntent?: {
+    id: string;
+    createdAt: number;
+    reason: ExitReason;
+    triggers: ExitTrigger[];
+    urgency: number;
+    attempts: number;
+  };
   pending?: {
     purpose: ExecutionPurpose;
     brokerOrderId: string;
     exitReason?: ExitReason;
+    exitIntentId?: string;
     order: OrderState;
   };
 }
@@ -94,6 +135,9 @@ export class LiveOrderManager {
   readonly #knownClientOrderIds: Set<string>;
   #position: PositionState | undefined;
   #pending: PendingBrokerExecution | undefined;
+  #exitIntent: LogicalExitIntent | undefined;
+  #lifecycle: TradeLifecycleState = "FLAT";
+  #safeMode = false;
   readonly #lastOptionQuotes = new Map<string, OptionQuote>();
   #halted = false;
   #haltReason: string | undefined;
@@ -115,7 +159,10 @@ export class LiveOrderManager {
       this.#risk.restoreState(options.restoredRiskState);
       this.#shadowRisk.restoreState(options.restoredRiskState);
     }
-    this.#position = options.restoredPosition ? { ...options.restoredPosition } : undefined;
+    this.#position = options.restoredPosition
+      ? normalizeRestoredPosition(options.restoredPosition)
+      : undefined;
+    if (this.#position) this.#lifecycle = this.#position.tradeState ?? "OPEN_UNPROTECTED";
     this.#knownClientOrderIds = new Set(options.knownClientOrderIds ?? []);
   }
 
@@ -124,11 +171,38 @@ export class LiveOrderManager {
       this.#assertOperational();
       const reconciliation = await reconcileBrokerState(this.#client, this.#position, this.#knownClientOrderIds);
       await this.#audit(timestamp, "broker_reconciliation", { reconciliation });
+      if (!this.#position &&
+          reconciliation.brokerPositions.length === 1 &&
+          reconciliation.openOrders.length === 0) {
+        const brokerPosition = reconciliation.brokerPositions[0]!;
+        this.#position = this.#risk.createFilledPosition(
+          brokerPosition.symbol,
+          brokerPosition.direction,
+          brokerPosition.quantity,
+          brokerPosition.averageEntryPrice,
+          timestamp,
+          brokerPosition.underlyingEntryPrice,
+        );
+        this.#safeMode = true;
+        this.#lifecycle = "SAFE_MODE";
+        this.#createExitIntent(timestamp, {
+          exit: true,
+          reason: "BROKER_OR_POSITION_RISK",
+          triggers: ["BROKER_OR_POSITION_RISK"],
+          updatedPosition: this.#position,
+        });
+        await this.#audit(timestamp, "broker_position_adopted_safe_mode", {
+          brokerPosition,
+          exitIntent: this.#exitIntent,
+        });
+        return this.snapshot();
+      }
       if (!reconciliation.matched || reconciliation.openOrders.length > 0) {
         const reasons = [...reconciliation.reasons];
         if (reconciliation.openOrders.length > 0) reasons.push("OPEN_ORDERS_REQUIRE_RESTORED_LOCAL_STATE");
         await this.#halt(timestamp, `BROKER_RECONCILIATION_FAILED:${[...new Set(reasons)].join(",")}`);
       }
+      this.#lifecycle = this.#position?.tradeState ?? (this.#position ? "OPEN_UNPROTECTED" : "FLAT");
       return this.snapshot();
     });
   }
@@ -139,9 +213,14 @@ export class LiveOrderManager {
       const reasons: string[] = [];
       if (this.#pending) reasons.push("ORDER_ALREADY_PENDING");
       if (this.#position) reasons.push("POSITION_ALREADY_OPEN");
+      if (this.#exitIntent) reasons.push("EXIT_RECONCILIATION_PENDING");
+      if (this.#safeMode) reasons.push("SAFE_MODE");
       if (!request.candidate.eligible) reasons.push("CANDIDATE_NOT_ELIGIBLE");
       if (!request.candidate.contract) reasons.push("MISSING_OPTION_CONTRACT");
       if (request.candidate.symbol !== request.quote.symbol) reasons.push("CANDIDATE_QUOTE_SYMBOL_MISMATCH");
+      if (request.optionSnapshot && request.optionSnapshot.symbol !== request.candidate.symbol) {
+        reasons.push("CANDIDATE_SNAPSHOT_SYMBOL_MISMATCH");
+      }
       if (request.candidate.symbol === "SPY") reasons.push("UNDERLYING_ORDER_FORBIDDEN");
 
       const clock = await this.#client.getMarketClock();
@@ -151,6 +230,9 @@ export class LiveOrderManager {
       }
       const quoteValidation = validateOptionQuote(request.quote, clock.timestamp, this.#config.dataQuality);
       if (!quoteValidation.usable) reasons.push(...quoteValidation.reasons.map((reason) => `QUOTE_${reason}`));
+      if (clock.timestamp - request.signal.timestamp > this.#config.execution.entrySignalTtlMs) {
+        reasons.push("SIGNAL_TTL_EXPIRED");
+      }
       if (reasons.length > 0) {
         await this.#audit(clock.timestamp, "entry_blocked", { signalId: request.signal.id, reasons });
         return { submitted: false, reasons: [...new Set(reasons)] };
@@ -183,6 +265,7 @@ export class LiveOrderManager {
         quantity: risk.quantity,
         timestamp: clock.timestamp,
         quote: request.quote,
+        priceCollar: maximumEntryPremium(request.candidate, request.quote, this.#config),
       });
       state = this.#orders.submit(state, clock.timestamp);
       await this.#audit(clock.timestamp, "broker_order_request", {
@@ -197,8 +280,19 @@ export class LiveOrderManager {
         direction: request.signal.direction,
         signalId: request.signal.id,
         underlyingEntryPrice: request.signal.featureSnapshot.price,
+        signalTimestamp: request.signal.timestamp,
+        maxEntryPremium: state.priceCollar,
+        ...(request.candidate.impliedVolatility !== undefined
+          ? { entryImpliedVolatility: request.candidate.impliedVolatility }
+          : request.optionSnapshot?.impliedVolatility !== undefined
+            ? { entryImpliedVolatility: request.optionSnapshot.impliedVolatility }
+            : {}),
+        ...(request.optionSnapshot?.timestamp !== undefined
+          ? { entrySnapshotTimestamp: request.optionSnapshot.timestamp }
+          : {}),
         lastPolledAt: clock.timestamp,
       };
+      this.#lifecycle = "ENTRY_PENDING";
       await this.#synchronizeBrokerOrder(brokerOrder, clock.timestamp);
       return { submitted: true, reasons: [], risk, brokerOrder };
     });
@@ -217,9 +311,28 @@ export class LiveOrderManager {
       if (this.#pending?.purpose === "ENTRY" && this.#position) {
         const exit = await this.#evaluateExit(request);
         if (exit.exit) {
-          await this.#audit(request.timestamp, "partial_entry_exit_requested", { reason: exit.reason, position: this.#position });
+          this.#createExitIntent(request.timestamp, exit);
+          await this.#audit(request.timestamp, "partial_entry_exit_requested", {
+            reason: exit.reason,
+            triggers: exit.triggers,
+            position: this.#position,
+            exitIntent: this.#exitIntent,
+          });
           await this.#requestCancel(request.timestamp);
-          if (!this.#pending && this.#position) await this.#submitExit(request.timestamp, exit.reason!);
+          if (!this.#pending && this.#position) await this.#submitExitAttempt(request.timestamp);
+          return this.snapshot();
+        }
+      }
+
+      if (this.#pending?.purpose === "ENTRY") {
+        const cancellationReasons = this.#entryCancellationReasons(request);
+        if (cancellationReasons.length > 0) {
+          await this.#audit(request.timestamp, "entry_cancel_decision", {
+            reasons: cancellationReasons,
+            brokerOrderId: this.#pending.brokerOrderId,
+            order: this.#pending.state,
+          });
+          await this.#requestCancel(request.timestamp);
           return this.snapshot();
         }
       }
@@ -229,9 +342,17 @@ export class LiveOrderManager {
         return this.snapshot();
       }
 
+      if (this.#exitIntent && this.#position) {
+        await this.#submitExitAttempt(request.timestamp);
+        return this.snapshot();
+      }
+
       if (this.#position) {
         const exit = await this.#evaluateExit(request);
-        if (exit.exit) await this.#submitExit(request.timestamp, exit.reason!);
+        if (exit.exit) {
+          this.#createExitIntent(request.timestamp, exit);
+          await this.#submitExitAttempt(request.timestamp);
+        }
       }
       return this.snapshot();
     });
@@ -240,12 +361,23 @@ export class LiveOrderManager {
   snapshot(): LiveExecutionSnapshot {
     return {
       halted: this.#halted,
+      lifecycle: this.#lifecycle,
+      safeMode: this.#safeMode,
       ...(this.#haltReason ? { haltReason: this.#haltReason } : {}),
       ...(this.#position ? { position: { ...this.#position } } : {}),
+      ...(this.#exitIntent ? { exitIntent: {
+        id: this.#exitIntent.id,
+        createdAt: this.#exitIntent.createdAt,
+        reason: this.#exitIntent.reason,
+        triggers: [...this.#exitIntent.triggers],
+        urgency: this.#exitIntent.urgency,
+        attempts: this.#exitIntent.attempts,
+      } } : {}),
       ...(this.#pending ? { pending: {
         purpose: this.#pending.purpose,
         brokerOrderId: this.#pending.brokerOrderId,
         ...(this.#pending.exitReason ? { exitReason: this.#pending.exitReason } : {}),
+        ...(this.#pending.exitIntentId ? { exitIntentId: this.#pending.exitIntentId } : {}),
         order: { ...this.#pending.state, events: [...this.#pending.state.events] },
       } } : {}),
     };
@@ -262,6 +394,20 @@ export class LiveOrderManager {
       ...(request.feature ? { feature: request.feature } : {}),
       ...(request.regime ? { regime: request.regime } : {}),
       killSwitch: request.killSwitch === true,
+      ...(request.brokerStateReliable !== undefined
+        ? { brokerStateReliable: request.brokerStateReliable }
+        : {}),
+      dailyRealizedPnl: this.#risk.state(request.timestamp).realizedPnl,
+      ...(request.recoveryProbability !== undefined
+        ? { recoveryProbability: request.recoveryProbability }
+        : {}),
+      ...(request.continuationLcbDollars !== undefined
+        ? { continuationLcbDollars: request.continuationLcbDollars }
+        : {}),
+      ...(request.trendProbability !== undefined
+        ? { trendProbability: request.trendProbability }
+        : {}),
+      ...(request.optionSnapshot ? { optionSnapshot: request.optionSnapshot } : {}),
     };
     const decision = this.#exits.evaluate(context);
     const shadowDecision = this.#shadowExits.evaluate({ ...context, position: { ...position } });
@@ -285,30 +431,92 @@ export class LiveOrderManager {
       });
     }
     this.#position = decision.updatedPosition;
+    if (!this.#exitIntent) this.#lifecycle = decision.updatedPosition.tradeState ?? "OPEN_UNPROTECTED";
+    await this.#audit(request.timestamp, "order_management_state", {
+      symbol: decision.updatedPosition.symbol,
+      direction: decision.updatedPosition.direction,
+      entryTimestamp: decision.updatedPosition.entryTimestamp,
+      lifecycle: decision.exit
+        ? "EXIT_PENDING"
+        : decision.updatedPosition.tradeState ?? "OPEN_UNPROTECTED",
+      tradeState: decision.updatedPosition.tradeState ?? "OPEN_UNPROTECTED",
+      decision: decision.exit ? "EXIT" : "HOLD",
+      reason: decision.reason ?? null,
+      triggers: decision.triggers ?? [],
+      markPrice: decision.markPrice ?? null,
+      liquidationPrice: decision.liquidationPrice ?? null,
+      executablePnl: decision.executablePnl ?? null,
+      protectedFloorPnl: decision.protectedFloorPnl ?? null,
+      floorBufferDollars:
+        decision.executablePnl !== undefined && decision.protectedFloorPnl !== undefined
+          ? decision.executablePnl - decision.protectedFloorPnl
+          : null,
+      highWaterPnl: decision.updatedPosition.highWaterPnl ?? null,
+      lowWaterPnl: decision.updatedPosition.lowWaterPnl ?? null,
+      recoveryProbability: decision.recoveryProbability ?? null,
+      continuationLcbDollars: decision.continuationLcbDollars ?? null,
+      reversalCusum: decision.updatedPosition.reversalCusum ?? null,
+      zeroCrossings: decision.updatedPosition.zeroCrossings ?? 0,
+      pnlObservationCount: decision.updatedPosition.pnlObservationCount ?? 0,
+      optionContinuation: decision.updatedPosition.optionContinuation ?? null,
+    });
     return decision;
   }
 
-  async #submitExit(timestamp: number, reason: ExitReason): Promise<void> {
+  async #submitExitAttempt(timestamp: number): Promise<void> {
     if (!this.#position) return;
+    const intent = this.#exitIntent;
+    if (!intent) throw new Error("Cannot submit an exit order without a logical exit intent");
     const quote = this.#quoteFor(this.#position.symbol);
     if (!quote) {
-      const reconciliation = await reconcileBrokerState(this.#client, this.#position, this.#knownClientOrderIds);
-      await this.#audit(timestamp, "exit_quote_missing", { reason, reconciliation });
-      await this.#halt(timestamp, `CANNOT_PRICE_EXIT:${reason}`);
+      this.#safeMode = true;
+      this.#lifecycle = "SAFE_MODE";
+      await this.#audit(timestamp, "exit_quote_missing", {
+        reason: intent.reason,
+        intentId: intent.id,
+        action: "EXIT_INTENT_PERSISTED",
+      });
+      return;
     }
-    const marketable = reason !== "PROFIT_TARGET";
-    const clientOrderId = this.#clientOrderId("exit", reason, timestamp);
+    intent.attempts += 1;
+    const marketable = true;
+    const clientOrderId = this.#clientOrderId(
+      "exit",
+      `${intent.id}-attempt-${intent.attempts}`,
+      timestamp,
+    );
+    const priceCollar = Math.max(
+      this.#config.execution.optionTickSize,
+      quote.bidPrice * (1 - this.#config.execution.exitPriceCollarPct),
+    );
     let state = this.#orders.propose({
       clientOrderId,
       symbol: this.#position.symbol,
       side: "sell",
       quantity: this.#position.quantity,
       timestamp,
-      quote: quote!,
+      quote,
       marketable,
+      urgency: intent.urgency,
+      priceCollar,
+      intentId: intent.id,
     });
     state = this.#orders.submit(state, timestamp);
-    await this.#audit(timestamp, "broker_order_request", { purpose: "EXIT", reason, marketable, order: state });
+    await this.#audit(timestamp, "broker_order_request", {
+      purpose: "EXIT",
+      reason: intent.reason,
+      triggers: intent.triggers,
+      exitIntentId: intent.id,
+      attempt: intent.attempts,
+      urgency: intent.urgency,
+      marketable,
+      tradeState: this.#position.tradeState,
+      executablePnl: this.#position.executablePnl,
+      protectedFloorPnl: this.#position.protectedFloorPnl,
+      estimatedRecoveryProbability: this.#position.estimatedRecoveryProbability,
+      optionContinuation: this.#position.optionContinuation,
+      order: state,
+    });
     const brokerOrder = await this.#submitOrRecover(state, timestamp);
     this.#knownClientOrderIds.add(clientOrderId);
     this.#pending = {
@@ -316,9 +524,11 @@ export class LiveOrderManager {
       brokerOrderId: brokerOrder.id,
       state,
       direction: this.#position.direction,
-      exitReason: reason,
+      exitReason: intent.reason,
+      exitIntentId: intent.id,
       lastPolledAt: timestamp,
     };
+    this.#lifecycle = "EXIT_PENDING";
     await this.#synchronizeBrokerOrder(brokerOrder, timestamp);
   }
 
@@ -366,30 +576,65 @@ export class LiveOrderManager {
         this.#position = reconcileEntryExposure(
           pending.state, pending.direction, timestamp, this.#risk, this.#position, pending.underlyingEntryPrice,
         );
+        if (this.#position && firstFill) {
+          if (pending.entryImpliedVolatility !== undefined) {
+            this.#position.entryImpliedVolatility = pending.entryImpliedVolatility;
+            this.#position.lastImpliedVolatility = pending.entryImpliedVolatility;
+            this.#position.lastOptionSnapshotTimestamp =
+              pending.entrySnapshotTimestamp ?? timestamp;
+          }
+        }
         if (firstFill) {
           this.#risk.recordEntry(timestamp);
           this.#shadowRisk.recordEntry(timestamp);
           this.#shadowScratchAuditedEntryTimestamp = undefined;
         }
+        this.#lifecycle = this.#position?.tradeState ?? "OPEN_UNPROTECTED";
         await this.#audit(timestamp, "entry_fill", {
           signalId: pending.signalId,
           incrementalQuantity, incrementalPrice, cumulativeQuantity: totalFilled, position: this.#position,
         });
       } else if (this.#position) {
         const exitingPosition = { ...this.#position };
+        const quantityBeforeFill = exitingPosition.quantity;
         const realizedPnl = 100 * incrementalQuantity * (incrementalPrice - exitingPosition.averageEntryPrice);
         this.#risk.recordRealizedPnl(timestamp, realizedPnl);
         this.#shadowRisk.recordRealizedPnl(timestamp, realizedPnl);
         this.#position.quantity -= incrementalQuantity;
+        if (this.#position.quantity > 0 && quantityBeforeFill > 0) {
+          const remainingFraction = this.#position.quantity / quantityBeforeFill;
+          for (const key of [
+            "executablePnl",
+            "highWaterPnl",
+            "lowWaterPnl",
+            "protectedFloorPnl",
+            "previousExecutablePnl",
+          ] as const) {
+            const value = this.#position[key];
+            if (value !== undefined) this.#position[key] = value * remainingFraction;
+          }
+        }
         await this.#audit(timestamp, "exit_fill", {
           reason: pending.exitReason, incrementalQuantity, incrementalPrice, realizedPnl,
+          exitIntentId: pending.exitIntentId,
+          exitTriggers: this.#exitIntent?.triggers ?? [],
           symbol: exitingPosition.symbol, direction: exitingPosition.direction,
           entryTimestamp: exitingPosition.entryTimestamp, averageEntryPrice: exitingPosition.averageEntryPrice,
           highWaterMark: exitingPosition.highWaterMark, lowWaterMark: exitingPosition.lowWaterMark,
+          highWaterPnl: exitingPosition.highWaterPnl ?? null,
+          lowWaterPnl: exitingPosition.lowWaterPnl ?? null,
+          executablePnl: exitingPosition.executablePnl ?? null,
+          protectedFloorPnl: exitingPosition.protectedFloorPnl ?? null,
+          estimatedRecoveryProbability: exitingPosition.estimatedRecoveryProbability ?? null,
+          optionContinuation: exitingPosition.optionContinuation ?? null,
+          tradeState: exitingPosition.tradeState ?? null,
           remainingQuantity: this.#position.quantity,
         });
         if (this.#position.quantity === 0) {
           this.#position = undefined;
+          this.#exitIntent = undefined;
+          this.#lifecycle = "CLOSED";
+          this.#safeMode = false;
           this.#shadowScratchAuditedEntryTimestamp = undefined;
         }
       }
@@ -402,16 +647,41 @@ export class LiveOrderManager {
         await this.#halt(timestamp, "BROKER_FILLED_STATUS_WITH_INCOMPLETE_QUANTITY", { broker, pending });
       }
       this.#pending = undefined;
+      if (pending.purpose === "ENTRY" && !this.#position) this.#lifecycle = "FLAT";
       return;
     }
     if (status === "rejected") {
       this.#orders.reject(pending.state, timestamp, "broker rejected order");
       this.#pending = undefined;
+      await this.#reconcilePositionTruth(timestamp, `${pending.purpose}_ORDER_REJECTED`);
+      if (pending.purpose === "ENTRY") {
+        this.#lifecycle = this.#position?.tradeState ?? "FLAT";
+      } else if (this.#position) {
+        this.#lifecycle = this.#safeMode ? "SAFE_MODE" : "EXIT_PENDING";
+        await this.#audit(timestamp, "exit_attempt_failed", {
+          exitIntentId: pending.exitIntentId,
+          reason: pending.exitReason,
+          brokerStatus: status,
+          action: "RETRY_EXIT_INTENT",
+        });
+      }
       return;
     }
     if (CANCELED_BROKER_STATUSES.has(status)) {
       this.#orders.confirmCancel(pending.state, timestamp);
       this.#pending = undefined;
+      await this.#reconcilePositionTruth(timestamp, `${pending.purpose}_ORDER_CANCELED`);
+      if (pending.purpose === "ENTRY") {
+        this.#lifecycle = this.#position?.tradeState ?? "FLAT";
+      } else if (this.#position) {
+        this.#lifecycle = this.#safeMode ? "SAFE_MODE" : "EXIT_PENDING";
+        await this.#audit(timestamp, "exit_attempt_canceled", {
+          exitIntentId: pending.exitIntentId,
+          reason: pending.exitReason,
+          brokerStatus: status,
+          action: "REPRICE_REMAINING_POSITION",
+        });
+      }
       return;
     }
     if (!ACTIVE_BROKER_STATUSES.has(status)) {
@@ -464,6 +734,158 @@ export class LiveOrderManager {
     await this.#synchronizeBrokerOrder(current, timestamp);
   }
 
+  async #reconcilePositionTruth(timestamp: number, cause: string): Promise<void> {
+    let brokerPositions: PositionState[];
+    try {
+      brokerPositions = await this.#client.listPositions();
+    } catch (error) {
+      this.#safeMode = true;
+      this.#lifecycle = "SAFE_MODE";
+      await this.#audit(timestamp, "broker_position_reconciliation_unavailable", {
+        cause,
+        error: error instanceof Error ? error.message : String(error),
+        action: "PERSIST_EXISTING_EXIT_INTENT",
+      });
+      return;
+    }
+    await this.#audit(timestamp, "broker_position_reconciliation", {
+      cause,
+      localPosition: this.#position ?? null,
+      brokerPositions,
+    });
+    if (brokerPositions.length > 1) {
+      await this.#halt(timestamp, "DUPLICATE_OR_UNEXPECTED_POSITIONS_AFTER_ORDER_TERMINAL", {
+        cause,
+        brokerPositions,
+      });
+    }
+    const brokerPosition = brokerPositions[0];
+    if (!brokerPosition) {
+      if (this.#position) {
+        await this.#audit(timestamp, "broker_flat_overrides_local_position", {
+          cause,
+          localPosition: this.#position,
+        });
+      }
+      this.#position = undefined;
+      this.#exitIntent = undefined;
+      this.#safeMode = false;
+      this.#lifecycle = "CLOSED";
+      return;
+    }
+    if (this.#position &&
+        (this.#position.symbol !== brokerPosition.symbol ||
+         this.#position.direction !== brokerPosition.direction)) {
+      await this.#halt(timestamp, "BROKER_POSITION_IDENTITY_MISMATCH_AFTER_ORDER_TERMINAL", {
+        cause,
+        localPosition: this.#position,
+        brokerPosition,
+      });
+    }
+    if (!this.#position) {
+      this.#position = this.#risk.createFilledPosition(
+        brokerPosition.symbol,
+        brokerPosition.direction,
+        brokerPosition.quantity,
+        brokerPosition.averageEntryPrice,
+        timestamp,
+        brokerPosition.underlyingEntryPrice,
+      );
+      this.#safeMode = true;
+      this.#createExitIntent(timestamp, {
+        exit: true,
+        reason: "BROKER_OR_POSITION_RISK",
+        triggers: ["BROKER_OR_POSITION_RISK"],
+        updatedPosition: this.#position,
+      });
+      return;
+    }
+    if (this.#position.quantity !== brokerPosition.quantity ||
+        this.#position.averageEntryPrice !== brokerPosition.averageEntryPrice) {
+      const prior = this.#position;
+      this.#position = {
+        ...prior,
+        quantity: brokerPosition.quantity,
+        averageEntryPrice: brokerPosition.averageEntryPrice,
+        stopPrice: Math.max(
+          this.#config.execution.optionTickSize,
+          brokerPosition.averageEntryPrice * (1 - this.#config.risk.hardOptionStopPct),
+        ),
+        targetPrice:
+          brokerPosition.averageEntryPrice * (1 + this.#config.risk.optionProfitTargetPct),
+      };
+      this.#safeMode = true;
+      if (this.#exitIntent) {
+        this.#lifecycle = "SAFE_MODE";
+      } else {
+        this.#createExitIntent(timestamp, {
+          exit: true,
+          reason: "BROKER_OR_POSITION_RISK",
+          triggers: ["BROKER_OR_POSITION_RISK"],
+          updatedPosition: this.#position,
+        });
+      }
+      await this.#audit(timestamp, "broker_position_quantity_overrode_local_state", {
+        cause,
+        prior,
+        brokerPosition,
+        updatedPosition: this.#position,
+      });
+    }
+  }
+
+  #createExitIntent(timestamp: number, decision: ExitDecision): void {
+    if (!this.#position || !decision.exit || !decision.reason) return;
+    const triggers = decision.triggers ?? [];
+    const urgency = exitUrgency(triggers, decision.reason);
+    if (this.#exitIntent) {
+      for (const trigger of triggers) {
+        if (!this.#exitIntent.triggers.includes(trigger)) this.#exitIntent.triggers.push(trigger);
+      }
+      this.#exitIntent.urgency = Math.max(this.#exitIntent.urgency, urgency);
+      this.#lifecycle = this.#safeMode ? "SAFE_MODE" : "EXIT_PENDING";
+      return;
+    }
+    this.#exitIntent = {
+      id: `exit-${this.#position.entryTimestamp}-${this.#position.symbol}`,
+      createdAt: timestamp,
+      reason: decision.reason,
+      triggers: [...triggers],
+      urgency,
+      attempts: 0,
+    };
+    this.#lifecycle = this.#safeMode ? "SAFE_MODE" : "EXIT_PENDING";
+  }
+
+  #entryCancellationReasons(request: ExecutionTick): string[] {
+    const pending = this.#pending;
+    if (!pending || pending.purpose !== "ENTRY") return [];
+    const reasons: string[] = [];
+    if (request.killSwitch) reasons.push("KILL_SWITCH");
+    if (pending.signalTimestamp !== undefined &&
+        request.timestamp - pending.signalTimestamp >= this.#config.execution.entrySignalTtlMs) {
+      reasons.push("SIGNAL_TTL_EXPIRED");
+    }
+    const quote = this.#quoteFor(pending.state.symbol, request.optionQuote);
+    if (!quote) {
+      reasons.push("OPTION_QUOTE_UNAVAILABLE");
+    } else {
+      const validation = validateOptionQuote(quote, request.timestamp, this.#config.dataQuality);
+      if (!validation.usable) {
+        reasons.push(...validation.reasons.map((reason) => `QUOTE_${reason}`));
+      }
+      if (pending.maxEntryPremium !== undefined &&
+          quote.bidPrice > pending.maxEntryPremium) {
+        reasons.push("MAXIMUM_ENTRY_PREMIUM_EXCEEDED");
+      }
+    }
+    if (request.regime &&
+        isOppositeDirectionRegime(pending.direction, request.regime.regime)) {
+      reasons.push("SIGNAL_DIRECTION_INVALIDATED");
+    }
+    return [...new Set(reasons)];
+  }
+
   #rememberQuote(quote: OptionQuote | undefined): void {
     if (!quote) return;
     const previous = this.#lastOptionQuotes.get(quote.symbol);
@@ -493,6 +915,8 @@ export class LiveOrderManager {
     } catch (error) {
       this.#halted = true;
       this.#haltReason = "AUDIT_RECORDER_FAILURE";
+      this.#safeMode = true;
+      this.#lifecycle = "SAFE_MODE";
       throw error;
     }
   }
@@ -500,6 +924,8 @@ export class LiveOrderManager {
   async #halt(timestamp: number, reason: string, detail: Record<string, unknown> = {}): Promise<never> {
     this.#halted = true;
     this.#haltReason = reason;
+    this.#safeMode = true;
+    this.#lifecycle = "SAFE_MODE";
     try {
       await this.#recorder.record({
         timestamp,
@@ -523,4 +949,72 @@ export class LiveOrderManager {
     this.#tail = result.then(() => undefined, () => undefined);
     return result;
   }
+}
+
+function maximumEntryPremium(
+  candidate: OptionCandidateEvaluation,
+  quote: OptionQuote,
+  config: EngineConfig,
+): number {
+  const midpoint = (quote.bidPrice + quote.askPrice) / 2;
+  const projectedMove = candidate.gammaAwareProjectedOptionMove;
+  const roundTripCost = candidate.roundTripCostPerShare;
+  if (projectedMove !== undefined && projectedMove > 0 &&
+      roundTripCost !== undefined && roundTripCost >= 0) {
+    const predictedFuturePremium = midpoint + projectedMove;
+    return Math.max(
+      config.execution.optionTickSize,
+      predictedFuturePremium - config.signals.costMultiplier * roundTripCost,
+    );
+  }
+  // Without a calibrated premium forecast, never chase beyond the signal-time ask.
+  return quote.askPrice;
+}
+
+function normalizeRestoredPosition(position: PositionState): PositionState {
+  return {
+    ...position,
+    tradeState: position.tradeState ?? "OPEN_UNPROTECTED",
+    executablePnl: position.executablePnl ?? 0,
+    highWaterPnl: position.highWaterPnl ?? 0,
+    lowWaterPnl: position.lowWaterPnl ?? 0,
+    lastPnlTimestamp: position.lastPnlTimestamp ?? position.entryTimestamp,
+    lastHighTimestamp: position.lastHighTimestamp ?? position.entryTimestamp,
+    previousExecutablePnl: position.previousExecutablePnl ?? position.executablePnl ?? 0,
+    pnlEwmaDriftPerSec: position.pnlEwmaDriftPerSec ?? 0,
+    pnlEwmaVariancePerSec: position.pnlEwmaVariancePerSec ?? 0,
+    reversalCusum: position.reversalCusum ?? 0,
+    zeroCrossings: position.zeroCrossings ?? 0,
+    previousPnlSign: position.previousPnlSign ?? 0,
+    pnlObservationCount: position.pnlObservationCount ?? 0,
+    ...(position.underlyingEntryPrice !== undefined
+      ? {
+          lastUnderlyingPrice: position.lastUnderlyingPrice ?? position.underlyingEntryPrice,
+          lastUnderlyingTimestamp: position.lastUnderlyingTimestamp ?? position.entryTimestamp,
+        }
+      : {}),
+  };
+}
+
+function exitUrgency(triggers: readonly ExitTrigger[], reason: ExitReason): number {
+  if (triggers.some((trigger) =>
+    trigger === "BROKER_OR_POSITION_RISK" ||
+    trigger === "FORCED_TIME_EXIT" ||
+    trigger === "HARD_LOSS_BOUNDARY" ||
+    trigger === "DAILY_RISK_SHUTDOWN")) return 1;
+  if (triggers.some((trigger) =>
+    trigger === "PROFIT_FLOOR_BREACH" ||
+    trigger === "REVERSAL_CUSUM")) return 0.85;
+  if (triggers.some((trigger) => trigger === "STRUCTURAL_INVALIDATION")) return 0.75;
+  if (triggers.length > 0) return 0.65;
+  return reason === "PROFIT_TARGET" ? 0.35 : 0.75;
+}
+
+function isOppositeDirectionRegime(
+  direction: TradeSignal["direction"],
+  regime: RegimeDecision["regime"],
+): boolean {
+  const down = new Set(["STRONG_DOWN", "GRIND_DOWN", "GAP_AND_GO_DOWN", "REVERSAL_DOWN"]);
+  const up = new Set(["STRONG_UP", "GRIND_UP", "GAP_AND_GO_UP", "REVERSAL_UP"]);
+  return direction === "BULLISH" ? down.has(regime) : up.has(regime);
 }
