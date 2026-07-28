@@ -1,5 +1,5 @@
 {
-  "version": "spy-0dte-entry-quality-7",
+  "version": "spy-0dte-unified-order-management-2",
   "symbol": "SPY",
   "timeZone": "America/New_York",
   "session": {
@@ -125,7 +125,13 @@
     "maxReplaces": 2,
     "cancelAfterMs": 6500,
     "orderPollMs": 350,
-    "optionTickSize": 0.01
+    "optionTickSize": 0.01,
+    "entrySignalTtlMs": 6500,
+    "adverseFillSpreadFraction": 0.25,
+    "exitTtlMinMs": 250,
+    "exitTtlMaxMs": 1800,
+    "exitPriceCollarPct": 0.15,
+    "exitMarketableOffsetTicks": 2
   },
   "risk": {
     "riskFractionOfEquity": 0.0025,
@@ -147,6 +153,29 @@
     "earlyScratchMinimumFavorablePct": 0.01,
     "earlyScratchUnderlyingReversalBps": 0.1,
     "staleDataEmergencySec": 10,
-    "onePositionAtATime": true
+    "onePositionAtATime": true,
+    "minimumProfitFloorDollars": 7,
+    "directWinnerActivationDollars": 15,
+    "recoveredActivationDollars": 20,
+    "meaningfulAdverseExcursionDollars": 5,
+    "recoveryDeadlineSec": 300,
+    "stallSec": 90,
+    "profitRetentionBase": 0.4,
+    "profitRetentionMax": 0.8,
+    "profitRetentionPeakScaleDollars": 100,
+    "recoveredRetentionBonus": 0.1,
+    "timeRetentionBonus": 0.15,
+    "pnlEwmaHalfLifeSec": 15,
+    "pnlNoiseMultiplier": 1.25,
+    "reversalCusumReference": 0.25,
+    "reversalCusumThreshold": 2.5,
+    "recoveryProbabilityMinAgeSec": 10,
+    "recoveryProbabilityMinObservations": 3,
+    "recoveryProbabilityGraceSec": 5,
+    "optionSnapshotMaxAgeSec": 120,
+    "greeksExitGraceSec": 5,
+    "continuationConfidenceZ": 1,
+    "continuationSpreadCostFraction": 0.25,
+    "ivCrushThreshold": 0.03
   }
 }

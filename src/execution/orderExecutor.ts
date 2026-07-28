@@ -20,6 +20,10 @@ export interface OrderState {
   lastActionAt: number;
   replacements: number;
   marketable: boolean;
+  urgency: number;
+  actionTtlMs: number;
+  priceCollar: number;
+  intentId?: string;
   events: Array<{ timestamp: number; status: OrderStatus; detail: string }>;
 }
 
@@ -31,6 +35,10 @@ export interface OrderProposal {
   timestamp: number;
   quote: OptionQuote;
   marketable?: boolean;
+  urgency?: number;
+  actionTtlMs?: number;
+  priceCollar?: number;
+  intentId?: string;
 }
 
 export function aggressionAtReplacement(initial: number, replacement: number, maximumReplacements: number): number {
@@ -43,6 +51,15 @@ export function limitInsideSpread(
   const raw = side === "buy" ? bid + aggression * (ask - bid) : ask - aggression * (ask - bid);
   const ticks = raw / tickSize;
   return side === "buy" ? Math.ceil(ticks - 1e-10) * tickSize : Math.floor(ticks + 1e-10) * tickSize;
+}
+
+export function urgencyTtl(
+  urgency: number,
+  minimumMs: number,
+  maximumMs: number,
+): number {
+  const bounded = Math.min(1, Math.max(0, urgency));
+  return Math.round((1 - bounded) * maximumMs + bounded * minimumMs);
 }
 
 /** Deterministic state machine used by replay and broker adapters. */
@@ -60,6 +77,17 @@ export class OrderExecutor {
     const limit = limitInsideSpread(
       proposal.quote.bidPrice, proposal.quote.askPrice, proposal.side, fraction, this.#config.execution.optionTickSize,
     );
+    const urgency = Math.min(1, Math.max(0, proposal.urgency ?? (proposal.marketable ? 1 : 0)));
+    const defaultCollar = proposal.side === "buy"
+      ? proposal.quote.askPrice * (1 + this.#config.execution.exitPriceCollarPct)
+      : Math.max(
+          this.#config.execution.optionTickSize,
+          proposal.quote.bidPrice * (1 - this.#config.execution.exitPriceCollarPct),
+        );
+    const priceCollar = proposal.priceCollar ?? defaultCollar;
+    const boundedLimit = proposal.side === "buy"
+      ? Math.min(limit, priceCollar)
+      : Math.max(limit, priceCollar);
     return {
       clientOrderId: proposal.clientOrderId,
       symbol: proposal.symbol,
@@ -67,13 +95,29 @@ export class OrderExecutor {
       requestedQuantity: proposal.quantity,
       filledQuantity: 0,
       averageFillPrice: 0,
-      limitPrice: limit,
+      limitPrice: boundedLimit,
       status: "PROPOSED",
       submittedAt: proposal.timestamp,
       lastActionAt: proposal.timestamp,
       replacements: 0,
       marketable: proposal.marketable ?? false,
-      events: [{ timestamp: proposal.timestamp, status: "PROPOSED", detail: `limit=${limit}` }],
+      urgency,
+      actionTtlMs: proposal.actionTtlMs ?? (
+        proposal.marketable
+          ? urgencyTtl(
+              urgency,
+              this.#config.execution.exitTtlMinMs,
+              this.#config.execution.exitTtlMaxMs,
+            )
+          : this.#config.execution.replaceAfterMs
+      ),
+      priceCollar,
+      ...(proposal.intentId ? { intentId: proposal.intentId } : {}),
+      events: [{
+        timestamp: proposal.timestamp,
+        status: "PROPOSED",
+        detail: `limit=${boundedLimit} urgency=${urgency.toFixed(2)} ttl=${proposal.actionTtlMs ?? this.#config.execution.replaceAfterMs}`,
+      }],
     };
   }
 
@@ -97,18 +141,34 @@ export class OrderExecutor {
 
   onTimer(state: OrderState, timestamp: number, freshQuote?: OptionQuote): OrderState {
     if (!["SUBMITTED", "PARTIAL"].includes(state.status)) return state;
-    if (timestamp - state.submittedAt >= this.#config.execution.cancelAfterMs) {
-      if (state.marketable) {
-        if (freshQuote && timestamp - state.lastActionAt >= this.#config.execution.replaceAfterMs &&
-            timestamp - freshQuote.timestamp <= this.#config.dataQuality.maxOptionQuoteAgeMs) {
-          state.replacements += 1;
-          state.limitPrice = limitInsideSpread(
-            freshQuote.bidPrice, freshQuote.askPrice, state.side, 1, this.#config.execution.optionTickSize,
-          );
-          return this.#transition(state, "SUBMITTED", timestamp, `marketable replacement ${state.replacements} limit=${state.limitPrice}`);
-        }
-        return state;
+    if (state.marketable) {
+      if (freshQuote && timestamp - state.lastActionAt >= state.actionTtlMs &&
+          timestamp - freshQuote.timestamp <= this.#config.dataQuality.maxOptionQuoteAgeMs) {
+        state.replacements += 1;
+        const extraTicks = Math.ceil(
+          state.urgency * this.#config.execution.exitMarketableOffsetTicks *
+          Math.max(1, state.replacements),
+        );
+        const rawLimit = state.side === "sell"
+          ? freshQuote.bidPrice - extraTicks * this.#config.execution.optionTickSize
+          : freshQuote.askPrice + extraTicks * this.#config.execution.optionTickSize;
+        const ticks = rawLimit / this.#config.execution.optionTickSize;
+        const rounded = state.side === "sell"
+          ? Math.floor(ticks + 1e-10) * this.#config.execution.optionTickSize
+          : Math.ceil(ticks - 1e-10) * this.#config.execution.optionTickSize;
+        state.limitPrice = state.side === "sell"
+          ? Math.max(state.priceCollar, rounded)
+          : Math.min(state.priceCollar, rounded);
+        return this.#transition(
+          state,
+          "SUBMITTED",
+          timestamp,
+          `marketable replacement ${state.replacements} limit=${state.limitPrice}`,
+        );
       }
+      return state;
+    }
+    if (timestamp - state.submittedAt >= this.#config.execution.cancelAfterMs) {
       return this.#transition(state, "CANCEL_PENDING", timestamp, "cancel deadline reached");
     }
     if (timestamp - state.lastActionAt >= this.#config.execution.replaceAfterMs &&

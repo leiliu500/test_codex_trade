@@ -255,6 +255,43 @@ export interface PositionState {
   lowWaterMark: number;
   underlyingEntryPrice?: number;
   invalidSince?: number;
+  /** Broker-confirmed trade state. Order submission never changes quantity. */
+  tradeState?: "OPEN_UNPROTECTED" | "PROTECTED_WINNER" | "PROTECTED_RECOVERED";
+  /** Conservative, bid-based liquidation P&L after modeled execution error. */
+  executablePnl?: number;
+  highWaterPnl?: number;
+  lowWaterPnl?: number;
+  protectedFloorPnl?: number;
+  lastPnlTimestamp?: number;
+  lastHighTimestamp?: number;
+  previousExecutablePnl?: number;
+  pnlEwmaDriftPerSec?: number;
+  pnlEwmaVariancePerSec?: number;
+  reversalCusum?: number;
+  zeroCrossings?: number;
+  previousPnlSign?: -1 | 0 | 1;
+  protectionActivatedAt?: number;
+  pnlObservationCount?: number;
+  estimatedRecoveryProbability?: number;
+  recoveryProbabilityInvalidSince?: number;
+  entryImpliedVolatility?: number;
+  lastImpliedVolatility?: number;
+  lastOptionSnapshotTimestamp?: number;
+  lastUnderlyingPrice?: number;
+  lastUnderlyingTimestamp?: number;
+  optionContinuationLcbDollars?: number;
+  optionContinuationInvalidSince?: number;
+  optionContinuation?: {
+    deltaDollars: number;
+    gammaDollars: number;
+    vegaDollars: number;
+    thetaDollars: number;
+    holdingCostDollars: number;
+    uncertaintyDollars: number;
+    expectedChangeDollars: number;
+    lcbDollars: number;
+    ivCrushDetected: boolean;
+  };
 }
 
 export type ExitReason =
@@ -267,13 +304,38 @@ export type ExitReason =
   | "MAX_HOLD"
   | "OPPOSITE_REGIME"
   | "EARLY_SCRATCH"
-  | "TREND_INVALIDATION";
+  | "TREND_INVALIDATION"
+  | "RECOVERY_TIMEOUT"
+  | "RECOVERY_PROBABILITY_TOO_LOW"
+  | "CONTINUATION_LCB_NON_POSITIVE"
+  | "REVERSAL_CUSUM"
+  | "STALL_OR_OPPORTUNITY_COST"
+  | "DAILY_RISK_SHUTDOWN"
+  | "BROKER_OR_POSITION_RISK"
+  | "GREEKS_CONTINUATION_LCB_NON_POSITIVE";
+
+export type ExitTrigger =
+  | "BROKER_OR_POSITION_RISK"
+  | "FORCED_TIME_EXIT"
+  | "HARD_LOSS_BOUNDARY"
+  | "STRUCTURAL_INVALIDATION"
+  | "PROFIT_FLOOR_BREACH"
+  | "REVERSAL_CUSUM"
+  | "RECOVERY_PROBABILITY_TOO_LOW"
+  | "CONTINUATION_LCB_NON_POSITIVE"
+  | "STALL_OR_OPPORTUNITY_COST"
+  | "DAILY_RISK_SHUTDOWN";
 
 export interface ExitDecision {
   exit: boolean;
   reason?: ExitReason;
+  triggers?: ExitTrigger[];
   markPrice?: number;
   liquidationPrice?: number;
+  executablePnl?: number;
+  protectedFloorPnl?: number;
+  recoveryProbability?: number;
+  continuationLcbDollars?: number;
   updatedPosition: PositionState;
 }
 

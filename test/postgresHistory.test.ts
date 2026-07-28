@@ -81,12 +81,27 @@ test("PostgreSQL history saves completed order cards with their full dynamics li
     entryTimestamp: 1_000,
     exitTimestamp: 2_000,
     exitReason: "PROFIT_TARGET",
+    lifecycle: "CLOSED",
+    tradeState: "PROTECTED_RECOVERED",
+    managementDecision: "EXIT",
+    managementReason: "PROFIT_FLOOR_BREACH",
+    exitTriggers: ["PROFIT_FLOOR_BREACH"],
+    executablePnl: 20,
+    protectedFloorPnl: 18,
+    recoveryProbability: 0.81,
+    continuationLcbDollars: -0.5,
     updates: [{
       timestamp: 1_100, stage: "POSITION_OPEN", status: "OPEN", remainingQuantity: 1,
       realizedPnl: 0, currentBid: 2.1, unrealizedPnl: 10, totalPnl: 10,
+      lifecycle: "PROTECTED_RECOVERED", tradeState: "PROTECTED_RECOVERED",
+      managementDecision: "HOLD", executablePnl: 8, protectedFloorPnl: 7,
     }, {
       timestamp: 2_000, stage: "CLOSED", status: "filled", remainingQuantity: 0,
       realizedPnl: 20, unrealizedPnl: 0, totalPnl: 20, pnlChange: 10,
+      lifecycle: "CLOSED", tradeState: "PROTECTED_RECOVERED",
+      managementDecision: "EXIT", managementReason: "PROFIT_FLOOR_BREACH",
+      exitTriggers: ["PROFIT_FLOOR_BREACH"], executablePnl: 20,
+      protectedFloorPnl: 18,
     }],
   };
 
@@ -97,11 +112,14 @@ test("PostgreSQL history saves completed order cards with their full dynamics li
   assert.equal(summary?.values[4], "CLOSED");
   assert.equal(summary?.values[7], 20);
   assert.match(String(summary?.values[12]), /"updates":\[/);
+  assert.match(String(summary?.values[12]), /"tradeState":"PROTECTED_RECOVERED"/);
+  assert.match(String(summary?.values[12]), /"protectedFloorPnl":18/);
   const dynamics = client.queries.find((query) => query.text.includes("INSERT INTO order_card_updates"));
   assert.equal(dynamics?.values.length, 16);
   assert.equal(dynamics?.values[0], "entry-1");
   assert.equal(dynamics?.values[8], "entry-1");
   assert.match(String(dynamics?.values[15]), /"pnlChange":10/);
+  assert.match(String(dynamics?.values[15]), /"managementDecision":"EXIT"/);
   const truncate = client.queries.find((query) => query.text.includes("DELETE FROM order_card_updates"));
   assert.deepEqual(truncate?.values, ["entry-1", 2]);
   await store.close();
@@ -115,7 +133,9 @@ test("PostgreSQL history restores completed cards and ordered dynamics for dashb
           card_id: "entry-1",
           data: {
             id: "entry-1", symbol: "SPY260722C00500000", active: false, stage: "CLOSED",
-            status: "filled", quantity: 1, remainingQuantity: 0, realizedPnl: 20, updates: [],
+            status: "filled", quantity: 1, remainingQuantity: 0, realizedPnl: 20,
+            lifecycle: "CLOSED", tradeState: "PROTECTED_RECOVERED",
+            protectedFloorPnl: 18, updates: [],
           },
         }]
         : text.includes("FROM order_card_updates")
@@ -124,6 +144,8 @@ test("PostgreSQL history restores completed cards and ordered dynamics for dashb
             data: {
               timestamp: 2_000, stage: "CLOSED", status: "filled",
               remainingQuantity: 0, realizedPnl: 20, totalPnl: 20,
+              lifecycle: "CLOSED", tradeState: "PROTECTED_RECOVERED",
+              managementDecision: "EXIT", protectedFloorPnl: 18,
             },
           }]
           : [];
@@ -136,6 +158,9 @@ test("PostgreSQL history restores completed cards and ordered dynamics for dashb
   assert.equal(cards[0]?.id, "entry-1");
   assert.equal(cards[0]?.updates[0]?.stage, "CLOSED");
   assert.equal(cards[0]?.updates[0]?.totalPnl, 20);
+  assert.equal(cards[0]?.tradeState, "PROTECTED_RECOVERED");
+  assert.equal(cards[0]?.protectedFloorPnl, 18);
+  assert.equal(cards[0]?.updates[0]?.managementDecision, "EXIT");
 });
 
 test("PostgreSQL history loads each changed option bid inside a completed card window", async () => {

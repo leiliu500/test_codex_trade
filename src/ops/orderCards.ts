@@ -15,7 +15,39 @@ export type DashboardOrderEntryQuality =
   | "EVALUATING"
   | "NOT_RATED";
 
-export interface DashboardOrderDynamicsUpdate {
+export interface DashboardOptionContinuation {
+  deltaDollars?: number;
+  gammaDollars?: number;
+  vegaDollars?: number;
+  thetaDollars?: number;
+  holdingCostDollars?: number;
+  uncertaintyDollars?: number;
+  expectedChangeDollars?: number;
+  lcbDollars?: number;
+  ivCrushDetected?: boolean;
+}
+
+export interface DashboardOrderManagement {
+  lifecycle?: string;
+  tradeState?: string;
+  managementDecision?: "HOLD" | "EXIT";
+  managementReason?: string;
+  exitTriggers?: string[];
+  executablePnl?: number;
+  liquidationPrice?: number;
+  protectedFloorPnl?: number;
+  floorBufferDollars?: number;
+  highWaterPnl?: number;
+  lowWaterPnl?: number;
+  recoveryProbability?: number;
+  continuationLcbDollars?: number;
+  reversalCusum?: number;
+  zeroCrossings?: number;
+  pnlObservationCount?: number;
+  optionContinuation?: DashboardOptionContinuation;
+}
+
+export interface DashboardOrderDynamicsUpdate extends DashboardOrderManagement {
   timestamp: number;
   stage: DashboardOrderCardStage;
   status: string;
@@ -39,7 +71,7 @@ export interface DashboardOrderQuote {
  * Stable card for one entry-through-exit lifecycle. Completed cards and every
  * observed P&L/status update are stored independently of the dashboard day.
  */
-export interface DashboardOrderCard {
+export interface DashboardOrderCard extends DashboardOrderManagement {
   id: string;
   signalId?: string;
   symbol: string;
@@ -79,6 +111,13 @@ export interface DashboardOrderCard {
     requestedQuantity: number;
     filledQuantity: number;
     replacements: number;
+    urgency?: number;
+    actionTtlMs?: number;
+    priceCollar?: number;
+    marketable?: boolean;
+    exitIntentId?: string;
+    attempt?: number;
+    triggers?: string[];
   };
   updates: DashboardOrderDynamicsUpdate[];
 }
@@ -204,6 +243,7 @@ export function mergeOrderCardQuoteDynamics(
         currentAsk: quote.askPrice,
         unrealizedPnl,
         totalPnl: realizedPnl + unrealizedPnl,
+        ...copyManagementState(state ?? card),
       },
       index: quoteUpdates.length,
     });
@@ -244,15 +284,99 @@ function sameDynamics(left: DashboardOrderDynamicsUpdate, right: DashboardOrderD
     left.realizedPnl === right.realizedPnl &&
     left.currentBid === right.currentBid &&
     left.unrealizedPnl === right.unrealizedPnl &&
-    left.totalPnl === right.totalPnl;
+    left.totalPnl === right.totalPnl &&
+    sameManagementState(left, right);
 }
 
 function cloneCard(card: DashboardOrderCard): DashboardOrderCard {
   return {
     ...card,
-    ...(card.workingOrder ? { workingOrder: { ...card.workingOrder } } : {}),
-    updates: card.updates.map((update) => ({ ...update })),
+    ...(card.exitTriggers ? { exitTriggers: [...card.exitTriggers] } : {}),
+    ...(card.optionContinuation
+      ? { optionContinuation: { ...card.optionContinuation } }
+      : {}),
+    ...(card.workingOrder ? {
+      workingOrder: {
+        ...card.workingOrder,
+        ...(card.workingOrder.triggers
+          ? { triggers: [...card.workingOrder.triggers] }
+          : {}),
+      },
+    } : {}),
+    updates: card.updates.map((update) => ({
+      ...update,
+      ...(update.exitTriggers ? { exitTriggers: [...update.exitTriggers] } : {}),
+      ...(update.optionContinuation
+        ? { optionContinuation: { ...update.optionContinuation } }
+        : {}),
+    })),
   };
+}
+
+function copyManagementState(
+  state: DashboardOrderManagement,
+): DashboardOrderManagement {
+  return {
+    ...(state.lifecycle ? { lifecycle: state.lifecycle } : {}),
+    ...(state.tradeState ? { tradeState: state.tradeState } : {}),
+    ...(state.managementDecision
+      ? { managementDecision: state.managementDecision }
+      : {}),
+    ...(state.managementReason ? { managementReason: state.managementReason } : {}),
+    ...(state.exitTriggers ? { exitTriggers: [...state.exitTriggers] } : {}),
+    ...(state.executablePnl !== undefined
+      ? { executablePnl: state.executablePnl }
+      : {}),
+    ...(state.liquidationPrice !== undefined
+      ? { liquidationPrice: state.liquidationPrice }
+      : {}),
+    ...(state.protectedFloorPnl !== undefined
+      ? { protectedFloorPnl: state.protectedFloorPnl }
+      : {}),
+    ...(state.floorBufferDollars !== undefined
+      ? { floorBufferDollars: state.floorBufferDollars }
+      : {}),
+    ...(state.highWaterPnl !== undefined ? { highWaterPnl: state.highWaterPnl } : {}),
+    ...(state.lowWaterPnl !== undefined ? { lowWaterPnl: state.lowWaterPnl } : {}),
+    ...(state.recoveryProbability !== undefined
+      ? { recoveryProbability: state.recoveryProbability }
+      : {}),
+    ...(state.continuationLcbDollars !== undefined
+      ? { continuationLcbDollars: state.continuationLcbDollars }
+      : {}),
+    ...(state.reversalCusum !== undefined ? { reversalCusum: state.reversalCusum } : {}),
+    ...(state.zeroCrossings !== undefined ? { zeroCrossings: state.zeroCrossings } : {}),
+    ...(state.pnlObservationCount !== undefined
+      ? { pnlObservationCount: state.pnlObservationCount }
+      : {}),
+    ...(state.optionContinuation
+      ? { optionContinuation: { ...state.optionContinuation } }
+      : {}),
+  };
+}
+
+function sameManagementState(
+  left: DashboardOrderManagement,
+  right: DashboardOrderManagement,
+): boolean {
+  return left.lifecycle === right.lifecycle &&
+    left.tradeState === right.tradeState &&
+    left.managementDecision === right.managementDecision &&
+    left.managementReason === right.managementReason &&
+    JSON.stringify(left.exitTriggers ?? []) === JSON.stringify(right.exitTriggers ?? []) &&
+    left.executablePnl === right.executablePnl &&
+    left.liquidationPrice === right.liquidationPrice &&
+    left.protectedFloorPnl === right.protectedFloorPnl &&
+    left.floorBufferDollars === right.floorBufferDollars &&
+    left.highWaterPnl === right.highWaterPnl &&
+    left.lowWaterPnl === right.lowWaterPnl &&
+    left.recoveryProbability === right.recoveryProbability &&
+    left.continuationLcbDollars === right.continuationLcbDollars &&
+    left.reversalCusum === right.reversalCusum &&
+    left.zeroCrossings === right.zeroCrossings &&
+    left.pnlObservationCount === right.pnlObservationCount &&
+    JSON.stringify(left.optionContinuation ?? {}) ===
+      JSON.stringify(right.optionContinuation ?? {});
 }
 
 function formatSignedPnl(value: number): string {

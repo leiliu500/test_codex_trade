@@ -6,6 +6,7 @@ import { evaluateOptionCost, gammaAwareProjectedOptionMove } from "../src/option
 import { formatOccSymbol, parseOccSymbol } from "../src/options/occSymbol.js";
 import { RiskManager } from "../src/risk/riskManager.js";
 import { ExitManager } from "../src/risk/exitManager.js";
+import { TradeStateEstimator } from "../src/risk/tradeStateEstimator.js";
 import { OrderExecutor, aggressionAtReplacement, limitInsideSpread, reconcileEntryExposure } from "../src/execution/orderExecutor.js";
 import { zonedDateTimeToEpoch } from "../src/utils/time.js";
 import type { FeatureSnapshot, PositionState, RegimeDecision } from "../src/types.js";
@@ -248,6 +249,251 @@ test("early scratch exits only when an unproductive position and its underlying 
   }).exit, false);
   const stillAligned = { ...reversed, fast: { normalizedSlope: 0.5 } } as unknown as FeatureSnapshot;
   assert.equal(manager.evaluate({ ...exitContext(position, entry + 5_000, 2), feature: stillAligned }).exit, false);
+});
+
+test("unified trade state uses executable bid P&L and distinguishes recovered from direct winners", () => {
+  const timestamp = zonedDateTimeToEpoch("2026-07-22", "11:00:00");
+  const risk = new RiskManager(defaultConfig);
+  const estimator = new TradeStateEstimator(defaultConfig);
+  const direct = risk.createFilledPosition(
+    "SPY260722C00500000", "BULLISH", 1, 2, timestamp, 500,
+  );
+
+  const falseMidpoint = estimator.estimate(direct, {
+    symbol: direct.symbol,
+    timestamp: timestamp + 1_000,
+    bidPrice: 1.99,
+    askPrice: 2.21,
+    bidSize: 10,
+    askSize: 10,
+  }, timestamp + 1_000);
+  assert.ok(falseMidpoint.midpointPnl > 0);
+  assert.ok(falseMidpoint.executablePnl < 0);
+  assert.equal(falseMidpoint.position.tradeState, "OPEN_UNPROTECTED");
+
+  const directWinner = estimator.estimate(direct, {
+    symbol: direct.symbol,
+    timestamp: timestamp + 1_000,
+    bidPrice: 2.18,
+    askPrice: 2.20,
+    bidSize: 10,
+    askSize: 10,
+  }, timestamp + 1_000);
+  assert.equal(directWinner.position.tradeState, "PROTECTED_WINNER");
+  assert.ok(directWinner.position.protectedFloorPnl! >= defaultConfig.risk.minimumProfitFloorDollars);
+
+  let recovered = risk.createFilledPosition(
+    "SPY260722C00500000", "BULLISH", 1, 2, timestamp, 500,
+  );
+  recovered = estimator.estimate(recovered, {
+    symbol: recovered.symbol,
+    timestamp: timestamp + 1_000,
+    bidPrice: 1.90,
+    askPrice: 1.92,
+    bidSize: 10,
+    askSize: 10,
+  }, timestamp + 1_000).position;
+  recovered = estimator.estimate(recovered, {
+    symbol: recovered.symbol,
+    timestamp: timestamp + 2_000,
+    bidPrice: 2.23,
+    askPrice: 2.25,
+    bidSize: 10,
+    askSize: 10,
+  }, timestamp + 2_000).position;
+  assert.equal(recovered.tradeState, "PROTECTED_RECOVERED");
+});
+
+test("new positions treat the profit target as a moving objective and never lower a protected floor", () => {
+  const timestamp = zonedDateTimeToEpoch("2026-07-22", "11:00:00");
+  const risk = new RiskManager(defaultConfig);
+  const manager = new ExitManager(defaultConfig);
+  let position = risk.createFilledPosition(
+    "SPY260722C00500000", "BULLISH", 1, 2, timestamp, 500,
+  );
+  const aboveLegacyTarget = manager.evaluate(exitContext(position, timestamp + 1_000, 2.80));
+  assert.equal(aboveLegacyTarget.exit, false);
+  assert.equal(aboveLegacyTarget.updatedPosition.tradeState, "PROTECTED_WINNER");
+  const firstFloor = aboveLegacyTarget.updatedPosition.protectedFloorPnl!;
+
+  const ordinaryPullback = manager.evaluate(
+    exitContext(aboveLegacyTarget.updatedPosition, timestamp + 2_000, 2.70),
+  );
+  assert.equal(ordinaryPullback.exit, false);
+  assert.ok(ordinaryPullback.updatedPosition.protectedFloorPnl! >= firstFloor);
+  position = ordinaryPullback.updatedPosition;
+
+  const newHigh = manager.evaluate(exitContext(position, timestamp + 3_000, 3.20));
+  assert.equal(newHigh.exit, false);
+  assert.ok(newHigh.updatedPosition.protectedFloorPnl! >= position.protectedFloorPnl!);
+});
+
+test("bad entries exit on path-implied recovery probability before the hard-loss boundary", () => {
+  const config = structuredClone(defaultConfig);
+  config.risk.recoveryProbabilityMinAgeSec = 0;
+  config.risk.recoveryProbabilityMinObservations = 2;
+  config.risk.recoveryProbabilityGraceSec = 0;
+  const timestamp = zonedDateTimeToEpoch("2026-07-22", "11:00:00");
+  const risk = new RiskManager(config);
+  const manager = new ExitManager(config);
+  let position = risk.createFilledPosition(
+    "SPY260722C00500000", "BULLISH", 1, 2, timestamp, 500,
+  );
+  let decision = manager.evaluate(exitContext(position, timestamp + 1_000, 1.96));
+  assert.equal(decision.exit, false);
+  position = decision.updatedPosition;
+  decision = manager.evaluate(exitContext(position, timestamp + 2_000, 1.91));
+  assert.equal(decision.reason, "RECOVERY_PROBABILITY_TOO_LOW");
+  assert.ok(decision.recoveryProbability! <
+    (decision.executablePnl! + 50) / (config.risk.recoveredActivationDollars + 50));
+  assert.ok(decision.liquidationPrice! > position.stopPrice);
+});
+
+test("a losing entry that recovers promptly becomes protected instead of taking a premature recovery exit", () => {
+  const config = structuredClone(defaultConfig);
+  config.risk.recoveryProbabilityMinAgeSec = 0;
+  config.risk.recoveryProbabilityMinObservations = 2;
+  config.risk.recoveryProbabilityGraceSec = 0;
+  const timestamp = zonedDateTimeToEpoch("2026-07-22", "11:00:00");
+  const risk = new RiskManager(config);
+  const manager = new ExitManager(config);
+  let position = risk.createFilledPosition(
+    "SPY260722C00500000", "BULLISH", 1, 2, timestamp, 500,
+  );
+  position = manager.evaluate(exitContext(position, timestamp + 1_000, 1.90)).updatedPosition;
+  const recovered = manager.evaluate(exitContext(position, timestamp + 2_000, 2.24));
+  assert.equal(recovered.exit, false);
+  assert.equal(recovered.updatedPosition.tradeState, "PROTECTED_RECOVERED");
+  assert.ok(recovered.updatedPosition.protectedFloorPnl! > 0);
+});
+
+test("failure-to-recover deadline exits an unprotected trade without waiting for the hard stop", () => {
+  const config = structuredClone(defaultConfig);
+  config.risk.recoveryDeadlineSec = 10;
+  config.risk.recoveryProbabilityMinAgeSec = 60;
+  const timestamp = zonedDateTimeToEpoch("2026-07-22", "11:00:00");
+  const position = new RiskManager(config).createFilledPosition(
+    "SPY260722C00500000", "BULLISH", 1, 2, timestamp, 500,
+  );
+  const decision = new ExitManager(config).evaluate(
+    exitContext(position, timestamp + 10_000, 1.90),
+  );
+  assert.equal(decision.reason, "RECOVERY_TIMEOUT");
+  assert.ok(decision.liquidationPrice! > position.stopPrice);
+});
+
+test("Greeks continuation exits IV crush and theta drag despite a still-valid SPY thesis", () => {
+  const config = structuredClone(defaultConfig);
+  config.risk.greeksExitGraceSec = 5;
+  config.risk.recoveryProbabilityMinAgeSec = 60;
+  const timestamp = zonedDateTimeToEpoch("2026-07-22", "11:00:00");
+  const risk = new RiskManager(config);
+  const manager = new ExitManager(config);
+  let position = risk.createFilledPosition(
+    "SPY260722C00500000", "BULLISH", 1, 2, timestamp, 500,
+  );
+  position.entryImpliedVolatility = 0.50;
+  position.lastImpliedVolatility = 0.50;
+  position.lastOptionSnapshotTimestamp = timestamp;
+  const feature = {
+    symbol: "SPY",
+    timestamp: timestamp + 1_000,
+    price: 500.01,
+    fast: {
+      normalizedSlope: 0.2,
+      windowSec: 10,
+      realizedVolatilityBps: 0,
+      regression: { slopeBpsPerSec: 0.01 },
+    },
+    medium: { normalizedSlope: 0.2 },
+    vwap: { sessionVwap: 499.99 },
+  } as unknown as FeatureSnapshot;
+  const snapshot = {
+    symbol: position.symbol,
+    timestamp: timestamp + 1_000,
+    impliedVolatility: 0.30,
+    greeks: { delta: 0.50, gamma: 0.01, theta: -1.5, vega: 0.10 },
+  };
+  let decision = manager.evaluate({
+    ...exitContext(position, timestamp + 1_000, 2),
+    feature,
+    optionSnapshot: snapshot,
+  });
+  assert.equal(decision.exit, false);
+  assert.equal(decision.updatedPosition.optionContinuation?.ivCrushDetected, true);
+  assert.ok(decision.continuationLcbDollars! < 0);
+
+  position = decision.updatedPosition;
+  decision = manager.evaluate({
+    ...exitContext(position, timestamp + 6_000, 2),
+    feature: { ...feature, timestamp: timestamp + 6_000 },
+    optionSnapshot: { ...snapshot, timestamp: timestamp + 6_000 },
+  });
+  assert.equal(decision.reason, "GREEKS_CONTINUATION_LCB_NON_POSITIVE");
+  assert.ok(decision.triggers?.includes("CONTINUATION_LCB_NON_POSITIVE"));
+});
+
+test("positive delta/gamma continuation lets a strong direct winner run", () => {
+  const config = structuredClone(defaultConfig);
+  config.risk.greeksExitGraceSec = 0;
+  config.risk.recoveryProbabilityMinAgeSec = 60;
+  const timestamp = zonedDateTimeToEpoch("2026-07-22", "11:00:00");
+  const position = new RiskManager(config).createFilledPosition(
+    "SPY260722C00500000", "BULLISH", 1, 2, timestamp, 500,
+  );
+  position.entryImpliedVolatility = 0.30;
+  position.lastImpliedVolatility = 0.30;
+  position.lastOptionSnapshotTimestamp = timestamp;
+  const feature = {
+    symbol: "SPY",
+    timestamp: timestamp + 1_000,
+    price: 500.05,
+    fast: {
+      normalizedSlope: 1,
+      windowSec: 10,
+      realizedVolatilityBps: 0.2,
+      regression: { slopeBpsPerSec: 1 },
+    },
+    medium: { normalizedSlope: 1 },
+    vwap: { sessionVwap: 499 },
+  } as unknown as FeatureSnapshot;
+  const decision = new ExitManager(config).evaluate({
+    ...exitContext(position, timestamp + 1_000, 2.20),
+    feature,
+    optionSnapshot: {
+      symbol: position.symbol,
+      timestamp: timestamp + 1_000,
+      impliedVolatility: 0.30,
+      greeks: { delta: 0.55, gamma: 0.02, theta: -1, vega: 0.08 },
+    },
+  });
+  assert.equal(decision.exit, false);
+  assert.equal(decision.updatedPosition.tradeState, "PROTECTED_WINNER");
+  assert.ok(decision.continuationLcbDollars! > 0);
+});
+
+test("protected trades exit on adverse SPY reversal CUSUM before the hard floor", () => {
+  const config = structuredClone(defaultConfig);
+  config.risk.reversalCusumThreshold = 0.5;
+  config.risk.recoveryProbabilityMinAgeSec = 60;
+  const timestamp = zonedDateTimeToEpoch("2026-07-22", "11:00:00");
+  const manager = new ExitManager(config);
+  let position = new RiskManager(config).createFilledPosition(
+    "SPY260722C00500000", "BULLISH", 1, 2, timestamp, 500,
+  );
+  position = manager.evaluate(exitContext(position, timestamp + 1_000, 2.20)).updatedPosition;
+  const adverseFeature = {
+    price: 500.01,
+    fast: { normalizedSlope: -1 },
+    medium: { normalizedSlope: 1 },
+    vwap: { sessionVwap: 499 },
+  } as unknown as FeatureSnapshot;
+  const decision = manager.evaluate({
+    ...exitContext(position, timestamp + 2_000, 2.18),
+    feature: adverseFeature,
+  });
+  assert.equal(decision.reason, "REVERSAL_CUSUM");
+  assert.ok(decision.executablePnl! > decision.protectedFloorPnl!);
 });
 
 test("order state machine handles rounding, partial fill, replacement and cancel", () => {

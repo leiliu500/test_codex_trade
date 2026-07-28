@@ -94,7 +94,26 @@ export class RiskManager {
       targetPrice: averageFillPrice * (1 + this.#config.risk.optionProfitTargetPct),
       highWaterMark: averageFillPrice,
       lowWaterMark: averageFillPrice,
-      ...(underlyingEntryPrice !== undefined ? { underlyingEntryPrice } : {}),
+      tradeState: "OPEN_UNPROTECTED",
+      executablePnl: 0,
+      highWaterPnl: 0,
+      lowWaterPnl: 0,
+      lastPnlTimestamp: timestamp,
+      lastHighTimestamp: timestamp,
+      previousExecutablePnl: 0,
+      pnlEwmaDriftPerSec: 0,
+      pnlEwmaVariancePerSec: 0,
+      reversalCusum: 0,
+      zeroCrossings: 0,
+      previousPnlSign: 0,
+      pnlObservationCount: 0,
+      ...(underlyingEntryPrice !== undefined
+        ? {
+            underlyingEntryPrice,
+            lastUnderlyingPrice: underlyingEntryPrice,
+            lastUnderlyingTimestamp: timestamp,
+          }
+        : {}),
     };
   }
 

@@ -189,6 +189,7 @@ export class ReplayEngine {
           timestamp: bar.timestamp,
           position: this.#position,
           ...(entry?.quote ? { optionQuote: entry.quote } : {}),
+          ...(entry?.snapshot ? { optionSnapshot: entry.snapshot } : {}),
           feature,
           regime,
           killSwitch: this.#account.killSwitch,
@@ -303,6 +304,12 @@ export class ReplayEngine {
         pending.state.symbol, pending.signal.direction, pending.state.filledQuantity, pending.state.averageFillPrice, timestamp,
         pending.signal.featureSnapshot.price,
       );
+      if (pending.candidate.impliedVolatility !== undefined) {
+        this.#position.entryImpliedVolatility = pending.candidate.impliedVolatility;
+        this.#position.lastImpliedVolatility = pending.candidate.impliedVolatility;
+        this.#position.lastOptionSnapshotTimestamp =
+          this.#book.get(pending.state.symbol)?.snapshot?.timestamp ?? timestamp;
+      }
       this.#positionSignal = pending.signal;
       this.#positionCandidate = pending.candidate;
       this.#positionMarks = [pending.state.averageFillPrice];

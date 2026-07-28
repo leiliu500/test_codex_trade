@@ -73,7 +73,35 @@ class FakeTradingClient implements TradingRestClient {
   async listOpenOrders(): Promise<BrokerOrder[]> {
     return [...this.orders.values()].filter((order) => ["new", "partially_filled"].includes(order.status)).map((order) => ({ ...order }));
   }
-  async listPositions(): Promise<PositionState[]> { return []; }
+  async listPositions(): Promise<PositionState[]> {
+    let quantity = 0;
+    let buyQuantity = 0;
+    let buyNotional = 0;
+    for (const order of this.orders.values()) {
+      const side = this.requests.find((request) =>
+        request.clientOrderId === order.clientOrderId)?.side;
+      if (side === "buy") {
+        quantity += order.filledQuantity;
+        buyQuantity += order.filledQuantity;
+        buyNotional += order.filledQuantity * (order.averageFillPrice ?? 0);
+      } else if (side === "sell") {
+        quantity -= order.filledQuantity;
+      }
+    }
+    if (quantity <= 0) return [];
+    const averageEntryPrice = buyNotional / Math.max(1, buyQuantity);
+    return [{
+      symbol,
+      direction: "BULLISH",
+      quantity,
+      averageEntryPrice,
+      entryTimestamp: start,
+      stopPrice: averageEntryPrice * (1 - defaultConfig.risk.hardOptionStopPct),
+      targetPrice: averageEntryPrice * (1 + defaultConfig.risk.optionProfitTargetPct),
+      highWaterMark: averageEntryPrice,
+      lowWaterMark: averageEntryPrice,
+    }];
+  }
 
   fill(orderId: string, filledQuantity: number, averageFillPrice: number, status: "partially_filled" | "filled"): void {
     const order = this.orders.get(orderId);
@@ -154,6 +182,13 @@ test("live manager submits an option entry, reconciles partial fill, cancels rem
   assert.equal(state.pending?.exitReason, "HARD_STOP");
   assert.equal(state.pending?.order.marketable, true);
   assert.equal(state.pending?.order.limitPrice, 1.48);
+  const management = recorder.events.find((event) =>
+    event.type === "order_management_state" && event.data.decision === "EXIT");
+  assert.equal(management?.data.lifecycle, "EXIT_PENDING");
+  assert.equal(management?.data.tradeState, "OPEN_UNPROTECTED");
+  assert.equal(management?.data.reason, "HARD_STOP");
+  assert.deepEqual(management?.data.triggers, ["HARD_LOSS_BOUNDARY"]);
+  assert.ok(Number(management?.data.executablePnl) < 0);
 
   client.fill(state.pending!.brokerOrderId, 2, 1.48, "filled");
   state = await manager.tick({ timestamp: start + 1400, optionQuote: optionQuote(start + 1400, 1.47, 1.49) });
@@ -315,4 +350,49 @@ test("startup halts when an open broker order has no restored local lifecycle st
   const manager = new LiveOrderManager({ config: defaultConfig, client });
   await assert.rejects(() => manager.initialize(start), /OPEN_ORDERS_REQUIRE_RESTORED_LOCAL_STATE/);
   assert.equal(manager.snapshot().halted, true);
+});
+
+test("rejected exits retain one logical intent and retry until broker-confirmed flat", async () => {
+  const client = new FakeTradingClient();
+  const recorder = new MemoryRecorder();
+  const manager = new LiveOrderManager({ config: defaultConfig, client, recorder });
+  await manager.initialize(start);
+  const submitted = await manager.submitEntry({
+    timestamp: start,
+    signal: signal(),
+    candidate: candidate(),
+    quote: optionQuote(start),
+  });
+  client.fill(submitted.brokerOrder!.id, 1, 2, "filled");
+  await manager.tick({ timestamp: start + 400, optionQuote: optionQuote(start + 400) });
+
+  let state = await manager.tick({
+    timestamp: start + 800,
+    optionQuote: optionQuote(start + 800, 1.40, 1.42),
+  });
+  assert.equal(state.lifecycle, "EXIT_PENDING");
+  assert.equal(state.exitIntent?.attempts, 1);
+  const intentId = state.exitIntent!.id;
+  const rejectedOrderId = state.pending!.brokerOrderId;
+  client.orders.get(rejectedOrderId)!.status = "rejected";
+
+  state = await manager.tick({
+    timestamp: start + 1_200,
+    optionQuote: optionQuote(start + 1_200, 1.38, 1.40),
+  });
+  assert.equal(state.lifecycle, "EXIT_PENDING");
+  assert.equal(state.exitIntent?.id, intentId);
+  assert.equal(state.exitIntent?.attempts, 2);
+  assert.notEqual(state.pending?.brokerOrderId, rejectedOrderId);
+  assert.equal(client.requests.filter((request) => request.side === "sell").length, 2);
+
+  client.fill(state.pending!.brokerOrderId, 1, 1.38, "filled");
+  state = await manager.tick({
+    timestamp: start + 1_600,
+    optionQuote: optionQuote(start + 1_600, 1.37, 1.39),
+  });
+  assert.equal(state.position, undefined);
+  assert.equal(state.exitIntent, undefined);
+  assert.equal(state.lifecycle, "CLOSED");
+  assert.ok(recorder.events.some((event) => event.type === "exit_attempt_failed"));
 });
