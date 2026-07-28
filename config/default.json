@@ -1,5 +1,5 @@
 {
-  "version": "spy-0dte-entry-quality-5",
+  "version": "spy-0dte-entry-quality-7",
   "symbol": "SPY",
   "timeZone": "America/New_York",
   "session": {
@@ -69,12 +69,20 @@
     "lateEntryGuard": {
       "mode": "ENFORCE",
       "start": "12:00:00",
+      "maxDailyEntries": 1000,
       "minProjectedMoveBps": 2.0,
       "minCostMarginBps": 1.0,
       "maxOptionSpreadPct": 0.008,
       "followThroughMinSec": 5,
       "followThroughMaxSec": 15,
-      "followThroughMinimumBps": 0.1
+      "followThroughMinimumBps": 0.1,
+      "bearishGrindRequiresFollowThrough": false,
+      "bearishUnclassifiedImpulseFollowThroughStart": "13:00:00",
+      "bearishStrongDownImpulse": {
+        "followThroughMinSec": 5,
+        "followThroughMaxSec": 5,
+        "followThroughMinimumBps": 1.5
+      }
     },
     "blockWhipsaw": true
   },

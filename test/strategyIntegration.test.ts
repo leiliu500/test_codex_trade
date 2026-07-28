@@ -235,20 +235,63 @@ test("late-session entries require stronger projection and causal follow-through
   const pending = engine.evaluateDetailed(late, up);
   assert.equal(pending.signal, undefined);
   assert.deepEqual(pending.reasons, ["LATE_ENTRY_FOLLOW_THROUGH_PENDING"]);
-  const notConfirmed = engine.evaluateDetailed({
+  const stillPending = engine.evaluateDetailed({
     ...late,
-    timestamp: late.timestamp + 5_000,
+    timestamp: late.timestamp + 4_000,
     price: late.price - 0.01,
   }, up);
-  assert.equal(notConfirmed.signal, undefined);
-  assert.deepEqual(notConfirmed.reasons, ["LATE_ENTRY_FOLLOW_THROUGH_NOT_CONFIRMED"]);
+  assert.equal(stillPending.signal, undefined);
+  assert.deepEqual(stillPending.reasons, ["LATE_ENTRY_FOLLOW_THROUGH_PENDING"]);
   const confirmed = engine.evaluateDetailed({
     ...late,
-    timestamp: late.timestamp + 6_000,
+    timestamp: late.timestamp + 5_000,
     price: late.price + 0.01,
   }, up);
   assert.equal(confirmed.signal?.direction, "BULLISH");
   assert.ok(confirmed.signal?.reasons.some((reason) => reason.includes("causal follow-through confirmed")));
+
+  const july24Engine = new SignalEngine(defaultConfig);
+  assert.equal(july24Engine.evaluateDetailed(late, up).signal, undefined);
+  const temporarilyUnconfirmed = {
+    ...late,
+    timestamp: late.timestamp + 5_000,
+    price: late.price + 0.04,
+    medium: { ...late.medium, normalizedSlope: -late.medium.normalizedSlope },
+  };
+  const waiting = july24Engine.evaluateDetailed(temporarilyUnconfirmed, up);
+  assert.equal(waiting.signal, undefined);
+  assert.deepEqual(waiting.reasons, ["NO_DIRECTION_PASSED"]);
+  const delayedWinner = july24Engine.evaluateDetailed({
+    ...late,
+    timestamp: late.timestamp + 15_000,
+    price: late.price * (1 + 1.8 / 10_000),
+  }, up);
+  assert.equal(delayedWinner.signal?.direction, "BULLISH");
+  assert.ok(delayedWinner.signal?.reasons.some((reason) =>
+    reason.includes("causal follow-through confirmed after 15.0s")));
+
+  const lateBearish = {
+    ...feature(-1),
+    timestamp: late.timestamp,
+  };
+  const down: RegimeDecision = { regime: "STRONG_DOWN", confidence: 1, reasons: [] };
+  const strictEngine = new SignalEngine(defaultConfig);
+  assert.equal(strictEngine.evaluateDetailed(lateBearish, down).signal, undefined);
+  const insufficient = strictEngine.evaluateDetailed({
+    ...lateBearish,
+    timestamp: lateBearish.timestamp + 5_000,
+    price: lateBearish.price - 0.07,
+  }, down);
+  assert.equal(insufficient.signal, undefined);
+  assert.deepEqual(insufficient.reasons, ["LATE_ENTRY_FOLLOW_THROUGH_FAILED"]);
+  const strictWinnerEngine = new SignalEngine(defaultConfig);
+  assert.equal(strictWinnerEngine.evaluateDetailed(lateBearish, down).signal, undefined);
+  const immediateBearish = strictWinnerEngine.evaluateDetailed({
+    ...lateBearish,
+    timestamp: lateBearish.timestamp + 5_000,
+    price: lateBearish.price - 0.08,
+  }, down);
+  assert.equal(immediateBearish.signal?.direction, "BEARISH");
 
   const weakProjection = {
     ...late,
@@ -265,6 +308,61 @@ test("late-session entries require stronger projection and causal follow-through
   assert.equal(weak.signal, undefined);
   assert.ok(weak.directions.find((item) => item.direction === "BULLISH")?.reasons
     .includes("LATE_ENTRY_PROJECTED_MOVE_BELOW_MINIMUM"));
+});
+
+test("late bearish persistence profiles retain qualified July 23 setup classes without weakening strong-down confirmation", () => {
+  const unclassified: RegimeDecision = { regime: "UNCLASSIFIED", confidence: 0, reasons: [] };
+  const bearishBase = feature(-1);
+  const lateBearishGrind: FeatureSnapshot = {
+    ...bearishBase,
+    timestamp: zonedDateTimeToEpoch("2026-07-22", "12:10:00"),
+    fast: {
+      ...bearishBase.fast,
+      normalizedSlope: -0.1,
+      normalizedAcceleration: 0,
+      regression: {
+        ...bearishBase.fast.regression,
+        slopeBpsPerSec: -0.5,
+        accelerationBpsPerSec2: 0,
+      },
+    },
+    medium: { ...bearishBase.medium, normalizedSlope: -0.3 },
+    slow: { ...bearishBase.slow, normalizedSlope: -0.15 },
+  };
+  const immediateGrind = new SignalEngine(defaultConfig).evaluateDetailed(lateBearishGrind, unclassified);
+  assert.equal(immediateGrind.signal?.direction, "BEARISH");
+  assert.equal(immediateGrind.signal?.kind, "GRIND");
+  assert.equal(immediateGrind.signal?.reasons.some((reason) => reason.includes("follow-through")), false);
+
+  const confirmedGrindConfig = structuredClone(defaultConfig);
+  confirmedGrindConfig.signals.lateEntryGuard.bearishGrindRequiresFollowThrough = true;
+  const pendingGrind = new SignalEngine(confirmedGrindConfig).evaluateDetailed(lateBearishGrind, unclassified);
+  assert.deepEqual(pendingGrind.reasons, ["LATE_ENTRY_FOLLOW_THROUGH_PENDING"]);
+
+  const earlyUnclassifiedImpulse = {
+    ...bearishBase,
+    timestamp: zonedDateTimeToEpoch("2026-07-22", "12:59:59"),
+  };
+  const immediateImpulse = new SignalEngine(defaultConfig).evaluateDetailed(
+    earlyUnclassifiedImpulse,
+    unclassified,
+  );
+  assert.equal(immediateImpulse.signal?.direction, "BEARISH");
+  assert.equal(immediateImpulse.signal?.kind, "IMPULSE");
+
+  const atConfirmationStart = {
+    ...earlyUnclassifiedImpulse,
+    timestamp: zonedDateTimeToEpoch("2026-07-22", "13:00:00"),
+  };
+  const pendingImpulse = new SignalEngine(defaultConfig).evaluateDetailed(atConfirmationStart, unclassified);
+  assert.deepEqual(pendingImpulse.reasons, ["LATE_ENTRY_FOLLOW_THROUGH_PENDING"]);
+
+  const strongDown: RegimeDecision = { regime: "STRONG_DOWN", confidence: 1, reasons: [] };
+  const pendingStrongDown = new SignalEngine(defaultConfig).evaluateDetailed(
+    earlyUnclassifiedImpulse,
+    strongDown,
+  );
+  assert.deepEqual(pendingStrongDown.reasons, ["LATE_ENTRY_FOLLOW_THROUGH_PENDING"]);
 });
 
 test("steady grind passes with acceleration near zero, but excessive adverse acceleration blocks", () => {

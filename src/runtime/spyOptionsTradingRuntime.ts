@@ -62,6 +62,7 @@ export function optionUniverseRequired(
 
 const OPEN_MARKET_CLOCK_POLL_MS = 5_000;
 const CLOSED_MARKET_CLOCK_POLL_MS = 30_000;
+export const OPTION_QUOTE_STALL_TIMEOUT_MS = 10_000;
 
 /** End-to-end, serialized SPY 0DTE option execution runtime. */
 export class SpyOptionsTradingRuntime {
@@ -103,8 +104,11 @@ export class SpyOptionsTradingRuntime {
   #lastFeature: FeatureSnapshot | undefined;
   #lastRegime: RegimeDecision | undefined;
   #lastOptionQuoteTimestamp: number | undefined;
+  #lastOptionQuoteReceivedAt: number | undefined;
+  #optionQuoteExpectedSince: number | undefined;
   #optionQuoteCount = 0;
   #rejectedOptionQuotes = 0;
+  #optionQuoteStalled = false;
   #execution: LiveExecutionSnapshot = { halted: false };
   #retainedPositionSymbol: string | undefined;
   #lastError: string | undefined;
@@ -121,6 +125,7 @@ export class SpyOptionsTradingRuntime {
   #tickTimer: ReturnType<typeof setInterval> | undefined;
   #optionReconnectTimer: ReturnType<typeof setTimeout> | undefined;
   #optionReconnectAttempt = 0;
+  #optionReconnectInProgress = false;
 
   constructor(options: SpyOptionsTradingRuntimeOptions) {
     this.#config = options.config;
@@ -216,6 +221,7 @@ export class SpyOptionsTradingRuntime {
         maxTradesPerDay: this.#config.signals.entryQualityMode === "ENFORCE"
           ? this.#config.risk.entryQualityMaxTradesPerDay : this.#config.risk.maxTradesPerDay,
         shadowMaxTradesPerDay: this.#config.risk.entryQualityMaxTradesPerDay,
+        lateMaxDailyEntries: this.#config.signals.lateEntryGuard.maxDailyEntries,
         maxDailyLossDollars: this.#config.risk.maxDailyLossDollars,
         activeEntryCapReached: this.#restoredRuntimeState.risk.entries >= (
           this.#config.signals.entryQualityMode === "ENFORCE"
@@ -226,6 +232,8 @@ export class SpyOptionsTradingRuntime {
             ? this.#config.risk.entryQualityMaxTradesPerDay : this.#config.risk.maxTradesPerDay
         ),
         shadowEntryCapReached: this.#restoredRuntimeState.risk.entries >= this.#config.risk.entryQualityMaxTradesPerDay,
+        lateEntryCapReached: this.#restoredRuntimeState.risk.entries >=
+          this.#config.signals.lateEntryGuard.maxDailyEntries,
         knownClientOrderIds: this.#restoredRuntimeState.knownClientOrderIds.size,
       });
       this.#synchronizeHistoryPriorities();
@@ -336,6 +344,12 @@ export class SpyOptionsTradingRuntime {
         if (this.#killSwitch) runtimeBlocks.push("KILL_SWITCH");
         if (this.#execution.halted) runtimeBlocks.push("EXECUTION_HALTED");
         if (this.#executionEnabled && !this.#strategyStateReady) runtimeBlocks.push("STRATEGY_STATE_NOT_READY");
+        if (this.#executionEnabled && this.#isOptionQuoteStalled(this.#now())) {
+          runtimeBlocks.push("OPTION_FEED_STALLED");
+        } else if (this.#executionEnabled && !this.#optionConnected &&
+            optionUniverseRequired(this.#now(), this.#marketOpen, false, this.#config)) {
+          runtimeBlocks.push("OPTION_FEED_DISCONNECTED");
+        }
         if (this.#execution.position) runtimeBlocks.push("POSITION_ALREADY_OPEN");
         if (this.#execution.pending) runtimeBlocks.push("ORDER_ALREADY_PENDING");
         if (runtimeBlocks.length > 0) {
@@ -469,26 +483,36 @@ export class SpyOptionsTradingRuntime {
   }
 
   healthState(): HealthState {
+    const now = this.#now();
     const stock = this.#stockReceiver.healthState(this.#killSwitch);
     const brokerReady = !this.#executionEnabled || (this.#brokerAvailable && this.#positionsReconciled && this.#account?.optionsApproved === true);
     const streamsConnected = stock.websocketConnected && this.#optionConnected;
     const streamsReady = this.#marketDataIdle || streamsConnected;
     const hasOptionExposure = this.#execution.position !== undefined || this.#execution.pending !== undefined;
     const universeReady = this.#subscribedSymbols.size > 0 ||
-      !optionUniverseRequired(this.#now(), this.#marketOpen, hasOptionExposure, this.#config);
+      !optionUniverseRequired(now, this.#marketOpen, hasOptionExposure, this.#config);
     const strategyReady = !this.#executionEnabled || !this.#marketOpen || this.#strategyStateReady;
+    const optionQuoteSilenceAgeMs = this.#optionQuoteSilenceAgeMs(now);
+    const optionQuoteStalled = this.#isOptionQuoteStalled(now);
     return {
       ...stock,
-      ready: streamsReady && brokerReady && universeReady && strategyReady && !this.#execution.halted && !this.#queue.halted,
+      ready: streamsReady && brokerReady && universeReady && strategyReady && !optionQuoteStalled &&
+        !this.#execution.halted && !this.#queue.halted,
       brokerRequired: this.#executionEnabled,
       optionDataFeed: "opra",
       receivedOptionQuotes: this.#optionQuoteCount,
-      ...(this.#lastOptionQuoteTimestamp !== undefined
-        ? { lastOptionQuoteAgeMs: Math.max(0, this.#now() - this.#lastOptionQuoteTimestamp) }
+      ...(optionQuoteSilenceAgeMs !== undefined
+        ? { lastOptionQuoteAgeMs: optionQuoteSilenceAgeMs }
         : {}),
+      ...(this.#lastOptionQuoteTimestamp !== undefined
+        ? { lastOptionQuoteProviderAgeMs: Math.max(0, now - this.#lastOptionQuoteTimestamp) }
+        : {}),
+      optionQuoteStalled,
+      optionQuoteStallThresholdMs: OPTION_QUOTE_STALL_TIMEOUT_MS,
       rejectedMarketEvents: (stock.rejectedMarketEvents ?? 0) + this.#rejectedOptionQuotes,
       reconnectAttempt: Math.max(stock.reconnectAttempt ?? 0, this.#optionReconnectAttempt),
       ...(this.#lastError ? { lastStreamError: this.#lastError } : {}),
+      stockWebsocketConnected: stock.websocketConnected,
       optionWebsocketConnected: this.#optionConnected,
       websocketConnected: streamsConnected,
       marketDataIdle: this.#marketDataIdle,
@@ -631,6 +655,10 @@ export class SpyOptionsTradingRuntime {
     try {
       await this.#queue.enqueue(async () => {
         if (this.#marketDataIdle || !this.#marketOpen) return;
+        if (quotes.length > 0) {
+          this.#lastOptionQuoteReceivedAt = this.#now();
+          this.#optionQuoteStalled = false;
+        }
         this.#recordOptionHistory(quotes);
         let activeSymbol = this.#execution.position?.symbol ?? this.#execution.pending?.order.symbol;
         for (const quote of quotes) {
@@ -689,6 +717,12 @@ export class SpyOptionsTradingRuntime {
       this.#recordHistory("option_contract", timestamp, contract.symbol, { ...contract });
     }
     this.#universe.commitRefresh(this.#now());
+    if (nextSymbols.size === 0) {
+      this.#optionQuoteExpectedSince = undefined;
+      this.#optionQuoteStalled = false;
+    } else if (add.length > 0 || remove.length > 0 || this.#optionQuoteExpectedSince === undefined) {
+      this.#optionQuoteExpectedSince = this.#now();
+    }
     this.#subscribedSymbols = nextSymbols;
     for (const snapshot of snapshots) {
       this.#book.updateSnapshot(snapshot);
@@ -709,7 +743,10 @@ export class SpyOptionsTradingRuntime {
     if (this.#marketDataIdle && timestamp - this.#lastClockCheck < CLOSED_MARKET_CLOCK_POLL_MS) return;
     void this.#queue.enqueue(async () => {
       await this.#refreshMarketSession(timestamp);
-      if (!this.#marketDataIdle && this.#marketOpen) await this.#tickExecution(timestamp);
+      if (!this.#marketDataIdle && this.#marketOpen) {
+        await this.#checkOptionQuoteLiveness(timestamp);
+        await this.#tickExecution(timestamp);
+      }
     })
       .catch((error: unknown) => this.#recordError(error));
   }
@@ -721,9 +758,14 @@ export class SpyOptionsTradingRuntime {
       onState: (connected) => {
         this.#optionConnected = connected;
         if (connected) {
+          if (this.#optionReconnectTimer) clearTimeout(this.#optionReconnectTimer);
+          this.#optionReconnectTimer = undefined;
           this.#optionReconnectAttempt = 0;
+          this.#optionQuoteStalled = false;
+          this.#optionQuoteExpectedSince = this.#now();
           this.#lastError = undefined;
-        } else if (this.#started && !this.#stopping && !this.#marketDataIdle) {
+        } else if (this.#started && !this.#stopping && !this.#marketDataIdle &&
+            !this.#optionReconnectInProgress) {
           this.#scheduleOptionReconnect();
         }
       },
@@ -732,22 +774,75 @@ export class SpyOptionsTradingRuntime {
   }
 
   #scheduleOptionReconnect(): void {
-    if (this.#stopping || this.#marketDataIdle || this.#optionReconnectTimer) return;
+    if (this.#stopping || this.#marketDataIdle || this.#optionReconnectTimer ||
+        this.#optionReconnectInProgress) return;
     this.#optionReconnectAttempt += 1;
     const delay = Math.min(30_000, 1_000 * (2 ** Math.max(0, this.#optionReconnectAttempt - 1)));
     this.#optionReconnectTimer = setTimeout(() => {
       this.#optionReconnectTimer = undefined;
       void (async () => {
         if (this.#marketDataIdle || this.#stopping) return;
+        this.#optionReconnectInProgress = true;
+        let failed = false;
         try {
           await this.#optionStream.close();
+          if (this.#marketDataIdle || this.#stopping) return;
           await this.#connectOptionStream();
         } catch (error) {
+          failed = true;
           this.#recordError(error);
-          this.#scheduleOptionReconnect();
+        } finally {
+          this.#optionReconnectInProgress = false;
         }
+        if (failed) this.#scheduleOptionReconnect();
       })();
     }, delay);
+  }
+
+  #optionQuoteSilenceAgeMs(timestamp: number): number | undefined {
+    const reference = Math.max(
+      this.#lastOptionQuoteReceivedAt ?? -Infinity,
+      this.#optionQuoteExpectedSince ?? -Infinity,
+    );
+    return Number.isFinite(reference) ? Math.max(0, timestamp - reference) : undefined;
+  }
+
+  #isOptionQuoteStalled(timestamp: number): boolean {
+    if (this.#optionQuoteStalled) return true;
+    const silenceAgeMs = this.#optionQuoteSilenceAgeMs(timestamp);
+    return this.#marketOpen && !this.#marketDataIdle && this.#optionConnected &&
+      this.#subscribedSymbols.size > 0 && silenceAgeMs !== undefined &&
+      silenceAgeMs > OPTION_QUOTE_STALL_TIMEOUT_MS;
+  }
+
+  async #checkOptionQuoteLiveness(timestamp: number): Promise<void> {
+    if (this.#marketDataIdle || !this.#marketOpen || !this.#optionConnected ||
+        this.#subscribedSymbols.size === 0) {
+      if (this.#subscribedSymbols.size === 0 || this.#marketDataIdle) this.#optionQuoteStalled = false;
+      return;
+    }
+    const silenceAgeMs = this.#optionQuoteSilenceAgeMs(timestamp);
+    if (silenceAgeMs === undefined || silenceAgeMs <= OPTION_QUOTE_STALL_TIMEOUT_MS ||
+        this.#optionQuoteStalled) return;
+    this.#optionQuoteStalled = true;
+    this.#optionConnected = false;
+    const error = new Error(
+      `OPRA option quote stream stalled for ${silenceAgeMs} ms with ` +
+      `${this.#subscribedSymbols.size} active subscriptions`,
+    );
+    this.#recordError(error);
+    this.#scheduleOptionReconnect();
+    this.#emit("option_stream_stalled", {
+      silenceAgeMs,
+      stallThresholdMs: OPTION_QUOTE_STALL_TIMEOUT_MS,
+      subscribedOptionContracts: this.#subscribedSymbols.size,
+    });
+    await this.#auditRuntime(timestamp, "option_stream_stalled", {
+      silenceAgeMs,
+      stallThresholdMs: OPTION_QUOTE_STALL_TIMEOUT_MS,
+      subscribedOptionContracts: this.#subscribedSymbols.size,
+      reconnectAttempt: this.#optionReconnectAttempt,
+    });
   }
 
   async #tickExecution(timestamp: number, optionQuote?: OptionQuote): Promise<void> {
@@ -781,12 +876,21 @@ export class SpyOptionsTradingRuntime {
     this.#marketOpen = false;
     this.#marketDataIdle = true;
     this.#optionConnected = false;
+    this.#optionQuoteStalled = false;
+    this.#optionQuoteExpectedSince = undefined;
     if (this.#optionReconnectTimer) clearTimeout(this.#optionReconnectTimer);
     this.#optionReconnectTimer = undefined;
+    const subscribedSymbols = [...this.#subscribedSymbols];
     this.#subscribedSymbols.clear();
     this.#history?.setPrioritySymbols?.(new Set());
     this.#marketDataTransition = this.#marketDataTransition.then(async () => {
-      await Promise.allSettled([this.#stockReceiver.close(), this.#optionStream.close()]);
+      await Promise.allSettled([
+        this.#stockReceiver.close(),
+        (async () => {
+          await this.#optionStream.close();
+          await this.#optionStream.unsubscribe(subscribedSymbols);
+        })(),
+      ]);
     });
     await this.#auditRuntime(timestamp, "market_session_idle", {
       reason: "MARKET_CLOSED",
@@ -805,6 +909,7 @@ export class SpyOptionsTradingRuntime {
     await this.#marketDataTransition;
     if (this.#stopping || !this.#marketOpen || !this.#marketDataIdle) return;
     this.#marketDataIdle = false;
+    this.#optionQuoteStalled = false;
     const latestQuote = await this.#client.getLatestSpySipQuote();
     this.#lastSpot = (latestQuote.bidPrice + latestQuote.askPrice) / 2;
     await this.#stockReceiver.start();

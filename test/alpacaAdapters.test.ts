@@ -1,9 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { adaptAlpacaStockQuote, adaptAlpacaStockTrade } from "../src/alpaca/stockStream.js";
-import { adaptAlpacaOptionQuote } from "../src/alpaca/optionStream.js";
+import { adaptAlpacaOptionQuote, AlpacaOptionWebSocket } from "../src/alpaca/optionStream.js";
 import { AlpacaTradingRestClient } from "../src/alpaca/restClient.js";
 import { OptionBook } from "../src/options/optionBook.js";
+import { decode, encode } from "@msgpack/msgpack";
+import { WebSocketServer, type RawData } from "ws";
+import type { AddressInfo } from "node:net";
 
 test("Alpaca market-data boundary maps official compact schemas", () => {
   const time = "2026-07-22T14:30:00.123456789Z";
@@ -20,6 +23,82 @@ test("Alpaca market-data boundary maps official compact schemas", () => {
     T: "q", S: "SPY260724C00500000", t: new Date(time), bp: 1, ap: 1.02, bs: 20, as: 30,
   });
   assert.equal(msgpackOption.timestamp, Date.parse(time));
+});
+
+test("OPRA subscription updates wait for each full-state acknowledgement", async (context) => {
+  const server = new WebSocketServer({ host: "127.0.0.1", port: 0 });
+  await new Promise<void>((resolve, reject) => {
+    server.once("listening", resolve);
+    server.once("error", reject);
+  });
+  context.after(async () => {
+    for (const client of server.clients) client.terminate();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  });
+
+  const subscriptions = new Set<string>();
+  const actions: Array<{ action: string; quotes: string[] }> = [];
+  let dynamicAcknowledgementPending = false;
+  let overlappingUpdates = false;
+  server.on("connection", (socket) => {
+    socket.on("message", (raw: RawData) => {
+      const message = decode(new Uint8Array(raw as Buffer)) as Record<string, unknown>;
+      if (message.action === "auth") {
+        socket.send(encode([{ T: "success", msg: "authenticated" }]));
+        return;
+      }
+      const action = String(message.action);
+      const quotes = Array.isArray(message.quotes)
+        ? message.quotes.filter((symbol): symbol is string => typeof symbol === "string")
+        : [];
+      actions.push({ action, quotes });
+      for (const symbol of quotes) {
+        if (action === "subscribe") subscriptions.add(symbol);
+        else if (action === "unsubscribe") subscriptions.delete(symbol);
+      }
+      const snapshot = [...subscriptions].sort();
+      const acknowledge = (): void => {
+        dynamicAcknowledgementPending = false;
+        socket.send(encode([{ T: "subscription", quotes: snapshot }]));
+      };
+      if (actions.length === 1) acknowledge();
+      else {
+        if (dynamicAcknowledgementPending) overlappingUpdates = true;
+        dynamicAcknowledgementPending = true;
+        setTimeout(acknowledge, 20);
+      }
+    });
+  });
+
+  const port = (server.address() as AddressInfo).port;
+  const stream = new AlpacaOptionWebSocket({
+    apiKey: "key",
+    apiSecret: "secret",
+    feed: "opra",
+    url: `ws://127.0.0.1:${port}`,
+    connectTimeoutMs: 1_000,
+  });
+  const errors: unknown[] = [];
+  const snapshots: string[][] = [];
+  await stream.subscribe(["SPY260727C00640000", "SPY260727P00640000"]);
+  await stream.connect({
+    onQuote: () => undefined,
+    onError: (error) => errors.push(error),
+    onSubscriptions: (symbols) => snapshots.push([...symbols].sort()),
+  });
+  await Promise.all([
+    stream.unsubscribe(["SPY260727C00640000"]),
+    stream.subscribe(["SPY260727C00641000"]),
+  ]);
+
+  assert.equal(overlappingUpdates, false);
+  assert.deepEqual(actions.map(({ action }) => action), ["subscribe", "unsubscribe", "subscribe"]);
+  assert.deepEqual(actions[1]?.quotes, ["SPY260727C00640000"]);
+  assert.deepEqual(actions[2]?.quotes, ["SPY260727C00641000"]);
+  assert.deepEqual([...subscriptions].sort(), ["SPY260727C00641000", "SPY260727P00640000"]);
+  assert.deepEqual(snapshots.at(-1), ["SPY260727C00641000", "SPY260727P00640000"]);
+  assert.deepEqual(errors, []);
+  await stream.close();
 });
 
 test("concrete Alpaca REST adapter uses paper-safe v2 option/order/account mappings", async () => {

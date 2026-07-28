@@ -12,6 +12,9 @@ export interface HealthState {
   receivedStockTrades?: number;
   receivedOptionQuotes?: number;
   lastOptionQuoteAgeMs?: number;
+  lastOptionQuoteProviderAgeMs?: number;
+  optionQuoteStalled?: boolean;
+  optionQuoteStallThresholdMs?: number;
   completedBars?: number;
   restoredStockEvents?: number;
   restoredBars?: number;
@@ -20,6 +23,7 @@ export interface HealthState {
   lastFeatureTimestamp?: number;
   reconnectAttempt?: number;
   lastStreamError?: string;
+  stockWebsocketConnected?: boolean;
   optionWebsocketConnected?: boolean;
   marketDataIdle?: boolean;
   executionEnabled?: boolean;

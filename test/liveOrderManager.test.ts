@@ -253,6 +253,33 @@ test("restored six-fill cap is shadow-audited without blocking a paper entry", a
   assert.ok((shadowRisk.reasons as string[]).includes("MAX_DAILY_ENTRIES_REACHED"));
 });
 
+test("the high late-entry cap leaves a seventh paper entry executable at the broker boundary", async () => {
+  const late = zonedDateTimeToEpoch(date, "12:00:00");
+  const client = new FakeTradingClient();
+  client.clock.timestamp = late;
+  const recorder = new MemoryRecorder();
+  const manager = new LiveOrderManager({
+    config: defaultConfig,
+    client,
+    recorder,
+    restoredRiskState: { marketDate: date, entries: 6, realizedPnl: 0 },
+  });
+  await manager.initialize(late);
+
+  const submitted = await manager.submitEntry({
+    timestamp: late,
+    signal: signal(late),
+    candidate: candidate(),
+    quote: optionQuote(late),
+  });
+
+  assert.equal(submitted.submitted, true);
+  assert.equal(client.requests.length, 1);
+  const risk = recorder.events.find((event) => event.type === "risk_decision")?.data.risk as
+    Record<string, unknown>;
+  assert.equal(risk.allowed, true);
+});
+
 test("early scratch is audited in shadow mode without closing the paper position", async () => {
   const client = new FakeTradingClient();
   const recorder = new MemoryRecorder();

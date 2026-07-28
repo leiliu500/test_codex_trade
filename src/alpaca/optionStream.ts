@@ -6,6 +6,7 @@ export interface OptionStreamHandlers {
   onQuote(quote: OptionQuote): void | Promise<void>;
   onQuotes?(quotes: readonly OptionQuote[]): void | Promise<void>;
   onState?(connected: boolean): void;
+  onSubscriptions?(symbols: readonly string[]): void;
   onError?(error: unknown): void;
 }
 
@@ -34,6 +35,13 @@ export class AlpacaOptionWebSocket implements OptionStream {
   #authenticated = false;
   #dispatching = false;
   #dispatchTail: Promise<void> = Promise.resolve();
+  #subscriptionTail: Promise<void> = Promise.resolve();
+  #subscriptionWaiter: {
+    target: Set<string>;
+    resolve: () => void;
+    reject: (error: unknown) => void;
+    timeout: ReturnType<typeof setTimeout>;
+  } | undefined;
 
   constructor(config: AlpacaOptionStreamConfig) {
     const feed = config.feed ?? "indicative";
@@ -49,14 +57,12 @@ export class AlpacaOptionWebSocket implements OptionStream {
     };
   }
 
-  async subscribe(symbols: readonly string[]): Promise<void> {
-    for (const symbol of symbols) this.#symbols.add(symbol);
-    if (this.#authenticated && symbols.length > 0) this.#send({ action: "subscribe", quotes: [...symbols] });
+  subscribe(symbols: readonly string[]): Promise<void> {
+    return this.#updateSubscriptions("subscribe", symbols);
   }
 
-  async unsubscribe(symbols: readonly string[]): Promise<void> {
-    for (const symbol of symbols) this.#symbols.delete(symbol);
-    if (this.#authenticated && symbols.length > 0) this.#send({ action: "unsubscribe", quotes: [...symbols] });
+  unsubscribe(symbols: readonly string[]): Promise<void> {
+    return this.#updateSubscriptions("unsubscribe", symbols);
   }
 
   connect(handlers: OptionStreamHandlers): Promise<void> {
@@ -97,32 +103,39 @@ export class AlpacaOptionWebSocket implements OptionStream {
           for (const message of decoded) {
             if (message.T === "success" && message.msg === "authenticated") {
               this.#authenticated = true;
-              if (this.#symbols.size > 0) this.#send({ action: "subscribe", quotes: [...this.#symbols] });
+              if (this.#symbols.size > 0) {
+                const initialSubscription = this.#waitForSubscriptions(new Set(this.#symbols));
+                this.#subscriptionTail = initialSubscription.catch(() => undefined);
+                this.#send({ action: "subscribe", quotes: [...this.#symbols] });
+                void initialSubscription.then(resolveOnce, rejectOnce);
+              }
               else resolveOnce();
             } else if (message.T === "subscription") {
-              const quotes = Array.isArray(message.quotes) ? message.quotes : [];
-              const missing = [...this.#symbols].filter((symbol) => !quotes.includes(symbol));
-              if (missing.length > 0) {
-                throw new Error(`${this.#config.feed.toUpperCase()} option subscription acknowledgement is missing ${missing.length} symbols`);
-              }
-              resolveOnce();
+              const quotes = Array.isArray(message.quotes)
+                ? message.quotes.filter((symbol): symbol is string => typeof symbol === "string")
+                : [];
+              handlers.onSubscriptions?.(quotes);
+              this.#acceptSubscriptionSnapshot(new Set(quotes));
             } else if (message.T === "q") quotes.push(adaptAlpacaOptionQuote(message));
             else if (message.T === "error") throw new Error(`Alpaca option stream error ${String(message.code)}: ${String(message.msg)}`);
           }
           if (quotes.length > 0) this.#enqueueQuotes(quotes);
         } catch (error) {
-          handlers.onError?.(error);
+          this.#failSubscriptionWaiter(error);
           rejectOnce(error);
+          this.#failSocket(error);
         }
       });
       socket.on("error", (error) => {
-        handlers.onError?.(error);
+        this.#failSubscriptionWaiter(error);
         rejectOnce(error);
+        handlers.onError?.(error);
       });
       socket.on("close", () => {
         clearTimeout(timeout);
         this.#socket = undefined;
         this.#authenticated = false;
+        this.#failSubscriptionWaiter(new Error(`${this.#config.feed.toUpperCase()} option stream closed`));
         handlers.onState?.(false);
         rejectOnce(new Error(`${this.#config.feed.toUpperCase()} option stream closed before subscription`));
       });
@@ -134,7 +147,87 @@ export class AlpacaOptionWebSocket implements OptionStream {
     if (socket) {
       await new Promise<void>((resolve) => { socket.once("close", () => resolve()); socket.close(); });
     }
+    await this.#subscriptionTail;
     await this.#dispatchTail;
+  }
+
+  #updateSubscriptions(action: "subscribe" | "unsubscribe", symbols: readonly string[]): Promise<void> {
+    const unique = [...new Set(symbols)];
+    if (unique.length === 0) return Promise.resolve();
+    if (!this.#authenticated) {
+      for (const symbol of unique) {
+        if (action === "subscribe") this.#symbols.add(symbol);
+        else this.#symbols.delete(symbol);
+      }
+      return Promise.resolve();
+    }
+    const operation = this.#subscriptionTail.then(async () => {
+      for (const symbol of unique) {
+        if (action === "subscribe") this.#symbols.add(symbol);
+        else this.#symbols.delete(symbol);
+      }
+      if (!this.#authenticated) return;
+      const acknowledgement = this.#waitForSubscriptions(new Set(this.#symbols));
+      try {
+        this.#send({ action, quotes: unique });
+      } catch (error) {
+        this.#failSubscriptionWaiter(error);
+      }
+      await acknowledgement;
+    });
+    this.#subscriptionTail = operation.catch(() => undefined);
+    return operation;
+  }
+
+  #waitForSubscriptions(target: Set<string>): Promise<void> {
+    if (this.#subscriptionWaiter) throw new Error("Option subscription acknowledgement is already pending");
+    return new Promise<void>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        const error = new Error(
+          `Timed out reconciling ${this.#config.feed.toUpperCase()} option subscriptions`,
+        );
+        this.#subscriptionWaiter = undefined;
+        reject(error);
+        this.#failSocket(error);
+      }, this.#config.connectTimeoutMs);
+      this.#subscriptionWaiter = { target, resolve, reject, timeout };
+    });
+  }
+
+  #acceptSubscriptionSnapshot(acknowledged: Set<string>): void {
+    const waiter = this.#subscriptionWaiter;
+    const target = waiter?.target ?? this.#symbols;
+    const missing = [...target].filter((symbol) => !acknowledged.has(symbol));
+    const unexpected = [...acknowledged].filter((symbol) => !target.has(symbol));
+    if (missing.length > 0 || unexpected.length > 0) {
+      const error = new Error(
+        `${this.#config.feed.toUpperCase()} option subscription acknowledgement differs from requested state: ` +
+        `${missing.length} missing, ${unexpected.length} unexpected`,
+      );
+      this.#failSubscriptionWaiter(error);
+      this.#failSocket(error);
+      return;
+    }
+    if (!waiter) return;
+    clearTimeout(waiter.timeout);
+    this.#subscriptionWaiter = undefined;
+    waiter.resolve();
+  }
+
+  #failSubscriptionWaiter(error: unknown): void {
+    const waiter = this.#subscriptionWaiter;
+    if (!waiter) return;
+    clearTimeout(waiter.timeout);
+    this.#subscriptionWaiter = undefined;
+    waiter.reject(error);
+  }
+
+  #failSocket(error: unknown): void {
+    this.#handlers?.onError?.(error);
+    const socket = this.#socket;
+    if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) {
+      socket.close();
+    }
   }
 
   #enqueueQuotes(quotes: readonly OptionQuote[]): void {
