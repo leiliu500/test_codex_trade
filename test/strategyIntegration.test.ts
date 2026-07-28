@@ -51,10 +51,11 @@ function feature(direction: 1 | -1 = 1): FeatureSnapshot {
 }
 
 const immediateSignalConfig = structuredClone(defaultConfig);
+immediateSignalConfig.signals.entryConfirmationMode = "SHADOW";
 immediateSignalConfig.signals.followThroughMinSec = 0;
 immediateSignalConfig.signals.followThroughMaxSec = 0;
 const enforcedSignalConfig = structuredClone(defaultConfig);
-enforcedSignalConfig.signals.entryQualityMode = "ENFORCE";
+enforcedSignalConfig.signals.entryConfirmationMode = "ENFORCE";
 const enforcedImmediateSignalConfig = structuredClone(enforcedSignalConfig);
 enforcedImmediateSignalConfig.signals.followThroughMinSec = 0;
 enforcedImmediateSignalConfig.signals.followThroughMaxSec = 0;
@@ -152,12 +153,11 @@ test("bullish impulses stop after 13:00 and all executable signals stop after 14
     bearishFeature, { regime: "STRONG_DOWN", confidence: 1, reasons: [] },
   )?.direction, "BEARISH");
 
-  const afterEntryCutoff = { ...feature(1), timestamp: zonedDateTimeToEpoch("2026-07-22", "14:30:01") };
-  const cutoff = new SignalEngine(enforcedImmediateWithoutLateGuardConfig).evaluateDetailed(
-    afterEntryCutoff, unclassified,
+  const afterEntryCutoff = { ...feature(-1), timestamp: zonedDateTimeToEpoch("2026-07-22", "14:30:01") };
+  const researchSignal = new SignalEngine(enforcedImmediateWithoutLateGuardConfig).evaluateDetailed(
+    afterEntryCutoff, { regime: "STRONG_DOWN", confidence: 1, reasons: [] },
   );
-  assert.equal(cutoff.signal, undefined);
-  assert.ok(cutoff.reasons.includes("ZERO_DTE_ENTRY_CUTOFF_PASSED"));
+  assert.equal(researchSignal.signal?.direction, "BEARISH");
 });
 
 test("causal follow-through confirms only aligned movement observed 5-15 seconds later", () => {
@@ -168,11 +168,17 @@ test("causal follow-through confirms only aligned movement observed 5-15 seconds
   assert.equal(armed.signal, undefined);
   assert.deepEqual(armed.reasons, ["FOLLOW_THROUGH_PENDING"]);
   assert.equal(winnerEngine.evaluate({ ...first, timestamp: first.timestamp + 4_000, price: 501.01 }, regime), undefined);
-  const confirmed = winnerEngine.evaluateDetailed(
+  const belowNoise = winnerEngine.evaluateDetailed(
     { ...first, timestamp: first.timestamp + 5_000, price: 501.02 }, regime,
   );
-  assert.equal(confirmed.signal?.timestamp, first.timestamp + 5_000);
+  assert.equal(belowNoise.signal, undefined);
+  assert.deepEqual(belowNoise.reasons, ["FOLLOW_THROUGH_NOT_CONFIRMED"]);
+  const confirmed = winnerEngine.evaluateDetailed(
+    { ...first, timestamp: first.timestamp + 10_000, price: 501.11 }, regime,
+  );
+  assert.equal(confirmed.signal?.timestamp, first.timestamp + 10_000);
   assert.ok(confirmed.signal?.reasons.some((reason) => reason.includes("causal follow-through confirmed")));
+  assert.ok(confirmed.signal?.reasons.some((reason) => reason.includes("2.000 bps required")));
 
   const loserEngine = new SignalEngine(enforcedSignalConfig);
   assert.equal(loserEngine.evaluate(first, regime), undefined);
@@ -186,31 +192,33 @@ test("causal follow-through confirms only aligned movement observed 5-15 seconds
   assert.deepEqual(failed.reasons, ["FOLLOW_THROUGH_FAILED"]);
 });
 
-test("default execution is immediate while enforced A/B profiles confirm selected scopes", () => {
+test("default confirmation targets bullish impulses without delaying other setup classes", () => {
   const bearish = feature(-1);
   const down: RegimeDecision = { regime: "STRONG_DOWN", confidence: 1, reasons: [] };
   assert.equal(new SignalEngine(defaultConfig).evaluate(bearish, down)?.direction, "BEARISH");
   const bullish = feature(1);
   const up: RegimeDecision = { regime: "STRONG_UP", confidence: 1, reasons: [] };
-  assert.equal(new SignalEngine(defaultConfig).evaluate(bullish, up)?.direction, "BULLISH");
+  assert.equal(new SignalEngine(immediateSignalConfig).evaluate(bullish, up)?.direction, "BULLISH");
 
-  const bullishOnly = new SignalEngine(enforcedSignalConfig).evaluateDetailed(bullish, up);
+  const bullishOnly = new SignalEngine(defaultConfig).evaluateDetailed(bullish, up);
   assert.equal(bullishOnly.signal, undefined);
   assert.deepEqual(bullishOnly.reasons, ["FOLLOW_THROUGH_PENDING"]);
   assert.equal(new SignalEngine(enforcedSignalConfig).evaluate(bearish, down)?.direction, "BEARISH");
 
   const allEntryConfig = structuredClone(defaultConfig);
-  allEntryConfig.signals.entryQualityMode = "ENFORCE";
+  allEntryConfig.signals.entryConfirmationMode = "ENFORCE";
   allEntryConfig.signals.followThroughScope = "ALL";
   const shadow = new SignalEngine(allEntryConfig).evaluateDetailed(bearish, down);
   assert.equal(shadow.signal, undefined);
   assert.deepEqual(shadow.reasons, ["FOLLOW_THROUGH_PENDING"]);
 });
 
-test("late-session entries require stronger projection and causal follow-through without delaying morning signals", () => {
+test("morning bullish impulses and late-session entries require causal follow-through", () => {
   const morning = feature(1);
   const up: RegimeDecision = { regime: "STRONG_UP", confidence: 1, reasons: [] };
-  assert.equal(new SignalEngine(defaultConfig).evaluate(morning, up)?.direction, "BULLISH");
+  const morningPending = new SignalEngine(defaultConfig).evaluateDetailed(morning, up);
+  assert.equal(morningPending.signal, undefined);
+  assert.deepEqual(morningPending.reasons, ["FOLLOW_THROUGH_PENDING"]);
   const weakMorningProjection = {
     ...morning,
     fast: {
@@ -245,7 +253,7 @@ test("late-session entries require stronger projection and causal follow-through
   const confirmed = engine.evaluateDetailed({
     ...late,
     timestamp: late.timestamp + 5_000,
-    price: late.price + 0.01,
+    price: late.price + 0.11,
   }, up);
   assert.equal(confirmed.signal?.direction, "BULLISH");
   assert.ok(confirmed.signal?.reasons.some((reason) => reason.includes("causal follow-through confirmed")));
@@ -264,7 +272,7 @@ test("late-session entries require stronger projection and causal follow-through
   const delayedWinner = july24Engine.evaluateDetailed({
     ...late,
     timestamp: late.timestamp + 15_000,
-    price: late.price * (1 + 1.8 / 10_000),
+    price: late.price * (1 + 2.2 / 10_000),
   }, up);
   assert.equal(delayedWinner.signal?.direction, "BULLISH");
   assert.ok(delayedWinner.signal?.reasons.some((reason) =>
@@ -289,7 +297,7 @@ test("late-session entries require stronger projection and causal follow-through
   const immediateBearish = strictWinnerEngine.evaluateDetailed({
     ...lateBearish,
     timestamp: lateBearish.timestamp + 5_000,
-    price: lateBearish.price - 0.08,
+    price: lateBearish.price - 0.11,
   }, down);
   assert.equal(immediateBearish.signal?.direction, "BEARISH");
 
@@ -498,9 +506,9 @@ test("option selector rejects wide cost and ranks an eligible liquid contract", 
   assert.ok(new OptionSelector(defaultConfig).evaluate(laterDated, undefined, signal).rejectionReasons.includes("NOT_SAME_DAY_EXPIRATION"));
 });
 
-test("morning option selection applies static gates without a follow-through delay", () => {
+test("morning option selection applies static gates after entry confirmation", () => {
   const morning = feature();
-  const signal = new SignalEngine(defaultConfig).evaluate(
+  const signal = new SignalEngine(immediateSignalConfig).evaluate(
     morning,
     classifyRegime(morning, defaultConfig.regimes),
   )!;

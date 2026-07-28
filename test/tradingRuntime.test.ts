@@ -21,10 +21,11 @@ const date = "2026-07-22";
 const now = zonedDateTimeToEpoch(date, "10:20:00");
 const callSymbol = "SPY260722C00501000";
 const immediateRuntimeConfig = structuredClone(defaultConfig);
+immediateRuntimeConfig.signals.entryConfirmationMode = "SHADOW";
 immediateRuntimeConfig.signals.followThroughMinSec = 0;
 immediateRuntimeConfig.signals.followThroughMaxSec = 0;
 const enforcedRuntimeConfig = structuredClone(defaultConfig);
-enforcedRuntimeConfig.signals.entryQualityMode = "ENFORCE";
+enforcedRuntimeConfig.signals.entryConfirmationMode = "ENFORCE";
 
 test("option universe readiness follows the 0DTE cutoff while protecting open exposure", () => {
   const beforeCutoff = zonedDateTimeToEpoch(date, "14:29:59");
@@ -381,7 +382,10 @@ test("end-to-end paper runtime arms SIP/OPRA and routes an eligible signal to a 
   const riskRecovery = recorder.events.find((event) => event.type === "daily_risk_state_recovery");
   assert.equal(riskRecovery?.data.restoredEntries, 0);
   assert.equal(riskRecovery?.data.activeMaxTradesPerDay, defaultConfig.risk.maxTradesPerDay);
-  assert.equal(riskRecovery?.data.shadowMaxTradesPerDay, defaultConfig.risk.entryQualityMaxTradesPerDay);
+  assert.equal(
+    riskRecovery?.data.entryConfirmationMode,
+    immediateRuntimeConfig.signals.entryConfirmationMode,
+  );
   await runtime.close();
   assert.deepEqual(history.priorityChanges.at(-1), []);
 });
@@ -492,7 +496,7 @@ test("restart restoration deduplicates partial entry fills and preserves the dai
   assert.ok(decision.reasons.includes("MAX_DAILY_ENTRIES_REACHED"));
 });
 
-test("restart after six unique fills restores an active shadow entry cap", async () => {
+test("restart preserves the high daily safety limit after six unique fills", async () => {
   const restoredAuditEvents: AuditEvent[] = Array.from({ length: 6 }, (_, index) => ({
     timestamp: now - (index + 1) * 1_000,
     marketDate: date,
@@ -524,11 +528,11 @@ test("restart after six unique fills restores an active shadow entry cap", async
   const recovery = recorder.events.find((event) => event.type === "daily_risk_state_recovery");
   assert.equal(recovery?.data.restoredEntries, 6);
   assert.equal(recovery?.data.activeEntryCapReached, false);
-  assert.equal(recovery?.data.shadowEntryCapReached, true);
+  assert.equal(recovery?.data.maxTradesPerDay, defaultConfig.risk.maxTradesPerDay);
   await runtime.close();
 });
 
-test("shadow confirmation observes a pending candidate without delaying the paper order", async () => {
+test("active confirmation keeps a weak immediate candidate out of the paper account", async () => {
   const client = new FakeRuntimeClient();
   const optionStream = new FakeOptionStream();
   const recorder = new MemoryRecorder();
@@ -548,9 +552,10 @@ test("shadow confirmation observes a pending candidate without delaying the pape
     symbol: callSymbol, timestamp: now, bidPrice: 1.995, askPrice: 2.005, bidSize: 100, askSize: 100,
   });
   await runtime.ingestFeature(bullishFeature());
-  assert.equal(client.requests.length, 1);
+  assert.equal(client.requests.length, 0);
   const evaluation = recorder.events.find((event) => event.type === "live_entry_evaluation");
-  assert.equal(evaluation?.data.decision, "SIGNAL");
+  assert.equal(evaluation?.data.decision, "NO_SIGNAL");
+  assert.deepEqual(evaluation?.data.reasons, ["FOLLOW_THROUGH_PENDING"]);
   const shadow = evaluation?.data.shadowEvaluation as Record<string, unknown>;
   assert.equal(shadow.decision, "NO_SIGNAL");
   assert.deepEqual(shadow.reasons, ["FOLLOW_THROUGH_PENDING"]);
@@ -640,6 +645,7 @@ test("post-14:30 baseline candidates are labeled research-only before option sel
   const recorder = new MemoryRecorder();
   const config = structuredClone(defaultConfig);
   config.signals.lateEntryGuard.mode = "DISABLED";
+  config.signals.entryConfirmationMode = "SHADOW";
   const runtime = new SpyOptionsTradingRuntime({
     config,
     client,
@@ -692,7 +698,7 @@ test("enforced opt-in waits for causal follow-through before submitting an entry
     symbol: callSymbol, timestamp: decisionTime, bidPrice: 1.995, askPrice: 2.005, bidSize: 100, askSize: 100,
   });
   await runtime.ingestFeature({
-    ...bullishFeature(), timestamp: decisionTime, price: 501.02, mid: 501.02,
+    ...bullishFeature(), timestamp: decisionTime, price: 501.11, mid: 501.11,
   });
   assert.equal(client.requests.length, 1);
   const signalEvaluation = recorder.events.find(
@@ -708,7 +714,7 @@ test("all confirmation scopes are audited together and cannot submit an order", 
   const client = new FakeRuntimeClient();
   const recorder = new MemoryRecorder();
   const runtime = new SpyOptionsTradingRuntime({
-    config: defaultConfig,
+    config: immediateRuntimeConfig,
     client,
     stockStream: new FakeStockStream(),
     optionStream: new FakeOptionStream(),

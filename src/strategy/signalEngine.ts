@@ -30,6 +30,7 @@ interface PendingFollowThrough {
   kind: TradeSignal["kind"];
   armedAt: number;
   entryReferencePrice: number;
+  entryNoiseFloorBps: number;
   maxSec: number;
   reasonPrefix: "" | "LATE_ENTRY_";
 }
@@ -38,6 +39,7 @@ interface FollowThroughRequirement {
   minSec: number;
   maxSec: number;
   minimumBps: number;
+  noiseMultiplier: number;
   reasonPrefix: "" | "LATE_ENTRY_";
 }
 
@@ -74,10 +76,6 @@ export class SignalEngine {
     if (!feature.openingRange.complete) globalReasons.push("OPENING_RANGE_INCOMPLETE");
     if (!inSessionWindow(feature.timestamp, this.#config.session.entryStart, this.#config.session.entryEnd, this.#config.timeZone)) {
       globalReasons.push("OUTSIDE_ENTRY_WINDOW");
-    }
-    if (this.#config.signals.entryQualityMode === "ENFORCE" &&
-        secondsSinceMidnight(feature.timestamp, this.#config.timeZone) > parseClock(this.#config.options.zeroDteEntryCutoff)) {
-      globalReasons.push("ZERO_DTE_ENTRY_CUTOFF_PASSED");
     }
     if (this.#config.signals.blockWhipsaw && regime.regime === "HIGH_VOL_WHIPSAW") globalReasons.push("WHIPSAW_REGIME_BLOCKED");
     if (feature.timestamp - this.#lastSignalTimestamp < this.#config.signals.minimumSignalIntervalSec * 1000) {
@@ -125,7 +123,8 @@ export class SignalEngine {
         return { passed: false, reasons: confirmation.reasons, directions: directionEvaluations };
       }
       selected.reasons.push(
-        `causal follow-through confirmed after ${confirmation.elapsedSec.toFixed(1)}s at ${confirmation.moveBps.toFixed(3)} bps`,
+        `causal follow-through confirmed after ${confirmation.elapsedSec.toFixed(1)}s at ` +
+        `${confirmation.moveBps.toFixed(3)} bps versus ${confirmation.requiredMoveBps.toFixed(3)} bps required`,
       );
     } else {
       this.#pendingFollowThrough = undefined;
@@ -141,7 +140,12 @@ export class SignalEngine {
 
   #confirmFollowThrough(
     selected: TradeSignal, feature: FeatureSnapshot, requirement: FollowThroughRequirement,
-  ): { confirmed: true; elapsedSec: number; moveBps: number } | { confirmed: false; reasons: string[] } {
+  ): {
+    confirmed: true;
+    elapsedSec: number;
+    moveBps: number;
+    requiredMoveBps: number;
+  } | { confirmed: false; reasons: string[] } {
     const pending = this.#pendingFollowThrough;
     const prefix = requirement.reasonPrefix;
     if (!pending || pending.direction !== selected.direction || pending.kind !== selected.kind ||
@@ -151,6 +155,7 @@ export class SignalEngine {
         kind: selected.kind,
         armedAt: feature.timestamp,
         entryReferencePrice: feature.price,
+        entryNoiseFloorBps: feature.fast.noiseFloorBps,
         maxSec: requirement.maxSec,
         reasonPrefix: prefix,
       };
@@ -166,9 +171,14 @@ export class SignalEngine {
     }
     const sign = selected.direction === "BULLISH" ? 1 : -1;
     const moveBps = sign * (feature.price / pending.entryReferencePrice - 1) * 10_000;
-    if (elapsedMs <= requirement.maxSec * 1000 && moveBps >= requirement.minimumBps) {
+    const requiredMoveBps = Math.max(
+      requirement.minimumBps,
+      requirement.noiseMultiplier *
+        Math.max(pending.entryNoiseFloorBps, feature.fast.noiseFloorBps),
+    );
+    if (elapsedMs <= requirement.maxSec * 1000 && moveBps >= requiredMoveBps) {
       this.#pendingFollowThrough = undefined;
-      return { confirmed: true, elapsedSec, moveBps };
+      return { confirmed: true, elapsedSec, moveBps, requiredMoveBps };
     }
     if (elapsedMs < requirement.maxSec * 1000) {
       return { confirmed: false, reasons: [`${prefix}FOLLOW_THROUGH_NOT_CONFIRMED`] };
@@ -178,6 +188,7 @@ export class SignalEngine {
       kind: selected.kind,
       armedAt: feature.timestamp,
       entryReferencePrice: feature.price,
+      entryNoiseFloorBps: feature.fast.noiseFloorBps,
       maxSec: requirement.maxSec,
       reasonPrefix: prefix,
     };
@@ -206,16 +217,18 @@ export class SignalEngine {
         minSec: profile.followThroughMinSec,
         maxSec: profile.followThroughMaxSec,
         minimumBps: profile.followThroughMinimumBps,
+        noiseMultiplier: this.#config.signals.followThroughNoiseMultiplier,
         reasonPrefix: "LATE_ENTRY_",
       };
     }
-    if (this.#config.signals.entryQualityMode !== "ENFORCE" || !this.#requiresStandardFollowThrough(signal)) {
+    if (this.#config.signals.entryConfirmationMode !== "ENFORCE" || !this.#requiresStandardFollowThrough(signal)) {
       return undefined;
     }
     return {
       minSec: this.#config.signals.followThroughMinSec,
       maxSec: this.#config.signals.followThroughMaxSec,
       minimumBps: this.#config.signals.followThroughMinimumBps,
+      noiseMultiplier: this.#config.signals.followThroughNoiseMultiplier,
       reasonPrefix: "",
     };
   }
@@ -301,7 +314,7 @@ export class SignalEngine {
       blockedReasons.push("LATE_BULLISH_IMPULSE_REQUIRES_UP_REGIME");
       return undefined;
     }
-    const bullishImpulseCutoffPassed = this.#config.signals.entryQualityMode === "ENFORCE" &&
+    const bullishImpulseCutoffPassed = this.#config.signals.entryConfirmationMode === "ENFORCE" &&
       direction === "BULLISH" &&
       secondsSinceMidnight(f.timestamp, this.#config.timeZone) > parseClock(this.#config.signals.bullishImpulseCutoff);
     if (impulsePassed && bullishImpulseCutoffPassed) {

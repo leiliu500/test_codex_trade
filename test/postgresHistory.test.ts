@@ -80,7 +80,7 @@ test("PostgreSQL history saves completed order cards with their full dynamics li
     totalPnl: 20,
     entryTimestamp: 1_000,
     exitTimestamp: 2_000,
-    exitReason: "PROFIT_TARGET",
+    exitReason: "PROFIT_FLOOR_EXIT",
     lifecycle: "CLOSED",
     tradeState: "PROTECTED_RECOVERED",
     managementDecision: "EXIT",

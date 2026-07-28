@@ -93,9 +93,6 @@ export interface DashboardTrade extends DashboardOrderManagement {
   unrealizedPnl?: number;
   unrealizedReturnPct?: number;
   stopPrice?: number;
-  targetPrice?: number;
-  highWaterMark: number;
-  lowWaterMark: number;
   maxFavorableExcursionPct?: number;
   maxAdverseExcursionPct?: number;
   capturePct?: number;
@@ -208,7 +205,6 @@ export interface DashboardActiveOrder extends DashboardOrderManagement {
   unrealizedReturnPct?: number;
   totalPnl?: number;
   stopPrice?: number;
-  targetPrice?: number;
   entryTimestamp?: number;
   elapsedMs?: number;
   lastQuoteTimestamp?: number;
@@ -287,8 +283,6 @@ export interface DashboardPerformance {
   optionsSelected: number;
   riskAllowed: number;
   riskBlocked: number;
-  /** Backward-compatible alias for signalsFired. */
-  entriesFired: number;
   entryOrders: number;
   exitOrders: number;
   filledEntryOrders: number;
@@ -508,12 +502,6 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
         if (!previous || timestamp >= previous.timestamp) {
           this.#latestOptionQuotes.set(event.symbol, { timestamp, bidPrice, askPrice });
         }
-        const trade = this.#openTrades.get(event.symbol);
-        if (trade && timestamp >= trade.entryTimestamp) {
-          const mark = (bidPrice + askPrice) / 2;
-          trade.highWaterMark = Math.max(trade.highWaterMark, mark);
-          trade.lowWaterMark = Math.min(trade.lowWaterMark, mark);
-        }
         this.#refreshProjectedOrderCards(timestamp, event.symbol, "PNL");
         this.#pruneMap(this.#latestOptionQuotes, 5_000);
       }
@@ -586,7 +574,6 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
         optionsSelected,
         riskAllowed,
         riskBlocked,
-        entriesFired: signals.length,
         entryOrders: orders.filter((order) => order.purpose === "ENTRY").length,
         exitOrders: orders.filter((order) => order.purpose === "EXIT").length,
         filledEntryOrders: orders.filter((order) => order.purpose === "ENTRY" && order.filledQuantity > 0).length,
@@ -702,7 +689,7 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
       const risk = recordValue(event.data.risk);
       outcome = risk.allowed === true ? "ALLOWED" : "BLOCKED";
       summary = risk.allowed === true
-        ? `${numberValue(risk.quantity) ?? 0} contract(s) · stop ${formatFeedNumber(numberValue(risk.stopPrice))} · target ${formatFeedNumber(numberValue(risk.targetPrice))}`
+        ? `${numberValue(risk.quantity) ?? 0} contract(s) · hard stop ${formatFeedNumber(numberValue(risk.stopPrice))}`
         : "Risk manager blocked entry";
       reasons = stringArray(risk.reasons);
     } else if (event.type === "entry_blocked") {
@@ -843,7 +830,6 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
         } : {}),
         ...(unrealizedReturnPct !== undefined ? { unrealizedReturnPct } : {}),
         ...(trade.stopPrice !== undefined ? { stopPrice: trade.stopPrice } : {}),
-        ...(trade.targetPrice !== undefined ? { targetPrice: trade.targetPrice } : {}),
         entryTimestamp: trade.entryTimestamp,
         elapsedMs: Math.max(0, generatedAt - trade.entryTimestamp),
         ...(workingOrder ? { workingOrder: publicWorkingOrder(workingOrder) } : {}),
@@ -994,9 +980,6 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
         unrealizedReturnPct: openCost > 0 ? 100 * unrealizedPnl / openCost : 0,
       } : {}),
       ...(trade.stopPrice !== undefined ? { stopPrice: trade.stopPrice } : {}),
-      ...(trade.targetPrice !== undefined ? { targetPrice: trade.targetPrice } : {}),
-      highWaterMark: trade.highWaterMark,
-      lowWaterMark: trade.lowWaterMark,
       ...excursions,
       ...(trade.returnPct !== undefined ? { returnPct: trade.returnPct } : {}),
       ...(trade.exitReason ? { exitReason: trade.exitReason } : {}),
@@ -1174,15 +1157,12 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
     const quantity = numberValue(position.quantity) ?? numberValue(event.data.cumulativeQuantity) ?? 0;
     const averageEntryPrice = numberValue(position.averageEntryPrice) ?? numberValue(event.data.incrementalPrice) ?? 0;
     const stopPrice = numberValue(position.stopPrice);
-    const targetPrice = numberValue(position.targetPrice);
     const signalId = stringValue(event.data.signalId)
       ?? [...this.#orders.values()].reverse().find((order) => order.purpose === "ENTRY" && order.symbol === symbol)?.signalId
       ?? this.#matchingSignal(symbol, entryTimestamp)?.id;
     const order = [...this.#orders.values()].reverse().find((candidate) =>
       candidate.purpose === "ENTRY" && (candidate.signalId === signalId || candidate.symbol === symbol));
     if (order && order.firstFillTimestamp === undefined) order.firstFillTimestamp = event.timestamp;
-    const highWaterMark = numberValue(position.highWaterMark) ?? averageEntryPrice;
-    const lowWaterMark = numberValue(position.lowWaterMark) ?? averageEntryPrice;
     const management = orderManagementFields(position);
     if (existing) {
       Object.assign(existing, management);
@@ -1190,9 +1170,6 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
       existing.quantity = Math.max(existing.quantity, quantity);
       existing.averageEntryPrice = averageEntryPrice;
       if (stopPrice !== undefined) existing.stopPrice = stopPrice;
-      if (targetPrice !== undefined) existing.targetPrice = targetPrice;
-      existing.highWaterMark = Math.max(existing.highWaterMark, highWaterMark);
-      existing.lowWaterMark = Math.min(existing.lowWaterMark, lowWaterMark);
       existing.status = "OPEN";
     } else {
       this.#openTrades.set(symbol, {
@@ -1203,9 +1180,6 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
         quantity,
         averageEntryPrice,
         ...(stopPrice !== undefined ? { stopPrice } : {}),
-        ...(targetPrice !== undefined ? { targetPrice } : {}),
-        highWaterMark,
-        lowWaterMark,
         realizedPnl: 0,
         status: "OPEN",
         exitedQuantity: 0,
@@ -1238,8 +1212,6 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
         entryTimestamp,
         quantity: numberValue(event.data.incrementalQuantity) ?? 0,
         averageEntryPrice: numberValue(event.data.averageEntryPrice) ?? 0,
-        highWaterMark: numberValue(event.data.highWaterMark) ?? numberValue(event.data.averageEntryPrice) ?? 0,
-        lowWaterMark: numberValue(event.data.lowWaterMark) ?? numberValue(event.data.averageEntryPrice) ?? 0,
         realizedPnl: 0,
         status: "OPEN",
         exitedQuantity: 0,
@@ -1250,14 +1222,6 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
     Object.assign(trade, orderManagementFields(event.data));
     const quantity = numberValue(event.data.incrementalQuantity) ?? 0;
     const price = numberValue(event.data.incrementalPrice) ?? 0;
-    const highWaterMark = numberValue(event.data.highWaterMark);
-    const lowWaterMark = numberValue(event.data.lowWaterMark);
-    if (highWaterMark !== undefined) trade.highWaterMark = Math.max(trade.highWaterMark, highWaterMark);
-    if (lowWaterMark !== undefined) trade.lowWaterMark = Math.min(trade.lowWaterMark, lowWaterMark);
-    if (price > 0) {
-      trade.highWaterMark = Math.max(trade.highWaterMark, price);
-      trade.lowWaterMark = Math.min(trade.lowWaterMark, price);
-    }
     trade.exitedQuantity += quantity;
     trade.exitNotional += quantity * price;
     trade.realizedPnl += numberValue(event.data.realizedPnl) ?? 0;
@@ -1368,7 +1332,6 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
       ...(active.unrealizedReturnPct !== undefined ? { unrealizedReturnPct: active.unrealizedReturnPct } : {}),
       ...(active.totalPnl !== undefined ? { totalPnl: active.totalPnl } : {}),
       ...(active.stopPrice !== undefined ? { stopPrice: active.stopPrice } : {}),
-      ...(active.targetPrice !== undefined ? { targetPrice: active.targetPrice } : {}),
       ...(active.entryTimestamp !== undefined ? { entryTimestamp: active.entryTimestamp } : {}),
       ...(active.elapsedMs !== undefined ? { elapsedMs: active.elapsedMs } : {}),
       ...(active.lastQuoteTimestamp !== undefined ? { lastQuoteTimestamp: active.lastQuoteTimestamp } : {}),
@@ -1413,7 +1376,6 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
       totalPnl: trade.realizedPnl,
       ...(trade.returnPct !== undefined ? { unrealizedReturnPct: trade.returnPct } : {}),
       ...(trade.stopPrice !== undefined ? { stopPrice: trade.stopPrice } : {}),
-      ...(trade.targetPrice !== undefined ? { targetPrice: trade.targetPrice } : {}),
       entryTimestamp: trade.entryTimestamp,
       ...(trade.exitTimestamp !== undefined ? {
         exitTimestamp: trade.exitTimestamp,
@@ -1478,20 +1440,25 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
 }
 
 function tradeExcursions(trade: Pick<MutableTrade,
-"averageEntryPrice" | "highWaterMark" | "lowWaterMark" | "status" | "returnPct">): {
+"averageEntryPrice" | "quantity" | "highWaterPnl" | "lowWaterPnl" | "status" | "returnPct">): {
   maxFavorableExcursionPct?: number;
   maxAdverseExcursionPct?: number;
   capturePct?: number;
 } {
-  if (!(trade.averageEntryPrice > 0)) return {};
-  const maxFavorableExcursionPct = 100 * (trade.highWaterMark - trade.averageEntryPrice) / trade.averageEntryPrice;
-  const maxAdverseExcursionPct = 100 * (trade.lowWaterMark - trade.averageEntryPrice) / trade.averageEntryPrice;
+  const entryCost = 100 * trade.quantity * trade.averageEntryPrice;
+  if (!(entryCost > 0)) return {};
+  const maxFavorableExcursionPct = trade.highWaterPnl === undefined
+    ? undefined
+    : 100 * trade.highWaterPnl / entryCost;
+  const maxAdverseExcursionPct = trade.lowWaterPnl === undefined
+    ? undefined
+    : 100 * trade.lowWaterPnl / entryCost;
   const capturePct = trade.status === "CLOSED" && trade.returnPct !== undefined && trade.returnPct > 0 &&
-    maxFavorableExcursionPct > 0
+    maxFavorableExcursionPct !== undefined && maxFavorableExcursionPct > 0
     ? Math.max(0, Math.min(100, 100 * trade.returnPct / maxFavorableExcursionPct)) : undefined;
   return {
-    maxFavorableExcursionPct,
-    maxAdverseExcursionPct,
+    ...(maxFavorableExcursionPct !== undefined ? { maxFavorableExcursionPct } : {}),
+    ...(maxAdverseExcursionPct !== undefined ? { maxAdverseExcursionPct } : {}),
     ...(capturePct !== undefined ? { capturePct } : {}),
   };
 }
@@ -1982,7 +1949,7 @@ if(x.optionContinuation){const o=x.optionContinuation;managementDetails.push('Gr
 management.append(managementHead,managementGrid);
 if(managementDetails.length)management.append(node('div','management-detail',managementDetails.join(' | ')));
 const fields=node('div','live-fields');
-fields.append(field('Position',x.remainingQuantity+' / '+x.quantity+' contracts'),field('Entry',x.entryPrice===undefined?'—':money(x.entryPrice)),field(x.active?'Bid / Ask':'Exit',x.active?(x.currentBid===undefined?'—':money(x.currentBid)+' / '+money(x.currentAsk)):(x.exitPrice===undefined?'—':money(x.exitPrice))),field('Stop',x.stopPrice===undefined?'—':money(x.stopPrice)),field('Target / objective',x.targetPrice===undefined?'—':money(x.targetPrice)),field('Elapsed',duration(x.elapsedMs)),field('Realized',money(x.realizedPnl)),field(x.active?'Quote age':'Exit reason',x.active?(x.quoteAgeMs===undefined?'Waiting for quote':duration(x.quoteAgeMs)):(x.exitReason||x.managementReason||x.status)),field('Direction',x.direction||'Pending entry'));
+fields.append(field('Position',x.remainingQuantity+' / '+x.quantity+' contracts'),field('Entry',x.entryPrice===undefined?'—':money(x.entryPrice)),field(x.active?'Bid / Ask':'Exit',x.active?(x.currentBid===undefined?'—':money(x.currentBid)+' / '+money(x.currentAsk)):(x.exitPrice===undefined?'—':money(x.exitPrice))),field('Hard stop',x.stopPrice===undefined?'—':money(x.stopPrice)),field('Protected floor',x.protectedFloorPnl===undefined?'—':money(x.protectedFloorPnl)),field('Elapsed',duration(x.elapsedMs)),field('Realized',money(x.realizedPnl)),field(x.active?'Quote age':'Exit reason',x.active?(x.quoteAgeMs===undefined?'Waiting for quote':duration(x.quoteAgeMs)):(x.exitReason||x.managementReason||x.status)),field('Direction',x.direction||'Pending entry'));
 card.append(head,quality,management,fields);
 if(x.workingOrder){const order=x.workingOrder,strip=node('div','order-strip'),row=node('div','order-strip-row'),left=node('span','',order.purpose+' '+order.status+' · '+order.filledQuantity+'/'+order.requestedQuantity+' filled'),right=node('span','',money(order.limitPrice)+' limit · '+order.replacements+' replaces'),details=[],triggerText=(order.triggers||x.exitTriggers||[]).map(value=>value.replaceAll('_',' ')).join(' · ');row.append(left,right);if(order.urgency!==undefined)details.push('urgency '+percent(100*order.urgency,0));if(order.actionTtlMs!==undefined)details.push('TTL '+order.actionTtlMs+' ms');if(order.priceCollar!==undefined)details.push('collar '+money(order.priceCollar));if(order.attempt!==undefined)details.push('attempt '+order.attempt);if(order.exitIntentId)details.push('intent '+order.exitIntentId);strip.append(row);if(details.length)strip.append(node('div','order-strip-detail',details.join(' · ')));if(triggerText)strip.append(node('div','order-strip-detail','Exit triggers · '+triggerText));card.append(strip)}
 const updates=x.updates||[],managementUpdates=updates.filter(update=>update.lifecycle||update.tradeState||update.managementDecision).length,dynamics=node('div','dynamics'),title=node('div','dynamics-title','Durable timeline · '+updates.length+' changes · '+managementUpdates+' manager states'),list=node('div','dynamics-list');
@@ -2028,7 +1995,7 @@ setStatus('brokerState','brokerDetail',h.brokerAvailable?'CONNECTED':'UNAVAILABL
 setStatus('marketState','marketDetail',String(h.marketClockState||'unknown').replaceAll('-',' ').toUpperCase(),h.positionsReconciled?'Positions reconciled':'Reconciliation required',h.positionsReconciled?'ok':'halted');
 const strategyRequired=h.executionEnabled&&h.marketClockState==='market-open',strategyReady=h.strategyStateReady===true||!strategyRequired,strategyStatus=String(h.strategyStateStatus||(!strategyRequired?'NOT REQUIRED':'UNKNOWN')).replaceAll('_',' ');
 setStatus('strategyState','strategyDetail',strategyReady?'READY':'BLOCKED',strategyStatus+' · '+count(h.restoredStockEvents)+' SIP restored at startup / '+count(h.restoredFeatureBars??h.restoredBars)+' bars · '+count(sipLive)+' live SIP events',strategyReady?'ok':'halted');
-const signalsFired=p.signalsFired??p.entriesFired??0,optionsSelected=p.optionsSelected??0;
+const signalsFired=p.signalsFired??0,optionsSelected=p.optionsSelected??0;
 $('signalsFired').textContent=count(signalsFired);$('optionsSelected').textContent=count(optionsSelected);$('optionSelectionDetail').textContent=percent(signalsFired>0?100*optionsSelected/signalsFired:0)+' of signals';$('riskAllowed').textContent=count(p.riskAllowed);$('riskDetail').textContent=count(p.riskBlocked)+' blocked';$('entryOrders').textContent=p.entryOrders;$('filledEntries').textContent=p.filledEntryOrders;$('closedTrades').textContent=p.closedTrades;$('winRate').textContent=(p.winRate*100).toFixed(1)+'%';$('pnl').textContent=money(p.realizedPnl);$('pnl').className='value '+(p.realizedPnl>0?'positive':p.realizedPnl<0?'negative':'');$('openPnl').textContent=money(p.unrealizedPnl);$('openPnl').className='value '+(p.unrealizedPnl>0?'positive':p.unrealizedPnl<0?'negative':'');$('totalPnl').textContent=money(p.totalPnl);$('totalPnl').className='value '+(p.totalPnl>0?'positive':p.totalPnl<0?'negative':'');$('profitFactor').textContent=p.profitFactor===null?'—':num(p.profitFactor);$('openTrades').textContent=p.openTrades;$('subscriptions').textContent=subscriptions;$('feedEvents').textContent=count(live.totalEvents);$('sipQuotes').textContent=count(live.eventCounts.stock_quote);$('sipTrades').textContent=count(live.eventCounts.stock_trade);$('opraQuotes').textContent=count(live.eventCounts.option_quote);$('featureEvents').textContent=count(live.eventCounts.feature_snapshot);$('feedAge').textContent=live.lastEventAgeMs===undefined?'—':duration(live.lastEventAgeMs);
 renderOrders(data.orderCards||data.activeOrders);
 rows('signals',data.signals,[x=>({value:time(x.timestamp)}),x=>({value:x.direction}),x=>({value:x.kind}),x=>({value:x.regime}),x=>({value:num(x.projectedMoveBps)+' bps'}),x=>({value:x.candidate}),x=>({value:x.riskStatus||'—',cls:x.riskStatus==='ALLOWED'?'positive':x.riskStatus==='BLOCKED'?'negative':''}),x=>({value:x.status}),x=>({value:(x.riskReasons||x.reasons||[]).join(', ')})]);

@@ -1,5 +1,5 @@
 {
-  "version": "spy-0dte-unified-order-management-2",
+  "version": "spy-0dte-entry-confirmation-9-unified-order-management-4",
   "symbol": "SPY",
   "timeZone": "America/New_York",
   "session": {
@@ -32,7 +32,7 @@
     "noiseFloorBps": 0.01
   },
   "signals": {
-    "entryQualityMode": "SHADOW",
+    "entryConfirmationMode": "ENFORCE",
     "minEfficiency60": 0.28,
     "minR2Medium": 0.15,
     "impulseFastSlopeScore": 0.42,
@@ -56,6 +56,7 @@
     "followThroughMinSec": 5,
     "followThroughMaxSec": 15,
     "followThroughMinimumBps": 0,
+    "followThroughNoiseMultiplier": 1.0,
     "followThroughScope": "BULLISH_IMPULSE",
     "shadowFollowThroughScope": "BULLISH_IMPULSE",
     "morningEntryGuard": {
@@ -139,19 +140,10 @@
     "maxPremiumDollarsPerTrade": 1500,
     "maxContracts": 1,
     "maxTradesPerDay": 1000,
-    "entryQualityMaxTradesPerDay": 6,
     "maxDailyLossDollars": 1000,
     "hardOptionStopPct": 0.25,
-    "optionProfitTargetPct": 0.35,
-    "trailingDrawdownPct": 0.18,
-    "trailingActivationPct": 0.12,
-    "trailingProfitFloorPct": 0.02,
     "maxHoldSec": 1200,
     "trendInvalidationGraceSec": 8,
-    "earlyScratchMinAgeSec": 5,
-    "earlyScratchMaxAgeSec": 30,
-    "earlyScratchMinimumFavorablePct": 0.01,
-    "earlyScratchUnderlyingReversalBps": 0.1,
     "staleDataEmergencySec": 10,
     "onePositionAtATime": true,
     "minimumProfitFloorDollars": 7,

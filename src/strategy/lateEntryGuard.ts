@@ -63,7 +63,13 @@ export function morningEntryGuardAudit(
     minProjectedMoveBps: config.signals.morningEntryGuard.minProjectedMoveBps,
     minCostMarginBps: config.signals.morningEntryGuard.minCostMarginBps,
     maxOptionSpreadPct: config.signals.morningEntryGuard.maxOptionSpreadPct,
-    followThrough: "DISABLED",
+    followThrough: config.signals.entryConfirmationMode === "ENFORCE"
+      ? config.signals.followThroughScope
+      : "DISABLED",
+    followThroughMinSec: config.signals.followThroughMinSec,
+    followThroughMaxSec: config.signals.followThroughMaxSec,
+    followThroughMinimumBps: config.signals.followThroughMinimumBps,
+    followThroughNoiseMultiplier: config.signals.followThroughNoiseMultiplier,
   };
 }
 
@@ -82,6 +88,7 @@ export function lateEntryGuardAudit(
     followThroughMinSec: config.signals.lateEntryGuard.followThroughMinSec,
     followThroughMaxSec: config.signals.lateEntryGuard.followThroughMaxSec,
     followThroughMinimumBps: config.signals.lateEntryGuard.followThroughMinimumBps,
+    followThroughNoiseMultiplier: config.signals.followThroughNoiseMultiplier,
     bearishGrindRequiresFollowThrough:
       config.signals.lateEntryGuard.bearishGrindRequiresFollowThrough,
     bearishUnclassifiedImpulseFollowThroughStart:

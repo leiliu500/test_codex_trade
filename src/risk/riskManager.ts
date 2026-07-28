@@ -30,9 +30,7 @@ export class RiskManager {
     if (!request.account.active) reasons.push("ACCOUNT_INACTIVE_OR_BLOCKED");
     if (!request.account.optionsApproved) reasons.push("OPTIONS_APPROVAL_INSUFFICIENT");
     if (request.account.killSwitch) reasons.push("KILL_SWITCH_ACTIVE");
-    const maxTradesPerDay = this.#config.signals.entryQualityMode === "ENFORCE"
-      ? this.#config.risk.entryQualityMaxTradesPerDay : this.#config.risk.maxTradesPerDay;
-    if (daily.entries >= maxTradesPerDay) reasons.push("MAX_DAILY_ENTRIES_REACHED");
+    if (daily.entries >= this.#config.risk.maxTradesPerDay) reasons.push("MAX_DAILY_ENTRIES_REACHED");
     if (lateEntryGuardActive(this.#config, request.timestamp) &&
         daily.entries >= this.#config.signals.lateEntryGuard.maxDailyEntries) {
       reasons.push("LATE_ENTRY_MAX_DAILY_ENTRIES_REACHED");
@@ -59,7 +57,6 @@ export class RiskManager {
       quantity: reasons.length === 0 ? quantity : 0,
       maxLossPerContract,
       stopPrice: Math.max(0.01, request.optionMid * (1 - this.#config.risk.hardOptionStopPct)),
-      targetPrice: request.optionMid * (1 + this.#config.risk.optionProfitTargetPct),
       reasons,
     };
   }
@@ -91,9 +88,6 @@ export class RiskManager {
       averageEntryPrice: averageFillPrice,
       entryTimestamp: timestamp,
       stopPrice: Math.max(0.01, averageFillPrice * (1 - this.#config.risk.hardOptionStopPct)),
-      targetPrice: averageFillPrice * (1 + this.#config.risk.optionProfitTargetPct),
-      highWaterMark: averageFillPrice,
-      lowWaterMark: averageFillPrice,
       tradeState: "OPEN_UNPROTECTED",
       executablePnl: 0,
       highWaterPnl: 0,

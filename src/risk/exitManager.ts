@@ -36,7 +36,6 @@ export class ExitManager {
   }
 
   evaluate(context: ExitContext): ExitDecision {
-    const wasLegacyPosition = context.position.tradeState === undefined;
     let position: PositionState = { ...context.position };
     const quote = context.optionQuote;
     const quoteStale = !quote ||
@@ -111,7 +110,7 @@ export class ExitManager {
       }
     }
 
-    if ((position.reversalCusum ?? 0) >= this.#config.risk.reversalCusumThreshold &&
+    if (position.reversalCusum >= this.#config.risk.reversalCusumThreshold &&
         position.tradeState !== "OPEN_UNPROTECTED") {
       trigger("REVERSAL_CUSUM");
     }
@@ -122,15 +121,15 @@ export class ExitManager {
     if (recoveryProbability === undefined &&
         position.tradeState === "OPEN_UNPROTECTED" &&
         ageSec >= this.#config.risk.recoveryProbabilityMinAgeSec &&
-        (position.pnlObservationCount ?? 0) >=
+        position.pnlObservationCount >=
           this.#config.risk.recoveryProbabilityMinObservations) {
       const riskBudget = positionRiskBudget(position);
       recoveryProbability = firstPassageUpperProbability(
-        position.executablePnl ?? 0,
+        position.executablePnl,
         -riskBudget,
         this.#config.risk.recoveredActivationDollars,
-        position.pnlEwmaDriftPerSec ?? 0,
-        position.pnlEwmaVariancePerSec ?? 0,
+        position.pnlEwmaDriftPerSec,
+        position.pnlEwmaVariancePerSec,
       );
     }
     if (recoveryProbability !== undefined) {
@@ -188,7 +187,7 @@ export class ExitManager {
     if (maxHoldFired) trigger("STALL_OR_OPPORTUNITY_COST");
 
     const timeSinceHighSec =
-      (context.timestamp - (position.lastHighTimestamp ?? position.entryTimestamp)) / 1000;
+      (context.timestamp - position.lastHighTimestamp) / 1000;
     if (executablePnl !== undefined &&
         executablePnl > 0 &&
         position.tradeState === "OPEN_UNPROTECTED" &&
@@ -196,62 +195,6 @@ export class ExitManager {
         context.continuationLcbDollars !== undefined &&
         context.continuationLcbDollars <= 0) {
       trigger("STALL_OR_OPPORTUNITY_COST");
-    }
-
-    // Preserve the old scratch gate as an opt-in compatibility policy. The new
-    // controller records it as negative continuation rather than midpoint loss.
-    let earlyScratchFired = false;
-    if (this.#config.signals.entryQualityMode === "ENFORCE" &&
-        context.feature &&
-        position.underlyingEntryPrice !== undefined &&
-        ageSec >= this.#config.risk.earlyScratchMinAgeSec &&
-        ageSec <= this.#config.risk.earlyScratchMaxAgeSec) {
-      const directionSign = position.direction === "BULLISH" ? 1 : -1;
-      const favorableMoveReached = wasLegacyPosition
-        ? context.position.highWaterMark >=
-            context.position.averageEntryPrice *
-              (1 + this.#config.risk.earlyScratchMinimumFavorablePct)
-        : (position.highWaterPnl ?? 0) >=
-            100 * position.quantity * position.averageEntryPrice *
-              this.#config.risk.earlyScratchMinimumFavorablePct;
-      const underlyingMoveBps = directionSign *
-        (context.feature.price / position.underlyingEntryPrice - 1) * 10_000;
-      const underlyingReversed =
-        underlyingMoveBps <= -this.#config.risk.earlyScratchUnderlyingReversalBps &&
-        directionSign * context.feature.fast.normalizedSlope < 0;
-      if (!favorableMoveReached && underlyingReversed) {
-        earlyScratchFired = true;
-        trigger("CONTINUATION_LCB_NON_POSITIVE");
-      }
-    }
-
-    // Compatibility only for restored pre-rewrite positions. Newly filled
-    // positions treat targetPrice as a moving objective, not a profit ceiling.
-    if (wasLegacyPosition && triggers.length === 0 &&
-        mark !== undefined && mark >= position.targetPrice) {
-      return finish(
-        position, "PROFIT_TARGET", [], mark, liquidationPrice, executablePnl,
-      );
-    }
-    if (wasLegacyPosition && mark !== undefined &&
-        context.position.highWaterMark >=
-          context.position.averageEntryPrice *
-            (1 + this.#config.risk.trailingActivationPct)) {
-      const trailingStop = Math.max(
-        context.position.highWaterMark * (1 - this.#config.risk.trailingDrawdownPct),
-        context.position.averageEntryPrice *
-          (1 + this.#config.risk.trailingProfitFloorPct),
-      );
-      if (mark <= trailingStop && triggers.length === 0) {
-        return finish(
-          position,
-          "TRAILING_STOP",
-          ["PROFIT_FLOOR_BREACH"],
-          mark,
-          liquidationPrice,
-          executablePnl,
-        );
-      }
     }
 
     if (triggers.length === 0) {
@@ -278,8 +221,7 @@ export class ExitManager {
     const primary = triggers[0]!;
     return finish(
       position,
-      compatibleReason(primary, context, {
-        earlyScratchFired,
+      reasonForTrigger(primary, context, {
         greeksContinuationFired,
         maxHoldFired,
         recoveryDeadlineFired,
@@ -333,11 +275,10 @@ function finish(
   };
 }
 
-function compatibleReason(
+function reasonForTrigger(
   trigger: ExitTrigger,
   context: ExitContext,
   flags: {
-    earlyScratchFired: boolean;
     greeksContinuationFired: boolean;
     maxHoldFired: boolean;
     recoveryDeadlineFired: boolean;
@@ -357,12 +298,11 @@ function compatibleReason(
         isOppositeRegime(context.position.direction, context.regime.regime)
         ? "OPPOSITE_REGIME"
         : "TREND_INVALIDATION";
-    case "PROFIT_FLOOR_BREACH": return "TRAILING_STOP";
+    case "PROFIT_FLOOR_BREACH": return "PROFIT_FLOOR_EXIT";
     case "REVERSAL_CUSUM": return "REVERSAL_CUSUM";
     case "RECOVERY_PROBABILITY_TOO_LOW":
       return flags.recoveryDeadlineFired ? "RECOVERY_TIMEOUT" : "RECOVERY_PROBABILITY_TOO_LOW";
     case "CONTINUATION_LCB_NON_POSITIVE":
-      if (flags.earlyScratchFired) return "EARLY_SCRATCH";
       if (flags.greeksContinuationFired) return "GREEKS_CONTINUATION_LCB_NON_POSITIVE";
       return "CONTINUATION_LCB_NON_POSITIVE";
     case "STALL_OR_OPPORTUNITY_COST":
@@ -372,7 +312,7 @@ function compatibleReason(
 }
 
 function minimumRecoveryProbability(position: PositionState, config: EngineConfig): number {
-  const current = position.executablePnl ?? 0;
+  const current = position.executablePnl;
   const riskBudget = positionRiskBudget(position);
   const activationValue = config.risk.recoveredActivationDollars;
   return clamp(
