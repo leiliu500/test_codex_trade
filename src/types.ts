@@ -239,7 +239,6 @@ export interface RiskDecision {
   quantity: number;
   maxLossPerContract: number;
   stopPrice: number;
-  targetPrice: number;
   reasons: string[];
 }
 
@@ -250,28 +249,25 @@ export interface PositionState {
   averageEntryPrice: number;
   entryTimestamp: number;
   stopPrice: number;
-  targetPrice: number;
-  highWaterMark: number;
-  lowWaterMark: number;
   underlyingEntryPrice?: number;
   invalidSince?: number;
   /** Broker-confirmed trade state. Order submission never changes quantity. */
-  tradeState?: "OPEN_UNPROTECTED" | "PROTECTED_WINNER" | "PROTECTED_RECOVERED";
+  tradeState: "OPEN_UNPROTECTED" | "PROTECTED_WINNER" | "PROTECTED_RECOVERED";
   /** Conservative, bid-based liquidation P&L after modeled execution error. */
-  executablePnl?: number;
-  highWaterPnl?: number;
-  lowWaterPnl?: number;
+  executablePnl: number;
+  highWaterPnl: number;
+  lowWaterPnl: number;
   protectedFloorPnl?: number;
-  lastPnlTimestamp?: number;
-  lastHighTimestamp?: number;
-  previousExecutablePnl?: number;
-  pnlEwmaDriftPerSec?: number;
-  pnlEwmaVariancePerSec?: number;
-  reversalCusum?: number;
-  zeroCrossings?: number;
-  previousPnlSign?: -1 | 0 | 1;
+  lastPnlTimestamp: number;
+  lastHighTimestamp: number;
+  previousExecutablePnl: number;
+  pnlEwmaDriftPerSec: number;
+  pnlEwmaVariancePerSec: number;
+  reversalCusum: number;
+  zeroCrossings: number;
+  previousPnlSign: -1 | 0 | 1;
   protectionActivatedAt?: number;
-  pnlObservationCount?: number;
+  pnlObservationCount: number;
   estimatedRecoveryProbability?: number;
   recoveryProbabilityInvalidSince?: number;
   entryImpliedVolatility?: number;
@@ -299,11 +295,9 @@ export type ExitReason =
   | "FORCED_SESSION_EXIT"
   | "STALE_DATA"
   | "HARD_STOP"
-  | "PROFIT_TARGET"
-  | "TRAILING_STOP"
+  | "PROFIT_FLOOR_EXIT"
   | "MAX_HOLD"
   | "OPPOSITE_REGIME"
-  | "EARLY_SCRATCH"
   | "TREND_INVALIDATION"
   | "RECOVERY_TIMEOUT"
   | "RECOVERY_PROBABILITY_TOO_LOW"

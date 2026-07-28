@@ -216,7 +216,7 @@ export class OrderExecutor {
 
 /**
  * Call after every entry fill, including a partial one. It immediately creates
- * authoritative exposure, reprices stop/target from the actual average fill,
+ * authoritative exposure, reprices the hard stop from the actual average fill,
  * and prevents another entry while the remainder is working.
  */
 export function reconcileEntryExposure(

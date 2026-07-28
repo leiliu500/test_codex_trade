@@ -24,6 +24,14 @@ export interface BrokerOrder {
   averageFillPrice?: number;
 }
 
+export interface BrokerPosition {
+  symbol: string;
+  direction: PositionState["direction"];
+  quantity: number;
+  averageEntryPrice: number;
+  underlyingEntryPrice?: number;
+}
+
 export interface TradingRestClient {
   getAccount(): Promise<AccountState>;
   getMarketClock(): Promise<{ timestamp: number; isOpen: boolean }>;
@@ -35,7 +43,7 @@ export interface TradingRestClient {
   replaceOrder(orderId: string, limitPrice: number): Promise<BrokerOrder>;
   cancelOrder(orderId: string): Promise<void>;
   listOpenOrders(): Promise<BrokerOrder[]>;
-  listPositions(): Promise<PositionState[]>;
+  listPositions(): Promise<BrokerPosition[]>;
 }
 
 export interface AlpacaRestConfig {
@@ -234,7 +242,7 @@ export class AlpacaTradingRestClient implements TradingRestClient {
     return raw.map(mapOrder);
   }
 
-  async listPositions(): Promise<PositionState[]> {
+  async listPositions(): Promise<BrokerPosition[]> {
     const raw = await this.#request<Array<Record<string, unknown>>>(this.#config.tradingBaseUrl, "/v2/positions");
     return raw.map((item) => {
       const symbol = String(item.symbol);
@@ -243,8 +251,6 @@ export class AlpacaTradingRestClient implements TradingRestClient {
       const type = parseOccSymbol(symbol)!.type === "put" ? "BEARISH" : "BULLISH";
       return {
         symbol, direction: type, quantity: Math.abs(Number(item.qty)), averageEntryPrice: price,
-        entryTimestamp: 0, stopPrice: 0, targetPrice: Number.POSITIVE_INFINITY,
-        highWaterMark: price, lowWaterMark: price,
       };
     });
   }
@@ -285,7 +291,7 @@ export interface ReconciliationResult {
   matched: boolean;
   openOrders: BrokerOrder[];
   unknownOrders: BrokerOrder[];
-  brokerPositions: PositionState[];
+  brokerPositions: BrokerPosition[];
   reasons: string[];
 }
 

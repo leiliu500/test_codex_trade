@@ -23,12 +23,16 @@ test("configuration cannot enable later-dated or overnight option trading", () =
   invalidConfirmation.signals.followThroughMinSec = 16;
   invalidConfirmation.signals.followThroughMaxSec = 15;
   assert.throws(() => validateConfig(invalidConfirmation), /Follow-through confirmation/);
+  const invalidNoiseMultiplier = structuredClone(defaultConfig);
+  invalidNoiseMultiplier.signals.followThroughNoiseMultiplier = -0.01;
+  assert.throws(() => validateConfig(invalidNoiseMultiplier), /Follow-through confirmation/);
   const invalidScope = structuredClone(defaultConfig);
   invalidScope.signals.followThroughScope = "INVALID" as typeof invalidScope.signals.followThroughScope;
   assert.throws(() => validateConfig(invalidScope), /Follow-through scope/);
   const invalidMode = structuredClone(defaultConfig);
-  invalidMode.signals.entryQualityMode = "INVALID" as typeof invalidMode.signals.entryQualityMode;
-  assert.throws(() => validateConfig(invalidMode), /Entry-quality mode/);
+  invalidMode.signals.entryConfirmationMode =
+    "INVALID" as typeof invalidMode.signals.entryConfirmationMode;
+  assert.throws(() => validateConfig(invalidMode), /Entry-confirmation mode/);
   const invalidLateMode = structuredClone(defaultConfig);
   invalidLateMode.signals.lateEntryGuard.mode =
     "INVALID" as typeof invalidLateMode.signals.lateEntryGuard.mode;
@@ -63,9 +67,6 @@ test("configuration cannot enable later-dated or overnight option trading", () =
   invalidMorningSpread.signals.morningEntryGuard.maxOptionSpreadPct =
     defaultConfig.dataQuality.maxOptionSpreadPct + 0.01;
   assert.throws(() => validateConfig(invalidMorningSpread), /Morning-entry guard thresholds/);
-  const invalidShadowCap = structuredClone(defaultConfig);
-  invalidShadowCap.risk.entryQualityMaxTradesPerDay = 0;
-  assert.throws(() => validateConfig(invalidShadowCap), /Daily entry caps/);
   const multipleContracts = structuredClone(defaultConfig);
   multipleContracts.risk.maxContracts = 2;
   assert.throws(() => validateConfig(multipleContracts), /exactly one option contract/);
@@ -100,7 +101,7 @@ test("delta-adjusted cost implements spread/slippage/multiple mathematics", () =
   assert.ok(gammaAwareProjectedOptionMove(500, 10, 0.5, 0.02) > 0.25);
 });
 
-test("risk sizing honors every cap and resets stop/target from actual fill", () => {
+test("risk sizing honors every cap and resets the hard stop from actual fill", () => {
   const riskConfig = structuredClone(defaultConfig);
   riskConfig.risk.maxTradesPerDay = 3;
   const manager = new RiskManager(riskConfig);
@@ -114,7 +115,6 @@ test("risk sizing honors every cap and resets stop/target from actual fill", () 
   assert.equal(decision.quantity, 1);
   const filled = manager.createFilledPosition("SPY260722C00500000", "BULLISH", 1, 2.20, timestamp);
   assert.ok(Math.abs(filled.stopPrice - 1.65) < 1e-12);
-  assert.ok(Math.abs(filled.targetPrice - 2.97) < 1e-12);
   for (let i = 0; i < riskConfig.risk.maxTradesPerDay - 1; i += 1) manager.recordEntry(timestamp);
   assert.equal(manager.evaluate({ timestamp, optionMid: 2, hasOpenPosition: false, account: {
     equity: 100_000, optionBuyingPower: 10_000, active: true, optionsApproved: true, killSwitch: false,
@@ -125,24 +125,16 @@ test("risk sizing honors every cap and resets stop/target from actual fill", () 
   } }).allowed, false);
 });
 
-test("six restored fills block the shadow profile without blocking active paper risk", () => {
+test("the high daily safety limit permits another entry after six restored fills", () => {
   const timestamp = zonedDateTimeToEpoch("2026-07-22", "11:00:00");
   const restored = { marketDate: "2026-07-22", entries: 6, realizedPnl: 0 };
   const request = {
     timestamp, optionMid: 2, hasOpenPosition: false,
     account: { equity: 100_000, optionBuyingPower: 10_000, active: true, optionsApproved: true, killSwitch: false },
   };
-  const active = new RiskManager(defaultConfig);
-  active.restoreState(restored);
-  assert.equal(active.evaluate(request).allowed, true);
-
-  const enforcedConfig = structuredClone(defaultConfig);
-  enforcedConfig.signals.entryQualityMode = "ENFORCE";
-  const shadow = new RiskManager(enforcedConfig);
-  shadow.restoreState(restored);
-  const shadowDecision = shadow.evaluate(request);
-  assert.equal(shadowDecision.allowed, false);
-  assert.ok(shadowDecision.reasons.includes("MAX_DAILY_ENTRIES_REACHED"));
+  const manager = new RiskManager(defaultConfig);
+  manager.restoreState(restored);
+  assert.equal(manager.evaluate(request).allowed, true);
 });
 
 test("the high late-entry cap leaves six restored fills executable", () => {
@@ -187,21 +179,58 @@ const exitContext = (position: PositionState, timestamp: number, mid: number) =>
   timestamp, position, optionQuote: { symbol: position.symbol, timestamp, bidPrice: mid - 0.01, askPrice: mid + 0.01, bidSize: 10, askSize: 10 }, killSwitch: false,
 });
 
-test("exit manager enforces emergency and price precedence", () => {
+function unifiedPosition(entryTimestamp: number, overrides: Partial<PositionState> = {}): PositionState {
+  return {
+    symbol: "OPT",
+    direction: "BULLISH",
+    quantity: 1,
+    averageEntryPrice: 2,
+    entryTimestamp,
+    stopPrice: 1.5,
+    tradeState: "OPEN_UNPROTECTED",
+    executablePnl: 0,
+    highWaterPnl: 0,
+    lowWaterPnl: 0,
+    lastPnlTimestamp: entryTimestamp,
+    lastHighTimestamp: entryTimestamp,
+    previousExecutablePnl: 0,
+    pnlEwmaDriftPerSec: 0,
+    pnlEwmaVariancePerSec: 0,
+    reversalCusum: 0,
+    zeroCrossings: 0,
+    previousPnlSign: 0,
+    pnlObservationCount: 0,
+    ...overrides,
+  };
+}
+
+test("exit manager enforces emergency precedence and protects a strong winner", () => {
   const manager = new ExitManager(defaultConfig);
   const entry = zonedDateTimeToEpoch("2026-07-22", "11:00:00");
-  const position: PositionState = { symbol: "OPT", direction: "BULLISH", quantity: 1, averageEntryPrice: 2,
-    entryTimestamp: entry, stopPrice: 1.5, targetPrice: 2.7, highWaterMark: 2, lowWaterMark: 2 };
+  const position = unifiedPosition(entry);
   assert.equal(manager.evaluate({ ...exitContext(position, entry + 1000, 1.4), killSwitch: true }).reason, "KILL_SWITCH");
   const hardStop = manager.evaluate(exitContext(position, entry + 1000, 1.4));
   assert.equal(hardStop.reason, "HARD_STOP");
-  assert.equal(hardStop.updatedPosition.lowWaterMark, 1.4);
-  const profitTarget = manager.evaluate(exitContext(position, entry + 1000, 2.8));
-  assert.equal(profitTarget.reason, "PROFIT_TARGET");
-  assert.equal(profitTarget.updatedPosition.highWaterMark, 2.8);
-  const trailing = { ...position, highWaterMark: 2.5 };
-  assert.equal(manager.evaluate(exitContext(trailing, entry + 1000, 2.04)).reason, "TRAILING_STOP");
-  assert.equal(manager.evaluate(exitContext(position, entry + defaultConfig.risk.maxHoldSec * 1000, 2)).reason, "MAX_HOLD");
+  assert.ok(hardStop.updatedPosition.lowWaterPnl < 0);
+  const winner = manager.evaluate(exitContext(position, entry + 1000, 2.8));
+  assert.equal(winner.exit, false);
+  assert.equal(winner.updatedPosition.tradeState, "PROTECTED_WINNER");
+  assert.ok(winner.updatedPosition.highWaterPnl > 0);
+  assert.equal(
+    manager.evaluate(exitContext(position, entry + defaultConfig.risk.maxHoldSec * 1000, 2)).reason,
+    "RECOVERY_TIMEOUT",
+  );
+  const protectedPosition: PositionState = {
+    ...position,
+    tradeState: "PROTECTED_WINNER",
+    executablePnl: 20,
+    highWaterPnl: 20,
+    protectedFloorPnl: 7,
+  };
+  assert.equal(
+    manager.evaluate(exitContext(protectedPosition, entry + defaultConfig.risk.maxHoldSec * 1000, 2.2)).reason,
+    "MAX_HOLD",
+  );
   const forced = zonedDateTimeToEpoch("2026-07-22", "15:50:00");
   assert.equal(manager.evaluate(exitContext(position, forced, 2)).reason, "FORCED_SESSION_EXIT");
   assert.equal(manager.evaluate({ timestamp: entry + 11_000, position, killSwitch: false }).reason, "STALE_DATA");
@@ -210,8 +239,7 @@ test("exit manager enforces emergency and price precedence", () => {
 test("opposite regimes and 8-second trend invalidation exit", () => {
   const manager = new ExitManager(defaultConfig);
   const entry = zonedDateTimeToEpoch("2026-07-22", "11:00:00");
-  const position: PositionState = { symbol: "OPT", direction: "BULLISH", quantity: 1, averageEntryPrice: 2,
-    entryTimestamp: entry, stopPrice: 1.5, targetPrice: 2.7, highWaterMark: 2, lowWaterMark: 2 };
+  const position = unifiedPosition(entry);
   const down: RegimeDecision = { regime: "STRONG_DOWN", confidence: 1, reasons: [] };
   assert.equal(manager.evaluate({ ...exitContext(position, entry + 1000, 2), regime: down }).reason, "OPPOSITE_REGIME");
   const feature = { medium: { normalizedSlope: -1 }, price: 499, vwap: { sessionVwap: 500 } } as unknown as FeatureSnapshot;
@@ -221,34 +249,21 @@ test("opposite regimes and 8-second trend invalidation exit", () => {
   assert.equal(later.reason, "TREND_INVALIDATION");
 });
 
-test("early scratch exits only when an unproductive position and its underlying both reverse", () => {
-  const enforcedConfig = structuredClone(defaultConfig);
-  enforcedConfig.signals.entryQualityMode = "ENFORCE";
-  const manager = new ExitManager(enforcedConfig);
+test("unified exit manager waits for mature invalidation evidence on a brief reversal", () => {
+  const manager = new ExitManager(defaultConfig);
   const entry = zonedDateTimeToEpoch("2026-07-22", "11:00:00");
-  const position: PositionState = {
-    symbol: "OPT", direction: "BULLISH", quantity: 1, averageEntryPrice: 2,
-    entryTimestamp: entry, stopPrice: 1.5, targetPrice: 2.7,
-    highWaterMark: 2, lowWaterMark: 2, underlyingEntryPrice: 500,
-  };
+  const position = unifiedPosition(entry, { underlyingEntryPrice: 500 });
   const reversed = {
     price: 499.99,
     fast: { normalizedSlope: -0.5 },
     medium: { normalizedSlope: 0.5 },
     vwap: { sessionVwap: 499 },
   } as unknown as FeatureSnapshot;
-  assert.equal(new ExitManager(defaultConfig).evaluate({
+  const decision = manager.evaluate({
     ...exitContext(position, entry + 5_000, 2), feature: reversed,
-  }).exit, false);
-  assert.equal(manager.evaluate({ ...exitContext(position, entry + 4_000, 2), feature: reversed }).exit, false);
-  assert.equal(manager.evaluate({ ...exitContext(position, entry + 5_000, 2), feature: reversed }).reason, "EARLY_SCRATCH");
-
-  const hadFavorableMovement = { ...position, highWaterMark: 2.03 };
-  assert.equal(manager.evaluate({
-    ...exitContext(hadFavorableMovement, entry + 5_000, 2), feature: reversed,
-  }).exit, false);
-  const stillAligned = { ...reversed, fast: { normalizedSlope: 0.5 } } as unknown as FeatureSnapshot;
-  assert.equal(manager.evaluate({ ...exitContext(position, entry + 5_000, 2), feature: stillAligned }).exit, false);
+  });
+  assert.equal(decision.exit, false);
+  assert.equal(decision.reason, undefined);
 });
 
 test("unified trade state uses executable bid P&L and distinguishes recovered from direct winners", () => {
@@ -304,20 +319,20 @@ test("unified trade state uses executable bid P&L and distinguishes recovered fr
   assert.equal(recovered.tradeState, "PROTECTED_RECOVERED");
 });
 
-test("new positions treat the profit target as a moving objective and never lower a protected floor", () => {
+test("winner protection never lowers an established executable profit floor", () => {
   const timestamp = zonedDateTimeToEpoch("2026-07-22", "11:00:00");
   const risk = new RiskManager(defaultConfig);
   const manager = new ExitManager(defaultConfig);
   let position = risk.createFilledPosition(
     "SPY260722C00500000", "BULLISH", 1, 2, timestamp, 500,
   );
-  const aboveLegacyTarget = manager.evaluate(exitContext(position, timestamp + 1_000, 2.80));
-  assert.equal(aboveLegacyTarget.exit, false);
-  assert.equal(aboveLegacyTarget.updatedPosition.tradeState, "PROTECTED_WINNER");
-  const firstFloor = aboveLegacyTarget.updatedPosition.protectedFloorPnl!;
+  const firstWinner = manager.evaluate(exitContext(position, timestamp + 1_000, 2.80));
+  assert.equal(firstWinner.exit, false);
+  assert.equal(firstWinner.updatedPosition.tradeState, "PROTECTED_WINNER");
+  const firstFloor = firstWinner.updatedPosition.protectedFloorPnl!;
 
   const ordinaryPullback = manager.evaluate(
-    exitContext(aboveLegacyTarget.updatedPosition, timestamp + 2_000, 2.70),
+    exitContext(firstWinner.updatedPosition, timestamp + 2_000, 2.70),
   );
   assert.equal(ordinaryPullback.exit, false);
   assert.ok(ordinaryPullback.updatedPosition.protectedFloorPnl! >= firstFloor);

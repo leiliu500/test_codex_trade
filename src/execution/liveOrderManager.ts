@@ -3,7 +3,7 @@ import type {
   AccountState, ExitDecision, ExitReason, ExitTrigger, FeatureSnapshot, OptionCandidateEvaluation,
   OptionQuote, OptionSnapshot, PositionState, RegimeDecision, RiskDecision, TradeSignal,
 } from "../types.js";
-import type { BrokerOrder, TradingRestClient } from "../alpaca/restClient.js";
+import type { BrokerOrder, BrokerPosition, TradingRestClient } from "../alpaca/restClient.js";
 import { reconcileBrokerState } from "../alpaca/restClient.js";
 import { validateOptionQuote } from "../features/quoteSanitizer.js";
 import { sameDaySpyOptionContractReasons } from "../options/tradingInvariants.js";
@@ -129,9 +129,7 @@ export class LiveOrderManager {
   readonly #recorder: AuditRecorder;
   readonly #orders: OrderExecutor;
   readonly #risk: RiskManager;
-  readonly #shadowRisk: RiskManager;
   readonly #exits: ExitManager;
-  readonly #shadowExits: ExitManager;
   readonly #knownClientOrderIds: Set<string>;
   #position: PositionState | undefined;
   #pending: PendingBrokerExecution | undefined;
@@ -141,7 +139,6 @@ export class LiveOrderManager {
   readonly #lastOptionQuotes = new Map<string, OptionQuote>();
   #halted = false;
   #haltReason: string | undefined;
-  #shadowScratchAuditedEntryTimestamp: number | undefined;
   #tail: Promise<void> = Promise.resolve();
 
   constructor(options: LiveOrderManagerOptions) {
@@ -151,18 +148,13 @@ export class LiveOrderManager {
     this.#orders = new OrderExecutor(options.config);
     this.#risk = new RiskManager(options.config);
     this.#exits = new ExitManager(options.config);
-    const shadowConfig = structuredClone(options.config);
-    shadowConfig.signals.entryQualityMode = "ENFORCE";
-    this.#shadowRisk = new RiskManager(shadowConfig);
-    this.#shadowExits = new ExitManager(shadowConfig);
     if (options.restoredRiskState) {
       this.#risk.restoreState(options.restoredRiskState);
-      this.#shadowRisk.restoreState(options.restoredRiskState);
     }
     this.#position = options.restoredPosition
-      ? normalizeRestoredPosition(options.restoredPosition)
+      ? validatedUnifiedPosition(options.restoredPosition)
       : undefined;
-    if (this.#position) this.#lifecycle = this.#position.tradeState ?? "OPEN_UNPROTECTED";
+    if (this.#position) this.#lifecycle = this.#position.tradeState;
     this.#knownClientOrderIds = new Set(options.knownClientOrderIds ?? []);
   }
 
@@ -202,7 +194,7 @@ export class LiveOrderManager {
         if (reconciliation.openOrders.length > 0) reasons.push("OPEN_ORDERS_REQUIRE_RESTORED_LOCAL_STATE");
         await this.#halt(timestamp, `BROKER_RECONCILIATION_FAILED:${[...new Set(reasons)].join(",")}`);
       }
-      this.#lifecycle = this.#position?.tradeState ?? (this.#position ? "OPEN_UNPROTECTED" : "FLAT");
+      this.#lifecycle = this.#position ? this.#position.tradeState : "FLAT";
       return this.snapshot();
     });
   }
@@ -249,11 +241,9 @@ export class LiveOrderManager {
         hasOpenPosition: this.#position !== undefined,
       };
       const risk = this.#risk.evaluate(riskRequest);
-      const shadowRisk = this.#shadowRisk.evaluate(riskRequest);
       await this.#audit(clock.timestamp, "risk_decision", {
         signalId: request.signal.id,
         risk,
-        shadowRisk: { mode: "SHADOW", risk: shadowRisk },
       });
       if (!risk.allowed) return { submitted: false, reasons: risk.reasons, risk };
 
@@ -410,36 +400,16 @@ export class LiveOrderManager {
       ...(request.optionSnapshot ? { optionSnapshot: request.optionSnapshot } : {}),
     };
     const decision = this.#exits.evaluate(context);
-    const shadowDecision = this.#shadowExits.evaluate({ ...context, position: { ...position } });
-    if (shadowDecision.reason === "EARLY_SCRATCH" &&
-        this.#shadowScratchAuditedEntryTimestamp !== position.entryTimestamp) {
-      this.#shadowScratchAuditedEntryTimestamp = position.entryTimestamp;
-      await this.#audit(request.timestamp, "shadow_exit_decision", {
-        mode: "SHADOW",
-        reason: shadowDecision.reason,
-        symbol: position.symbol,
-        direction: position.direction,
-        entryTimestamp: position.entryTimestamp,
-        averageEntryPrice: position.averageEntryPrice,
-        underlyingEntryPrice: position.underlyingEntryPrice ?? null,
-        highWaterMark: shadowDecision.updatedPosition.highWaterMark,
-        markPrice: shadowDecision.markPrice ?? null,
-        liquidationPrice: shadowDecision.liquidationPrice ?? null,
-        featurePrice: request.feature?.price ?? null,
-        fastSlope: request.feature?.fast.normalizedSlope ?? null,
-        activeDecision: decision.reason ?? "HOLD",
-      });
-    }
     this.#position = decision.updatedPosition;
-    if (!this.#exitIntent) this.#lifecycle = decision.updatedPosition.tradeState ?? "OPEN_UNPROTECTED";
+    if (!this.#exitIntent) this.#lifecycle = decision.updatedPosition.tradeState;
     await this.#audit(request.timestamp, "order_management_state", {
       symbol: decision.updatedPosition.symbol,
       direction: decision.updatedPosition.direction,
       entryTimestamp: decision.updatedPosition.entryTimestamp,
       lifecycle: decision.exit
         ? "EXIT_PENDING"
-        : decision.updatedPosition.tradeState ?? "OPEN_UNPROTECTED",
-      tradeState: decision.updatedPosition.tradeState ?? "OPEN_UNPROTECTED",
+        : decision.updatedPosition.tradeState,
+      tradeState: decision.updatedPosition.tradeState,
       decision: decision.exit ? "EXIT" : "HOLD",
       reason: decision.reason ?? null,
       triggers: decision.triggers ?? [],
@@ -451,13 +421,13 @@ export class LiveOrderManager {
         decision.executablePnl !== undefined && decision.protectedFloorPnl !== undefined
           ? decision.executablePnl - decision.protectedFloorPnl
           : null,
-      highWaterPnl: decision.updatedPosition.highWaterPnl ?? null,
-      lowWaterPnl: decision.updatedPosition.lowWaterPnl ?? null,
+      highWaterPnl: decision.updatedPosition.highWaterPnl,
+      lowWaterPnl: decision.updatedPosition.lowWaterPnl,
       recoveryProbability: decision.recoveryProbability ?? null,
       continuationLcbDollars: decision.continuationLcbDollars ?? null,
-      reversalCusum: decision.updatedPosition.reversalCusum ?? null,
-      zeroCrossings: decision.updatedPosition.zeroCrossings ?? 0,
-      pnlObservationCount: decision.updatedPosition.pnlObservationCount ?? 0,
+      reversalCusum: decision.updatedPosition.reversalCusum,
+      zeroCrossings: decision.updatedPosition.zeroCrossings,
+      pnlObservationCount: decision.updatedPosition.pnlObservationCount,
       optionContinuation: decision.updatedPosition.optionContinuation ?? null,
     });
     return decision;
@@ -586,10 +556,8 @@ export class LiveOrderManager {
         }
         if (firstFill) {
           this.#risk.recordEntry(timestamp);
-          this.#shadowRisk.recordEntry(timestamp);
-          this.#shadowScratchAuditedEntryTimestamp = undefined;
         }
-        this.#lifecycle = this.#position?.tradeState ?? "OPEN_UNPROTECTED";
+        this.#lifecycle = this.#position?.tradeState ?? "FLAT";
         await this.#audit(timestamp, "entry_fill", {
           signalId: pending.signalId,
           incrementalQuantity, incrementalPrice, cumulativeQuantity: totalFilled, position: this.#position,
@@ -599,7 +567,6 @@ export class LiveOrderManager {
         const quantityBeforeFill = exitingPosition.quantity;
         const realizedPnl = 100 * incrementalQuantity * (incrementalPrice - exitingPosition.averageEntryPrice);
         this.#risk.recordRealizedPnl(timestamp, realizedPnl);
-        this.#shadowRisk.recordRealizedPnl(timestamp, realizedPnl);
         this.#position.quantity -= incrementalQuantity;
         if (this.#position.quantity > 0 && quantityBeforeFill > 0) {
           const remainingFraction = this.#position.quantity / quantityBeforeFill;
@@ -620,14 +587,13 @@ export class LiveOrderManager {
           exitTriggers: this.#exitIntent?.triggers ?? [],
           symbol: exitingPosition.symbol, direction: exitingPosition.direction,
           entryTimestamp: exitingPosition.entryTimestamp, averageEntryPrice: exitingPosition.averageEntryPrice,
-          highWaterMark: exitingPosition.highWaterMark, lowWaterMark: exitingPosition.lowWaterMark,
-          highWaterPnl: exitingPosition.highWaterPnl ?? null,
-          lowWaterPnl: exitingPosition.lowWaterPnl ?? null,
-          executablePnl: exitingPosition.executablePnl ?? null,
+          highWaterPnl: exitingPosition.highWaterPnl,
+          lowWaterPnl: exitingPosition.lowWaterPnl,
+          executablePnl: exitingPosition.executablePnl,
           protectedFloorPnl: exitingPosition.protectedFloorPnl ?? null,
           estimatedRecoveryProbability: exitingPosition.estimatedRecoveryProbability ?? null,
           optionContinuation: exitingPosition.optionContinuation ?? null,
-          tradeState: exitingPosition.tradeState ?? null,
+          tradeState: exitingPosition.tradeState,
           remainingQuantity: this.#position.quantity,
         });
         if (this.#position.quantity === 0) {
@@ -635,7 +601,6 @@ export class LiveOrderManager {
           this.#exitIntent = undefined;
           this.#lifecycle = "CLOSED";
           this.#safeMode = false;
-          this.#shadowScratchAuditedEntryTimestamp = undefined;
         }
       }
     }
@@ -735,7 +700,7 @@ export class LiveOrderManager {
   }
 
   async #reconcilePositionTruth(timestamp: number, cause: string): Promise<void> {
-    let brokerPositions: PositionState[];
+    let brokerPositions: BrokerPosition[];
     try {
       brokerPositions = await this.#client.listPositions();
     } catch (error) {
@@ -811,8 +776,6 @@ export class LiveOrderManager {
           this.#config.execution.optionTickSize,
           brokerPosition.averageEntryPrice * (1 - this.#config.risk.hardOptionStopPct),
         ),
-        targetPrice:
-          brokerPosition.averageEntryPrice * (1 + this.#config.risk.optionProfitTargetPct),
       };
       this.#safeMode = true;
       if (this.#exitIntent) {
@@ -837,7 +800,7 @@ export class LiveOrderManager {
   #createExitIntent(timestamp: number, decision: ExitDecision): void {
     if (!this.#position || !decision.exit || !decision.reason) return;
     const triggers = decision.triggers ?? [];
-    const urgency = exitUrgency(triggers, decision.reason);
+    const urgency = exitUrgency(triggers);
     if (this.#exitIntent) {
       for (const trigger of triggers) {
         if (!this.#exitIntent.triggers.includes(trigger)) this.#exitIntent.triggers.push(trigger);
@@ -971,32 +934,27 @@ function maximumEntryPremium(
   return quote.askPrice;
 }
 
-function normalizeRestoredPosition(position: PositionState): PositionState {
-  return {
-    ...position,
-    tradeState: position.tradeState ?? "OPEN_UNPROTECTED",
-    executablePnl: position.executablePnl ?? 0,
-    highWaterPnl: position.highWaterPnl ?? 0,
-    lowWaterPnl: position.lowWaterPnl ?? 0,
-    lastPnlTimestamp: position.lastPnlTimestamp ?? position.entryTimestamp,
-    lastHighTimestamp: position.lastHighTimestamp ?? position.entryTimestamp,
-    previousExecutablePnl: position.previousExecutablePnl ?? position.executablePnl ?? 0,
-    pnlEwmaDriftPerSec: position.pnlEwmaDriftPerSec ?? 0,
-    pnlEwmaVariancePerSec: position.pnlEwmaVariancePerSec ?? 0,
-    reversalCusum: position.reversalCusum ?? 0,
-    zeroCrossings: position.zeroCrossings ?? 0,
-    previousPnlSign: position.previousPnlSign ?? 0,
-    pnlObservationCount: position.pnlObservationCount ?? 0,
-    ...(position.underlyingEntryPrice !== undefined
-      ? {
-          lastUnderlyingPrice: position.lastUnderlyingPrice ?? position.underlyingEntryPrice,
-          lastUnderlyingTimestamp: position.lastUnderlyingTimestamp ?? position.entryTimestamp,
-        }
-      : {}),
-  };
+function validatedUnifiedPosition(position: PositionState): PositionState {
+  if (!["OPEN_UNPROTECTED", "PROTECTED_WINNER", "PROTECTED_RECOVERED"].includes(position.tradeState) ||
+      ![
+        position.executablePnl,
+        position.highWaterPnl,
+        position.lowWaterPnl,
+        position.lastPnlTimestamp,
+        position.lastHighTimestamp,
+        position.previousExecutablePnl,
+        position.pnlEwmaDriftPerSec,
+        position.pnlEwmaVariancePerSec,
+        position.reversalCusum,
+        position.zeroCrossings,
+        position.pnlObservationCount,
+      ].every(Number.isFinite)) {
+    throw new Error("Restored position does not contain a complete unified order-management state");
+  }
+  return { ...position };
 }
 
-function exitUrgency(triggers: readonly ExitTrigger[], reason: ExitReason): number {
+function exitUrgency(triggers: readonly ExitTrigger[]): number {
   if (triggers.some((trigger) =>
     trigger === "BROKER_OR_POSITION_RISK" ||
     trigger === "FORCED_TIME_EXIT" ||
@@ -1007,7 +965,7 @@ function exitUrgency(triggers: readonly ExitTrigger[], reason: ExitReason): numb
     trigger === "REVERSAL_CUSUM")) return 0.85;
   if (triggers.some((trigger) => trigger === "STRUCTURAL_INVALIDATION")) return 0.75;
   if (triggers.length > 0) return 0.65;
-  return reason === "PROFIT_TARGET" ? 0.35 : 0.75;
+  return 0.75;
 }
 
 function isOppositeDirectionRegime(

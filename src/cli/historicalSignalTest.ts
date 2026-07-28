@@ -118,17 +118,19 @@ async function main(): Promise<void> {
     votesPassed: signal.votes.filter((vote) => vote.passed).map((vote) => vote.name),
     price: signal.featureSnapshot.price,
   }));
-  const baselineSignals = signals;
+  const immediateEntryConfig = structuredClone(defaultConfig);
+  immediateEntryConfig.signals.entryConfirmationMode = "SHADOW";
+  const baselineSignals = evaluateSignals(bars, priorClose, immediateEntryConfig);
   const bullishImpulseConfirmationConfig = structuredClone(defaultConfig);
-  bullishImpulseConfirmationConfig.signals.entryQualityMode = "ENFORCE";
+  bullishImpulseConfirmationConfig.signals.entryConfirmationMode = "ENFORCE";
   bullishImpulseConfirmationConfig.signals.followThroughScope = "BULLISH_IMPULSE";
   const bullishImpulseConfirmationSignals = evaluateSignals(bars, priorClose, bullishImpulseConfirmationConfig);
   const impulseConfirmationConfig = structuredClone(defaultConfig);
-  impulseConfirmationConfig.signals.entryQualityMode = "ENFORCE";
+  impulseConfirmationConfig.signals.entryConfirmationMode = "ENFORCE";
   impulseConfirmationConfig.signals.followThroughScope = "IMPULSE";
   const impulseConfirmationSignals = evaluateSignals(bars, priorClose, impulseConfirmationConfig);
   const allEntryConfirmationConfig = structuredClone(defaultConfig);
-  allEntryConfirmationConfig.signals.entryQualityMode = "ENFORCE";
+  allEntryConfirmationConfig.signals.entryConfirmationMode = "ENFORCE";
   allEntryConfirmationConfig.signals.followThroughScope = "ALL";
   const allEntryConfirmationSignals = evaluateSignals(bars, priorClose, allEntryConfirmationConfig);
   const baselineSummary = summarizeSignals(baselineSignals, bars);

@@ -1,7 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { defaultConfig } from "../src/config.js";
-import type { BrokerOrder, BrokerOrderRequest, TradingRestClient } from "../src/alpaca/restClient.js";
+import type {
+  BrokerOrder, BrokerOrderRequest, BrokerPosition, TradingRestClient,
+} from "../src/alpaca/restClient.js";
 import type {
   AccountState, FeatureSnapshot, OptionCandidateEvaluation, OptionContract, OptionQuote, OptionSnapshot,
   PositionState, TradeSignal,
@@ -73,7 +75,7 @@ class FakeTradingClient implements TradingRestClient {
   async listOpenOrders(): Promise<BrokerOrder[]> {
     return [...this.orders.values()].filter((order) => ["new", "partially_filled"].includes(order.status)).map((order) => ({ ...order }));
   }
-  async listPositions(): Promise<PositionState[]> {
+  async listPositions(): Promise<BrokerPosition[]> {
     let quantity = 0;
     let buyQuantity = 0;
     let buyNotional = 0;
@@ -95,11 +97,6 @@ class FakeTradingClient implements TradingRestClient {
       direction: "BULLISH",
       quantity,
       averageEntryPrice,
-      entryTimestamp: start,
-      stopPrice: averageEntryPrice * (1 - defaultConfig.risk.hardOptionStopPct),
-      targetPrice: averageEntryPrice * (1 + defaultConfig.risk.optionProfitTargetPct),
-      highWaterMark: averageEntryPrice,
-      lowWaterMark: averageEntryPrice,
     }];
   }
 
@@ -207,12 +204,12 @@ test("trailing protection locks a configured profit floor after activation", asy
   assert.equal(state.position?.averageEntryPrice, 2);
 
   state = await manager.tick({ timestamp: start + 500, optionQuote: optionQuote(start + 500, 2.39, 2.41) });
-  assert.ok(Math.abs(state.position!.highWaterMark - 2.4) < 1e-12);
+  assert.ok(state.position!.highWaterPnl > 0);
   assert.equal(state.pending, undefined);
 
   state = await manager.tick({ timestamp: start + 600, optionQuote: optionQuote(start + 600, 2.02, 2.04) });
   assert.equal(state.pending?.purpose, "EXIT");
-  assert.equal(state.pending?.exitReason, "TRAILING_STOP");
+  assert.equal(state.pending?.exitReason, "PROFIT_FLOOR_EXIT");
   assert.equal(state.pending?.order.marketable, true);
 });
 
@@ -265,7 +262,7 @@ test("ambiguous submission is recovered by deterministic client order ID without
   assert.ok(recorder.events.some((event) => event.type === "broker_submission_recovered"));
 });
 
-test("restored six-fill cap is shadow-audited without blocking a paper entry", async () => {
+test("restored fill count remains below the high daily safety limit", async () => {
   const client = new FakeTradingClient();
   const recorder = new MemoryRecorder();
   const manager = new LiveOrderManager({
@@ -281,11 +278,7 @@ test("restored six-fill cap is shadow-audited without blocking a paper entry", a
   assert.equal(submitted.submitted, true);
   const riskEvent = recorder.events.find((event) => event.type === "risk_decision");
   const activeRisk = riskEvent?.data.risk as Record<string, unknown>;
-  const shadowAudit = riskEvent?.data.shadowRisk as Record<string, unknown>;
-  const shadowRisk = shadowAudit.risk as Record<string, unknown>;
   assert.equal(activeRisk.allowed, true);
-  assert.equal(shadowRisk.allowed, false);
-  assert.ok((shadowRisk.reasons as string[]).includes("MAX_DAILY_ENTRIES_REACHED"));
 });
 
 test("the high late-entry cap leaves a seventh paper entry executable at the broker boundary", async () => {
@@ -315,7 +308,7 @@ test("the high late-entry cap leaves a seventh paper entry executable at the bro
   assert.equal(risk.allowed, true);
 });
 
-test("early scratch is audited in shadow mode without closing the paper position", async () => {
+test("live order manager uses only unified exit evidence for a brief underlying reversal", async () => {
   const client = new FakeTradingClient();
   const recorder = new MemoryRecorder();
   const manager = new LiveOrderManager({ config: defaultConfig, client, recorder });
@@ -337,9 +330,24 @@ test("early scratch is audited in shadow mode without closing the paper position
   });
   assert.equal(state.pending, undefined);
   assert.equal(state.position?.symbol, symbol);
-  const shadowExit = recorder.events.find((event) => event.type === "shadow_exit_decision");
-  assert.equal(shadowExit?.data.reason, "EARLY_SCRATCH");
-  assert.equal(shadowExit?.data.activeDecision, "HOLD");
+  assert.ok(recorder.events.some((event) =>
+    event.type === "order_management_state" && event.data.decision === "HOLD"));
+});
+
+test("incomplete restored management state is rejected instead of synthesized", () => {
+  const client = new FakeTradingClient();
+  const incomplete = {
+    symbol,
+    direction: "BULLISH",
+    quantity: 1,
+    averageEntryPrice: 2,
+    entryTimestamp: start,
+    stopPrice: 1.5,
+  } as PositionState;
+  assert.throws(
+    () => new LiveOrderManager({ config: defaultConfig, client, restoredPosition: incomplete }),
+    /complete unified order-management state/,
+  );
 });
 
 test("startup halts when an open broker order has no restored local lifecycle state", async () => {

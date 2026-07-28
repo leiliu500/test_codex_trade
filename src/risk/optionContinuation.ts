@@ -92,7 +92,7 @@ export function estimateOptionContinuation(
     Math.max(0, quote.askPrice - quote.bidPrice) *
     config.risk.continuationSpreadCostFraction;
   const uncertaintyDollars = config.risk.continuationConfidenceZ *
-    Math.sqrt(Math.max(0, position.pnlEwmaVariancePerSec ?? 0) * horizonSec);
+    Math.sqrt(Math.max(0, position.pnlEwmaVariancePerSec) * horizonSec);
   const expectedChangeDollars =
     deltaDollars + gammaDollars + vegaDollars + thetaDollars;
   const lcbDollars = expectedChangeDollars - holdingCostDollars - uncertaintyDollars;

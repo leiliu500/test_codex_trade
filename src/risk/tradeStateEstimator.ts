@@ -39,38 +39,33 @@ export class TradeStateEstimator {
     const multiplier = 100 * position.quantity;
     const executablePnl = multiplier * (liquidationPrice - position.averageEntryPrice);
     const midpointPnl = multiplier * (markPrice - position.averageEntryPrice);
-    const previousPnl = position.executablePnl ?? 0;
-    const previousTimestamp = position.lastPnlTimestamp ?? position.entryTimestamp;
+    const previousPnl = position.executablePnl;
+    const previousTimestamp = position.lastPnlTimestamp;
     const elapsedSec = Math.max(0, (timestamp - previousTimestamp) / 1000);
 
-    // Preserve premium high/low fields for existing operational consumers, but
-    // never use them as an executable decision input.
-    position.highWaterMark = Math.max(position.highWaterMark, markPrice);
-    position.lowWaterMark = Math.min(position.lowWaterMark, markPrice);
     position.previousExecutablePnl = previousPnl;
     position.executablePnl = executablePnl;
-    position.highWaterPnl = Math.max(position.highWaterPnl ?? 0, executablePnl);
-    position.lowWaterPnl = Math.min(position.lowWaterPnl ?? 0, executablePnl);
+    position.highWaterPnl = Math.max(position.highWaterPnl, executablePnl);
+    position.lowWaterPnl = Math.min(position.lowWaterPnl, executablePnl);
 
-    if (executablePnl >= (original.highWaterPnl ?? 0)) position.lastHighTimestamp = timestamp;
-    position.lastHighTimestamp ??= position.entryTimestamp;
+    if (executablePnl >= original.highWaterPnl) position.lastHighTimestamp = timestamp;
 
     if (elapsedSec > 0) {
       const lambda = 1 - Math.exp(-Math.LN2 * elapsedSec / this.#config.risk.pnlEwmaHalfLifeSec);
-      const previousDrift = position.pnlEwmaDriftPerSec ?? 0;
+      const previousDrift = position.pnlEwmaDriftPerSec;
       const observedDrift = (executablePnl - previousPnl) / elapsedSec;
       const residual = executablePnl - previousPnl - previousDrift * elapsedSec;
       const observedVariancePerSec = residual * residual / elapsedSec;
       position.pnlEwmaDriftPerSec = (1 - lambda) * previousDrift + lambda * observedDrift;
       position.pnlEwmaVariancePerSec =
-        (1 - lambda) * (position.pnlEwmaVariancePerSec ?? 0) + lambda * observedVariancePerSec;
-      position.pnlObservationCount = (position.pnlObservationCount ?? 0) + 1;
+        (1 - lambda) * position.pnlEwmaVariancePerSec + lambda * observedVariancePerSec;
+      position.pnlObservationCount += 1;
     }
 
     const pnlSign = sign(executablePnl);
     const previousSign = position.previousPnlSign ?? 0;
     if (previousSign !== 0 && pnlSign !== 0 && previousSign !== pnlSign) {
-      position.zeroCrossings = (position.zeroCrossings ?? 0) + 1;
+      position.zeroCrossings += 1;
     }
     position.previousPnlSign = pnlSign;
 
@@ -79,14 +74,14 @@ export class TradeStateEstimator {
       const signedSlope = directionSign * feature.fast.normalizedSlope;
       position.reversalCusum = Math.max(
         0,
-        (position.reversalCusum ?? 0) - signedSlope - this.#config.risk.reversalCusumReference,
+        position.reversalCusum - signedSlope - this.#config.risk.reversalCusumReference,
       );
     }
 
     const tradeState = position.tradeState;
     if (tradeState === "OPEN_UNPROTECTED") {
       const meaningfulAdversePath =
-        (position.lowWaterPnl ?? 0) <= -this.#config.risk.meaningfulAdverseExcursionDollars;
+        position.lowWaterPnl <= -this.#config.risk.meaningfulAdverseExcursionDollars;
       if (!meaningfulAdversePath &&
           executablePnl >= this.#config.risk.directWinnerActivationDollars) {
         position.tradeState = "PROTECTED_WINNER";
@@ -100,14 +95,14 @@ export class TradeStateEstimator {
 
     const horizonSec = this.#config.signals.projectionHorizonSec;
     const noiseAllowanceDollars = this.#config.risk.pnlNoiseMultiplier *
-      Math.sqrt(Math.max(0, position.pnlEwmaVariancePerSec ?? 0) * horizonSec);
+      Math.sqrt(Math.max(0, position.pnlEwmaVariancePerSec) * horizonSec);
     const microstructureAllowanceDollars = multiplier *
       (spread * (1 + this.#config.execution.adverseFillSpreadFraction) +
         this.#config.execution.optionTickSize);
 
     if (position.tradeState === "PROTECTED_WINNER" ||
         position.tradeState === "PROTECTED_RECOVERED") {
-      const peak = Math.max(0, position.highWaterPnl ?? executablePnl);
+      const peak = Math.max(0, position.highWaterPnl);
       const peakProgress = 1 - Math.exp(
         -peak / this.#config.risk.profitRetentionPeakScaleDollars,
       );

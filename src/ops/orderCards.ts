@@ -1,3 +1,5 @@
+import { defaultConfig } from "../config.js";
+
 export type DashboardOrderCardStage =
   | "ENTRY_WORKING"
   | "PARTIAL_ENTRY"
@@ -91,7 +93,6 @@ export interface DashboardOrderCard extends DashboardOrderManagement {
   unrealizedReturnPct?: number;
   totalPnl?: number;
   stopPrice?: number;
-  targetPrice?: number;
   entryTimestamp?: number;
   exitTimestamp?: number;
   elapsedMs?: number;
@@ -144,47 +145,55 @@ export function classifyOrderCardEntryQuality(card: DashboardOrderCard): {
   const bestObservedPnl = Math.max(...observedPnl);
   const finalPnl = card.totalPnl ?? card.realizedPnl;
   const epsilon = 0.005;
+  const meaningfulProfit = defaultConfig.risk.directWinnerActivationDollars;
+  const protectedEntry = card.tradeState === "PROTECTED_WINNER" ||
+    card.tradeState === "PROTECTED_RECOVERED";
+  const meaningfulProfitReached = protectedEntry ||
+    bestObservedPnl >= meaningfulProfit - epsilon;
   if (card.active) {
-    if (bestObservedPnl > epsilon) {
+    if (meaningfulProfitReached) {
       return {
         entryQuality: "GOOD",
-        entryQualityReason: `Recovered the opening spread and reached ${formatSignedPnl(bestObservedPnl)}.`,
+        entryQualityReason:
+          `Reached meaningful entry protection with best observed P&L ${formatSignedPnl(bestObservedPnl)}.`,
         bestObservedPnl,
       };
     }
     return {
       entryQuality: "EVALUATING",
-      entryQualityReason: `Position is active; best observed P&L is ${formatSignedPnl(bestObservedPnl)}.`,
+      entryQualityReason:
+        `Position is active; best observed P&L is ${formatSignedPnl(bestObservedPnl)} and entry protection requires ${formatSignedPnl(meaningfulProfit)}.`,
       bestObservedPnl,
     };
   }
-  if (bestObservedPnl > epsilon) {
+  if (meaningfulProfitReached) {
     if (finalPnl > epsilon) {
       return {
         entryQuality: "GOOD",
         entryQualityReason:
-          `Recovered the spread, reached ${formatSignedPnl(bestObservedPnl)}, and closed ${formatSignedPnl(finalPnl)}.`,
+          `Reached meaningful entry protection at ${formatSignedPnl(bestObservedPnl)} and closed ${formatSignedPnl(finalPnl)}.`,
         bestObservedPnl,
       };
     }
     return {
       entryQuality: "GOOD_ENTRY_POOR_EXIT",
       entryQualityReason:
-        `Recovered the spread and reached ${formatSignedPnl(bestObservedPnl)}, but closed ${formatSignedPnl(finalPnl)}.`,
+        `Reached meaningful entry protection at ${formatSignedPnl(bestObservedPnl)}, but closed ${formatSignedPnl(finalPnl)}.`,
       bestObservedPnl,
     };
   }
   if (bestObservedPnl >= -epsilon) {
     return {
       entryQuality: "MARGINAL",
-      entryQualityReason: `Recovered only to breakeven and closed ${formatSignedPnl(finalPnl)}.`,
+      entryQualityReason:
+        `Reached only ${formatSignedPnl(bestObservedPnl)}, below the ${formatSignedPnl(meaningfulProfit)} entry-quality threshold, and closed ${formatSignedPnl(finalPnl)}.`,
       bestObservedPnl,
     };
   }
   return {
     entryQuality: "POOR",
     entryQualityReason:
-      `Never recovered the opening spread; best observed P&L was ${formatSignedPnl(bestObservedPnl)}.`,
+      `Never recovered the opening spread; best observed P&L was ${formatSignedPnl(bestObservedPnl)} and never approached ${formatSignedPnl(meaningfulProfit)} protection.`,
     bestObservedPnl,
   };
 }

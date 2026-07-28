@@ -2,7 +2,7 @@ import defaultConfigJson from "../config/default.json" with { type: "json" };
 import { parseClock } from "./utils/time.js";
 
 export type FollowThroughScope = "BULLISH_IMPULSE" | "IMPULSE" | "ALL";
-export type EntryQualityMode = "SHADOW" | "ENFORCE";
+export type EntryConfirmationMode = "SHADOW" | "ENFORCE";
 export type LateEntryGuardMode = "DISABLED" | "ENFORCE";
 export type MorningEntryGuardMode = "DISABLED" | "ENFORCE";
 
@@ -40,7 +40,7 @@ export interface EngineConfig {
     noiseFloorBps: number;
   };
   signals: {
-    entryQualityMode: EntryQualityMode;
+    entryConfirmationMode: EntryConfirmationMode;
     minEfficiency60: number;
     minR2Medium: number;
     impulseFastSlopeScore: number;
@@ -64,6 +64,7 @@ export interface EngineConfig {
     followThroughMinSec: number;
     followThroughMaxSec: number;
     followThroughMinimumBps: number;
+    followThroughNoiseMultiplier: number;
     followThroughScope: FollowThroughScope;
     shadowFollowThroughScope: FollowThroughScope | "DISABLED";
     morningEntryGuard: {
@@ -147,19 +148,10 @@ export interface EngineConfig {
     maxPremiumDollarsPerTrade: number;
     maxContracts: number;
     maxTradesPerDay: number;
-    entryQualityMaxTradesPerDay: number;
     maxDailyLossDollars: number;
     hardOptionStopPct: number;
-    optionProfitTargetPct: number;
-    trailingDrawdownPct: number;
-    trailingActivationPct: number;
-    trailingProfitFloorPct: number;
     maxHoldSec: number;
     trendInvalidationGraceSec: number;
-    earlyScratchMinAgeSec: number;
-    earlyScratchMaxAgeSec: number;
-    earlyScratchMinimumFavorablePct: number;
-    earlyScratchUnderlyingReversalBps: number;
     staleDataEmergencySec: number;
     onePositionAtATime: boolean;
     minimumProfitFloorDollars: number;
@@ -219,7 +211,6 @@ export function validateConfig(config: EngineConfig): void {
     config.execution.exitLimitSpreadFraction,
     config.execution.adverseFillSpreadFraction,
     config.execution.exitPriceCollarPct,
-    config.risk.trailingProfitFloorPct,
     config.risk.profitRetentionBase,
     config.risk.profitRetentionMax,
     config.risk.recoveredRetentionBonus,
@@ -238,9 +229,6 @@ export function validateConfig(config: EngineConfig): void {
   }
   if (config.options.expirationDaysMin !== 0 || config.options.expirationDaysMax !== 0) {
     throw new Error("This engine is hard-limited to SPY options expiring on the current market date (0DTE)");
-  }
-  if (config.risk.trailingProfitFloorPct >= config.risk.trailingActivationPct) {
-    throw new Error("Trailing profit floor must be below trailing activation");
   }
   const entryStart = parseClock(config.session.entryStart);
   const lateBullishImpulseStart = parseClock(config.signals.lateBullishImpulseStart);
@@ -279,16 +267,19 @@ export function validateConfig(config: EngineConfig): void {
   }
   if (!(config.signals.followThroughMinSec >= 0 &&
         config.signals.followThroughMaxSec >= config.signals.followThroughMinSec &&
-        config.signals.followThroughMinimumBps >= 0)) {
-    throw new Error("Follow-through confirmation requires 0 <= minSec <= maxSec and non-negative bps");
+        config.signals.followThroughMinimumBps >= 0 &&
+        config.signals.followThroughNoiseMultiplier >= 0)) {
+    throw new Error(
+      "Follow-through confirmation requires 0 <= minSec <= maxSec and non-negative bps/noise multiplier",
+    );
   }
   const scopes = new Set<FollowThroughScope>(["BULLISH_IMPULSE", "IMPULSE", "ALL"]);
   if (!scopes.has(config.signals.followThroughScope) ||
       (config.signals.shadowFollowThroughScope !== "DISABLED" && !scopes.has(config.signals.shadowFollowThroughScope))) {
     throw new Error("Follow-through scope must be BULLISH_IMPULSE, IMPULSE, ALL, or DISABLED for shadow evaluation");
   }
-  if (!new Set<EntryQualityMode>(["SHADOW", "ENFORCE"]).has(config.signals.entryQualityMode)) {
-    throw new Error("Entry-quality mode must be SHADOW or ENFORCE");
+  if (!new Set<EntryConfirmationMode>(["SHADOW", "ENFORCE"]).has(config.signals.entryConfirmationMode)) {
+    throw new Error("Entry-confirmation mode must be SHADOW or ENFORCE");
   }
   if (!new Set<LateEntryGuardMode>(["DISABLED", "ENFORCE"]).has(config.signals.lateEntryGuard.mode)) {
     throw new Error("Late-entry guard mode must be DISABLED or ENFORCE");
@@ -319,18 +310,11 @@ export function validateConfig(config: EngineConfig): void {
         config.signals.lateEntryGuard.bearishStrongDownImpulse.followThroughMinimumBps >= 0)) {
     throw new Error("Late-entry guard thresholds or follow-through window are invalid");
   }
-  if (!(Number.isInteger(config.risk.maxTradesPerDay) && config.risk.maxTradesPerDay > 0 &&
-        Number.isInteger(config.risk.entryQualityMaxTradesPerDay) && config.risk.entryQualityMaxTradesPerDay > 0)) {
-    throw new Error("Daily entry caps must be positive integers");
+  if (!(Number.isInteger(config.risk.maxTradesPerDay) && config.risk.maxTradesPerDay > 0)) {
+    throw new Error("The daily safety entry limit must be a positive integer");
   }
   if (config.risk.maxContracts !== 1) {
     throw new Error("Entry order sizing is hard-limited to exactly one option contract");
-  }
-  if (!(config.risk.earlyScratchMinAgeSec >= 0 &&
-        config.risk.earlyScratchMaxAgeSec >= config.risk.earlyScratchMinAgeSec &&
-        config.risk.earlyScratchMinimumFavorablePct >= 0 &&
-        config.risk.earlyScratchUnderlyingReversalBps >= 0)) {
-    throw new Error("Early scratch thresholds must be non-negative and use minAgeSec <= maxAgeSec");
   }
   if (!(config.execution.entrySignalTtlMs > 0 &&
         config.execution.exitTtlMinMs > 0 &&

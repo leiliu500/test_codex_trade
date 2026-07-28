@@ -157,7 +157,7 @@ test("dashboard clears order cards at 10 PM Pacific and does not restore prior-d
     totalPnl: 25,
     entryTimestamp: beforeRollover - 60_000,
     exitTimestamp: beforeRollover - 1_000,
-    exitReason: "PROFIT_TARGET",
+    exitReason: "PROFIT_FLOOR_EXIT",
     updates: [{
       timestamp: beforeRollover - 1_000,
       stage: "CLOSED",
@@ -189,8 +189,8 @@ test("dashboard persists a completed card with all captured P&L updates", async 
   await dashboard.record(event("entry_fill", {
     position: {
       symbol, direction: "BULLISH", quantity: 1, averageEntryPrice: 2,
-      entryTimestamp: timestamp, stopPrice: 1.5, targetPrice: 2.7,
-      highWaterMark: 2, lowWaterMark: 2,
+      entryTimestamp: timestamp, stopPrice: 1.5,
+      tradeState: "OPEN_UNPROTECTED", executablePnl: 0, highWaterPnl: 0, lowWaterPnl: 0,
     },
   }));
   dashboard.recordMarketEvent({
@@ -204,7 +204,7 @@ test("dashboard persists a completed card with all captured P&L updates", async 
     data: { timestamp: timestamp + 200, bidPrice: 2.2, askPrice: 2.22 },
   });
   await dashboard.record(event("exit_fill", {
-    reason: "PROFIT_TARGET", symbol, direction: "BULLISH", entryTimestamp: timestamp,
+    reason: "PROFIT_FLOOR_EXIT", symbol, direction: "BULLISH", entryTimestamp: timestamp,
     averageEntryPrice: 2, incrementalQuantity: 1, incrementalPrice: 2.25,
     realizedPnl: 25, remainingQuantity: 0,
   }, 300));
@@ -230,8 +230,7 @@ test("order cards expose and persist unified order-management state changes", as
   await dashboard.record(event("entry_fill", {
     position: {
       symbol, direction: "BULLISH", quantity: 1, averageEntryPrice: 2,
-      entryTimestamp: timestamp, stopPrice: 1.5, targetPrice: 2.7,
-      highWaterMark: 2, lowWaterMark: 2, tradeState: "OPEN_UNPROTECTED",
+      entryTimestamp: timestamp, stopPrice: 1.5, tradeState: "OPEN_UNPROTECTED",
       executablePnl: -3, highWaterPnl: 0, lowWaterPnl: -3,
     },
   }));
@@ -423,7 +422,8 @@ test("order cards classify entry quality from the best observed and final P&L", 
     }).entryQuality;
 
   assert.equal(classified([-7, 20, 12], 12), "GOOD");
-  assert.equal(classified([-6, 12, -6], -6), "GOOD_ENTRY_POOR_EXIT");
+  assert.equal(classified([-6, 16, -6], -6), "GOOD_ENTRY_POOR_EXIT");
+  assert.equal(classified([-6, 12, -6], -6), "MARGINAL");
   assert.equal(classified([-7, 0, -21], -21), "MARGINAL");
   assert.equal(classified([-9, -7, -28], -28), "POOR");
   assert.equal(classified([-7], -7, true), "EVALUATING");
@@ -435,7 +435,8 @@ test("completed cards keep the exit order from their own trade window when symbo
   dashboard.record(event("entry_fill", {
     position: {
       symbol, direction: "BULLISH", quantity: 1, averageEntryPrice: 2,
-      entryTimestamp: timestamp, highWaterMark: 2, lowWaterMark: 2,
+      entryTimestamp: timestamp, tradeState: "OPEN_UNPROTECTED",
+      executablePnl: 0, highWaterPnl: 0, lowWaterPnl: 0,
     },
   }));
   dashboard.record(event("broker_order_request", {
@@ -466,11 +467,12 @@ test("completed cards keep the exit order from their own trade window when symbo
   dashboard.record(event("entry_fill", {
     position: {
       symbol, direction: "BULLISH", quantity: 1, averageEntryPrice: 2.1,
-      entryTimestamp: timestamp + 1_000, highWaterMark: 2.1, lowWaterMark: 2.1,
+      entryTimestamp: timestamp + 1_000, tradeState: "OPEN_UNPROTECTED",
+      executablePnl: 0, highWaterPnl: 0, lowWaterPnl: 0,
     },
   }, 1_000));
   dashboard.record(event("broker_order_request", {
-    purpose: "EXIT", reason: "PROFIT_TARGET",
+    purpose: "EXIT", reason: "PROFIT_FLOOR_EXIT",
     order: {
       clientOrderId: "second-exit", symbol, side: "sell", requestedQuantity: 1,
       filledQuantity: 0, limitPrice: 2.3, status: "SUBMITTED",
@@ -543,7 +545,7 @@ test("dashboard reconstructs fired entries, broker execution, trades, and perfor
   }));
   dashboard.record(event("risk_decision", {
     signalId: "signal-1",
-    risk: { allowed: true, reasons: [], quantity: 2, stopPrice: 1.5, targetPrice: 2.7 },
+    risk: { allowed: true, reasons: [], quantity: 2, stopPrice: 1.5 },
   }, 5));
   dashboard.record(event("broker_order_request", {
     purpose: "ENTRY", signalId: "signal-1",
@@ -564,7 +566,8 @@ test("dashboard reconstructs fired entries, broker execution, trades, and perfor
     incrementalQuantity: 2, incrementalPrice: 2, cumulativeQuantity: 2,
     position: {
       symbol, direction: "BULLISH", quantity: 2, averageEntryPrice: 2, entryTimestamp: timestamp,
-      stopPrice: 1.5, targetPrice: 2.7, highWaterMark: 2, lowWaterMark: 2,
+      stopPrice: 1.5, tradeState: "OPEN_UNPROTECTED",
+      executablePnl: 0, highWaterPnl: 0, lowWaterPnl: 0,
     },
   }, 30));
   dashboard.recordMarketEvent({
@@ -593,7 +596,6 @@ test("dashboard reconstructs fired entries, broker execution, trades, and perfor
   assert.ok(openSnapshot.orderCards[0]?.updates.some((update) =>
     update.stage === "POSITION_OPEN" && Math.abs((update.totalPnl ?? 0) - 80) < 1e-9));
   assert.equal(openSnapshot.activeOrders[0]?.stopPrice, 1.5);
-  assert.equal(openSnapshot.activeOrders[0]?.targetPrice, 2.7);
   assert.ok(Math.abs(openSnapshot.performance.unrealizedPnl - 80) < 1e-9);
   assert.ok(Math.abs(openSnapshot.performance.totalPnl - 80) < 1e-9);
   assert.equal(openSnapshot.liveData.totalEvents, 1);
@@ -605,7 +607,7 @@ test("dashboard reconstructs fired entries, broker execution, trades, and perfor
   assert.equal(openSnapshot.decisions[0]?.directions?.[0]?.reasons[0], "MEDIUM_SLOPE_MISALIGNED");
 
   dashboard.record(event("broker_order_request", {
-    purpose: "EXIT", reason: "PROFIT_TARGET",
+    purpose: "EXIT", reason: "PROFIT_FLOOR_EXIT",
     order: {
       clientOrderId: "exit-1", symbol, side: "sell", requestedQuantity: 2, filledQuantity: 0,
       averageFillPrice: 0, limitPrice: 2.7, status: "SUBMITTED", submittedAt: timestamp + 60_000, replacements: 0,
@@ -613,9 +615,9 @@ test("dashboard reconstructs fired entries, broker execution, trades, and perfor
   }, 60_000));
   assert.equal(dashboard.snapshot().activeOrders[0]?.stage, "EXIT_WORKING");
   dashboard.record(event("exit_fill", {
-    reason: "PROFIT_TARGET", symbol, direction: "BULLISH", entryTimestamp: timestamp,
+    reason: "PROFIT_FLOOR_EXIT", symbol, direction: "BULLISH", entryTimestamp: timestamp,
     averageEntryPrice: 2, incrementalQuantity: 2, incrementalPrice: 2.7,
-    realizedPnl: 140, remainingQuantity: 0, highWaterMark: 2.8, lowWaterMark: 1.8,
+    realizedPnl: 140, remainingQuantity: 0, highWaterPnl: 160, lowWaterPnl: -40,
   }, 60_100));
   dashboard.record(event("broker_order_state", {
     purpose: "EXIT",
@@ -628,7 +630,6 @@ test("dashboard reconstructs fired entries, broker execution, trades, and perfor
   assert.equal(snapshot.performance.optionsSelected, 1);
   assert.equal(snapshot.performance.riskAllowed, 1);
   assert.equal(snapshot.performance.riskBlocked, 0);
-  assert.equal(snapshot.performance.entriesFired, 1);
   assert.equal(snapshot.performance.entryOrders, 1);
   assert.equal(snapshot.performance.exitOrders, 1);
   assert.equal(snapshot.performance.closedTrades, 1);
@@ -648,7 +649,7 @@ test("dashboard reconstructs fired entries, broker execution, trades, and perfor
   assert.equal(snapshot.signals[0]?.status, "ORDER_SUBMITTED");
   assert.equal(snapshot.orders.find((order) => order.clientOrderId === "entry-1")?.filledQuantity, 2);
   assert.equal(snapshot.trades[0]?.averageExitPrice, 2.7);
-  assert.equal(snapshot.trades[0]?.exitReason, "PROFIT_TARGET");
+  assert.equal(snapshot.trades[0]?.exitReason, "PROFIT_FLOOR_EXIT");
   assert.ok(Math.abs((snapshot.trades[0]?.maxFavorableExcursionPct ?? 0) - 40) < 1e-9);
   assert.ok(Math.abs((snapshot.trades[0]?.maxAdverseExcursionPct ?? 0) + 10) < 1e-9);
   assert.ok(Math.abs((snapshot.trades[0]?.capturePct ?? 0) - 87.5) < 1e-9);
@@ -708,7 +709,8 @@ test("dashboard exposes the full signal funnel and excludes losses from profit c
   dashboard.record(event("entry_fill", {
     position: {
       symbol, direction: "BULLISH", quantity: 1, averageEntryPrice: 2,
-      entryTimestamp: timestamp + 2_100, highWaterMark: 2, lowWaterMark: 2,
+      entryTimestamp: timestamp + 2_100, tradeState: "OPEN_UNPROTECTED",
+      executablePnl: 0, highWaterPnl: 0, lowWaterPnl: 0,
     },
   }, 2_100));
   dashboard.recordMarketEvent({
@@ -719,7 +721,7 @@ test("dashboard exposes the full signal funnel and excludes losses from profit c
   dashboard.record(event("exit_fill", {
     reason: "TREND_INVALIDATION", symbol, direction: "BULLISH", entryTimestamp: timestamp + 2_100,
     averageEntryPrice: 2, incrementalQuantity: 1, incrementalPrice: 1.9,
-    realizedPnl: -10, remainingQuantity: 0, highWaterMark: 2.1, lowWaterMark: 1.9,
+    realizedPnl: -10, remainingQuantity: 0, highWaterPnl: 10, lowWaterPnl: -10,
   }, 2_300));
   snapshot = dashboard.snapshot();
   assert.ok(Math.abs((snapshot.trades[0]?.maxFavorableExcursionPct ?? 0) - 5) < 1e-9);
@@ -731,13 +733,14 @@ test("dashboard exposes the full signal funnel and excludes losses from profit c
   winner.record(event("entry_fill", {
     position: {
       symbol, direction: "BULLISH", quantity: 1, averageEntryPrice: 2,
-      entryTimestamp: timestamp, highWaterMark: 2, lowWaterMark: 2,
+      entryTimestamp: timestamp, tradeState: "OPEN_UNPROTECTED",
+      executablePnl: 0, highWaterPnl: 0, lowWaterPnl: 0,
     },
   }));
   winner.record(event("exit_fill", {
     reason: "OPPOSITE_REGIME", symbol, direction: "BULLISH", entryTimestamp: timestamp,
     averageEntryPrice: 2, incrementalQuantity: 1, incrementalPrice: 2.2,
-    realizedPnl: 20, remainingQuantity: 0, highWaterMark: 2, lowWaterMark: 2,
+    realizedPnl: 20, remainingQuantity: 0, highWaterPnl: 20, lowWaterPnl: 0,
   }, 1_000));
   const winningTrade = winner.snapshot().trades[0];
   assert.ok(Math.abs((winningTrade?.maxFavorableExcursionPct ?? 0) - 10) < 1e-9);

@@ -250,7 +250,7 @@ export class ReplayEngine {
       quantity: this.#position.quantity,
       timestamp,
       quote,
-      marketable: reason === "FORCED_SESSION_EXIT" || reason === "KILL_SWITCH" || reason === "EARLY_SCRATCH",
+      marketable: reason === "FORCED_SESSION_EXIT" || reason === "KILL_SWITCH",
     });
     state = this.#orders.submit(state, timestamp);
     this.#pending = { purpose: "EXIT", state, reason };

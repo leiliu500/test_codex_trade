@@ -148,12 +148,13 @@ export class SpyOptionsTradingRuntime {
       const lateEntryBaselineConfig = structuredClone(options.config);
       lateEntryBaselineConfig.signals.lateEntryGuard.mode = "DISABLED";
       lateEntryBaselineConfig.signals.morningEntryGuard.mode = "DISABLED";
+      lateEntryBaselineConfig.signals.entryConfirmationMode = "SHADOW";
       this.#lateEntryBaselineSignals = new SignalEngine(lateEntryBaselineConfig);
     }
     if (options.config.signals.shadowFollowThroughScope !== "DISABLED") {
       for (const scope of ["BULLISH_IMPULSE", "IMPULSE", "ALL"] as const) {
         const shadowConfig = structuredClone(options.config);
-        shadowConfig.signals.entryQualityMode = "ENFORCE";
+        shadowConfig.signals.entryConfirmationMode = "ENFORCE";
         shadowConfig.signals.followThroughScope = scope;
         this.#shadowSignals.set(scope, new SignalEngine(shadowConfig));
       }
@@ -215,23 +216,13 @@ export class SpyOptionsTradingRuntime {
         marketDate: this.#restoredRuntimeState.risk.marketDate,
         restoredEntries: this.#restoredRuntimeState.risk.entries,
         restoredRealizedPnl: this.#restoredRuntimeState.risk.realizedPnl,
-        entryQualityMode: this.#config.signals.entryQualityMode,
-        activeMaxTradesPerDay: this.#config.signals.entryQualityMode === "ENFORCE"
-          ? this.#config.risk.entryQualityMaxTradesPerDay : this.#config.risk.maxTradesPerDay,
-        maxTradesPerDay: this.#config.signals.entryQualityMode === "ENFORCE"
-          ? this.#config.risk.entryQualityMaxTradesPerDay : this.#config.risk.maxTradesPerDay,
-        shadowMaxTradesPerDay: this.#config.risk.entryQualityMaxTradesPerDay,
+        entryConfirmationMode: this.#config.signals.entryConfirmationMode,
+        activeMaxTradesPerDay: this.#config.risk.maxTradesPerDay,
+        maxTradesPerDay: this.#config.risk.maxTradesPerDay,
         lateMaxDailyEntries: this.#config.signals.lateEntryGuard.maxDailyEntries,
         maxDailyLossDollars: this.#config.risk.maxDailyLossDollars,
-        activeEntryCapReached: this.#restoredRuntimeState.risk.entries >= (
-          this.#config.signals.entryQualityMode === "ENFORCE"
-            ? this.#config.risk.entryQualityMaxTradesPerDay : this.#config.risk.maxTradesPerDay
-        ),
-        entryCapReached: this.#restoredRuntimeState.risk.entries >= (
-          this.#config.signals.entryQualityMode === "ENFORCE"
-            ? this.#config.risk.entryQualityMaxTradesPerDay : this.#config.risk.maxTradesPerDay
-        ),
-        shadowEntryCapReached: this.#restoredRuntimeState.risk.entries >= this.#config.risk.entryQualityMaxTradesPerDay,
+        activeEntryCapReached: this.#restoredRuntimeState.risk.entries >= this.#config.risk.maxTradesPerDay,
+        entryCapReached: this.#restoredRuntimeState.risk.entries >= this.#config.risk.maxTradesPerDay,
         lateEntryCapReached: this.#restoredRuntimeState.risk.entries >=
           this.#config.signals.lateEntryGuard.maxDailyEntries,
         knownClientOrderIds: this.#restoredRuntimeState.knownClientOrderIds.size,
@@ -288,7 +279,7 @@ export class SpyOptionsTradingRuntime {
         strategyStateStatus: this.#strategyStateStatus,
         restoredStockEvents: this.#restoredStockEvents,
         restoredFeatureBars: this.#restoredFeatureBars,
-        entryQualityMode: this.#config.signals.entryQualityMode,
+        entryConfirmationMode: this.#config.signals.entryConfirmationMode,
         activeFollowThroughScope: this.#config.signals.followThroughScope,
         shadowFollowThroughScope: this.#config.signals.shadowFollowThroughScope,
         shadowFollowThroughScopes: [...this.#shadowSignals.keys()],
