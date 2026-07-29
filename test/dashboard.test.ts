@@ -52,6 +52,8 @@ test("dashboard exposes liveness and feed tabs before any entries, orders, or hi
   assert.match(html, /Profit floor/);
   assert.match(html, /Recovery/);
   assert.match(html, /Continuation LCB/);
+  assert.match(html, /material changes/);
+  assert.match(html, /fractionalSecondDigits:3/);
   assert.match(html, /STATE NOT RECORDED/);
   assert.match(html, /DECISION NOT RECORDED/);
   assert.doesNotMatch(html, /x\.tradeState\|\|\(!x\.entryPrice\?'AWAITING FILL':'OPEN UNPROTECTED'\)/);
@@ -178,6 +180,85 @@ test("dashboard clears order cards at 10 PM Pacific and does not restore prior-d
   assert.equal(dashboard.snapshot().orderCards.length, 0);
   dashboard.restoreOrderCards([completedCard]);
   assert.equal(dashboard.snapshot().orderCards.length, 0);
+});
+
+test("dashboard compacts historical sub-cent controller noise but preserves material transitions", () => {
+  const dashboard = historicalDashboard();
+  const base = {
+    stage: "POSITION_OPEN" as const,
+    status: "OPEN",
+    source: "STATUS" as const,
+    remainingQuantity: 1,
+    realizedPnl: 0,
+    currentBid: 1.86,
+    unrealizedPnl: -14,
+    totalPnl: -14,
+    lifecycle: "OPEN_UNPROTECTED",
+    tradeState: "OPEN_UNPROTECTED",
+    managementDecision: "HOLD" as const,
+    executablePnl: -14.25,
+    liquidationPrice: 1.8575,
+    highWaterPnl: 4.75,
+    lowWaterPnl: -14.25,
+    recoveryProbability: 0.001,
+    reversalCusum: 24.4,
+    zeroCrossings: 14,
+    pnlObservationCount: 160,
+  };
+  const card: DashboardOrderCard = {
+    id: "historical-noisy-controller",
+    symbol,
+    direction: "BULLISH",
+    active: false,
+    stage: "CLOSED",
+    status: "filled",
+    quantity: 1,
+    remainingQuantity: 0,
+    entryPrice: 2,
+    exitPrice: 1.86,
+    realizedPnl: -14,
+    totalPnl: -14,
+    entryTimestamp: timestamp,
+    exitTimestamp: timestamp + 1_000,
+    updates: [{
+      ...base,
+      timestamp: timestamp + 100,
+      continuationLcbDollars: -6.871092448,
+      optionContinuation: { lcbDollars: -6.871092448, uncertaintyDollars: 4.361 },
+    }, {
+      ...base,
+      timestamp: timestamp + 101,
+      continuationLcbDollars: -6.871302924,
+      optionContinuation: { lcbDollars: -6.871302924, uncertaintyDollars: 4.362 },
+    }, {
+      ...base,
+      timestamp: timestamp + 200,
+      currentBid: 1.85,
+      unrealizedPnl: -15,
+      totalPnl: -15,
+      executablePnl: -15.25,
+      pnlObservationCount: 161,
+      continuationLcbDollars: -6.89,
+      optionContinuation: { lcbDollars: -6.89, uncertaintyDollars: 4.362 },
+    }, {
+      ...base,
+      timestamp: timestamp + 300,
+      stage: "EXIT_WORKING",
+      status: "SUBMITTED",
+      lifecycle: "EXIT_PENDING",
+      managementDecision: "EXIT",
+      managementReason: "TREND_INVALIDATION",
+      exitTriggers: ["STRUCTURAL_INVALIDATION"],
+      continuationLcbDollars: -6.89,
+    }],
+  };
+
+  dashboard.restoreOrderCards([card]);
+  const restored = dashboard.snapshot().orderCards[0]!;
+  assert.equal(restored.updates.length, 3);
+  assert.equal(restored.updates[0]?.timestamp, timestamp + 100);
+  assert.equal(restored.updates[1]?.timestamp, timestamp + 200);
+  assert.equal(restored.updates[2]?.managementDecision, "EXIT");
 });
 
 test("dashboard persists a completed card with all captured P&L updates", async () => {

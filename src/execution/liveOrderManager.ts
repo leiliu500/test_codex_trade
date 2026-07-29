@@ -12,6 +12,10 @@ import { RiskManager } from "../risk/riskManager.js";
 import type { DailyRiskState } from "../risk/riskManager.js";
 import type { AuditRecorder } from "../ops/recorder.js";
 import { MemoryRecorder } from "../ops/recorder.js";
+import {
+  sameMaterialOrderManagement,
+  type DashboardOrderManagement,
+} from "../ops/orderCards.js";
 import { marketDate } from "../utils/time.js";
 import { OrderExecutor, reconcileEntryExposure, type OrderState } from "./orderExecutor.js";
 
@@ -137,6 +141,7 @@ export class LiveOrderManager {
   #lifecycle: TradeLifecycleState = "FLAT";
   #safeMode = false;
   readonly #lastOptionQuotes = new Map<string, OptionQuote>();
+  #lastAuditedManagementState: DashboardOrderManagement | undefined;
   #halted = false;
   #haltReason: string | undefined;
   #tail: Promise<void> = Promise.resolve();
@@ -402,34 +407,81 @@ export class LiveOrderManager {
     const decision = this.#exits.evaluate(context);
     this.#position = decision.updatedPosition;
     if (!this.#exitIntent) this.#lifecycle = decision.updatedPosition.tradeState;
-    await this.#audit(request.timestamp, "order_management_state", {
-      symbol: decision.updatedPosition.symbol,
-      direction: decision.updatedPosition.direction,
-      entryTimestamp: decision.updatedPosition.entryTimestamp,
+    const managementState: DashboardOrderManagement = {
       lifecycle: decision.exit
         ? "EXIT_PENDING"
         : decision.updatedPosition.tradeState,
       tradeState: decision.updatedPosition.tradeState,
-      decision: decision.exit ? "EXIT" : "HOLD",
-      reason: decision.reason ?? null,
-      triggers: decision.triggers ?? [],
-      markPrice: decision.markPrice ?? null,
-      liquidationPrice: decision.liquidationPrice ?? null,
-      executablePnl: decision.executablePnl ?? null,
-      protectedFloorPnl: decision.protectedFloorPnl ?? null,
-      floorBufferDollars:
-        decision.executablePnl !== undefined && decision.protectedFloorPnl !== undefined
-          ? decision.executablePnl - decision.protectedFloorPnl
-          : null,
+      managementDecision: decision.exit ? "EXIT" : "HOLD",
+      ...(decision.reason ? { managementReason: decision.reason } : {}),
+      ...(decision.triggers?.length ? { exitTriggers: [...decision.triggers] } : {}),
+      ...(decision.liquidationPrice !== undefined
+        ? { liquidationPrice: decision.liquidationPrice }
+        : {}),
+      ...(decision.executablePnl !== undefined
+        ? { executablePnl: decision.executablePnl }
+        : {}),
+      ...(decision.protectedFloorPnl !== undefined
+        ? { protectedFloorPnl: decision.protectedFloorPnl }
+        : {}),
+      ...(decision.executablePnl !== undefined && decision.protectedFloorPnl !== undefined
+        ? { floorBufferDollars: decision.executablePnl - decision.protectedFloorPnl }
+        : {}),
       highWaterPnl: decision.updatedPosition.highWaterPnl,
       lowWaterPnl: decision.updatedPosition.lowWaterPnl,
-      recoveryProbability: decision.recoveryProbability ?? null,
-      continuationLcbDollars: decision.continuationLcbDollars ?? null,
+      ...(decision.recoveryProbability !== undefined
+        ? { recoveryProbability: decision.recoveryProbability }
+        : {}),
+      ...(decision.continuationLcbDollars !== undefined
+        ? { continuationLcbDollars: decision.continuationLcbDollars }
+        : {}),
       reversalCusum: decision.updatedPosition.reversalCusum,
       zeroCrossings: decision.updatedPosition.zeroCrossings,
       pnlObservationCount: decision.updatedPosition.pnlObservationCount,
-      optionContinuation: decision.updatedPosition.optionContinuation ?? null,
+      ...(decision.updatedPosition.optionContinuation
+        ? { optionContinuation: { ...decision.updatedPosition.optionContinuation } }
+        : {}),
+    };
+    const materialChange = !this.#lastAuditedManagementState ||
+      !sameMaterialOrderManagement(this.#lastAuditedManagementState, managementState);
+    if (materialChange) await this.#audit(request.timestamp, "order_management_state", {
+      symbol: decision.updatedPosition.symbol,
+      direction: decision.updatedPosition.direction,
+      entryTimestamp: decision.updatedPosition.entryTimestamp,
+      lifecycle: managementState.lifecycle,
+      tradeState: managementState.tradeState,
+      decision: managementState.managementDecision,
+      reason: managementState.managementReason ?? null,
+      triggers: managementState.exitTriggers ?? [],
+      markPrice: decision.markPrice ?? null,
+      liquidationPrice: managementState.liquidationPrice ?? null,
+      executablePnl: managementState.executablePnl ?? null,
+      protectedFloorPnl: managementState.protectedFloorPnl ?? null,
+      floorBufferDollars: managementState.floorBufferDollars ?? null,
+      highWaterPnl: managementState.highWaterPnl,
+      lowWaterPnl: managementState.lowWaterPnl,
+      recoveryProbability: managementState.recoveryProbability ?? null,
+      continuationLcbDollars: managementState.continuationLcbDollars ?? null,
+      reversalCusum: managementState.reversalCusum,
+      zeroCrossings: managementState.zeroCrossings,
+      pnlObservationCount: managementState.pnlObservationCount,
+      optionContinuation: managementState.optionContinuation ?? null,
     });
+    if (materialChange) {
+      this.#lastAuditedManagementState = {
+        ...managementState,
+        ...(managementState.exitTriggers
+          ? { exitTriggers: [...managementState.exitTriggers] }
+          : {}),
+        ...(managementState.optionContinuation
+          ? { optionContinuation: { ...managementState.optionContinuation } }
+          : {}),
+      };
+    } else if (!this.#recorder.healthy()) {
+      await this.#halt(request.timestamp, "AUDIT_RECORDER_FAILURE", {
+        skippedType: "order_management_state",
+      });
+    }
     return decision;
   }
 
@@ -556,6 +608,7 @@ export class LiveOrderManager {
         }
         if (firstFill) {
           this.#risk.recordEntry(timestamp);
+          this.#lastAuditedManagementState = undefined;
         }
         this.#lifecycle = this.#position?.tradeState ?? "FLAT";
         await this.#audit(timestamp, "entry_fill", {
@@ -598,6 +651,7 @@ export class LiveOrderManager {
         });
         if (this.#position.quantity === 0) {
           this.#position = undefined;
+          this.#lastAuditedManagementState = undefined;
           this.#exitIntent = undefined;
           this.#lifecycle = "CLOSED";
           this.#safeMode = false;
@@ -733,6 +787,7 @@ export class LiveOrderManager {
         });
       }
       this.#position = undefined;
+      this.#lastAuditedManagementState = undefined;
       this.#exitIntent = undefined;
       this.#safeMode = false;
       this.#lifecycle = "CLOSED";

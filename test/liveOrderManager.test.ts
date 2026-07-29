@@ -213,6 +213,44 @@ test("trailing protection locks a configured profit floor after activation", asy
   assert.equal(state.pending?.order.marketable, true);
 });
 
+test("unchanged quote-batch evaluations do not flood durable management history", async () => {
+  const client = new FakeTradingClient();
+  const recorder = new MemoryRecorder();
+  const manager = new LiveOrderManager({ config: defaultConfig, client, recorder });
+  await manager.initialize(start);
+  const submitted = await manager.submitEntry({
+    timestamp: start,
+    signal: signal(),
+    candidate: candidate(),
+    quote: optionQuote(start),
+  });
+  client.fill(submitted.brokerOrder!.id, 1, 2, "filled");
+  await manager.tick({
+    timestamp: start + 400,
+    optionQuote: optionQuote(start + 400),
+  });
+
+  const managementCount = () => recorder.events.filter((event) =>
+    event.type === "order_management_state").length;
+  assert.equal(managementCount(), 1);
+
+  for (let offset = 401; offset <= 500; offset += 1) {
+    await manager.tick({
+      timestamp: start + offset,
+      optionQuote: optionQuote(start + offset),
+    });
+  }
+  assert.equal(managementCount(), 1);
+  assert.equal(manager.snapshot().position?.pnlObservationCount, 0);
+
+  await manager.tick({
+    timestamp: start + 501,
+    optionQuote: optionQuote(start + 501, 2.01, 2.03),
+  });
+  assert.equal(managementCount(), 2);
+  assert.equal(manager.snapshot().position?.pnlObservationCount, 1);
+});
+
 test("unfilled entry is replaced toward market and canceled at its deadline", async () => {
   const client = new FakeTradingClient();
   const manager = new LiveOrderManager({ config: defaultConfig, client });
