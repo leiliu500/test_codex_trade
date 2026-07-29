@@ -274,6 +274,9 @@ export interface PositionState {
   /** Observation count at the first executable soft-activation touch. */
   softProtectionCandidateObservationCount?: number;
   softProtectionActivatedAt?: number;
+  /** Resettable confirmation state for a microstructure-sized soft-floor breach. */
+  softFloorBreachStartedAt?: number;
+  softFloorBreachCandidateObservationCount?: number;
   protectionActivatedAt?: number;
   pnlObservationCount: number;
   estimatedRecoveryProbability?: number;

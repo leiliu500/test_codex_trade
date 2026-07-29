@@ -161,6 +161,9 @@ export interface EngineConfig {
     softProtectionRetentionRatio: number;
     softProtectionMinimumFloorDollars: number;
     softProtectionMaximumFloorDollars: number;
+    softFloorBreachConfirmationMs: number;
+    softFloorBreachMinimumObservations: number;
+    softProtectionEmergencyLossDollars: number;
     minimumProfitFloorDollars: number;
     directWinnerActivationDollars: number;
     recoveredActivationDollars: number;
@@ -350,6 +353,10 @@ export function validateConfig(config: EngineConfig): void {
           config.risk.softProtectionMinimumFloorDollars &&
         config.risk.softProtectionMaximumFloorDollars <=
           config.risk.minimumProfitFloorDollars &&
+        config.risk.softFloorBreachConfirmationMs > 0 &&
+        Number.isInteger(config.risk.softFloorBreachMinimumObservations) &&
+        config.risk.softFloorBreachMinimumObservations >= 2 &&
+        config.risk.softProtectionEmergencyLossDollars >= 0 &&
         config.risk.minimumProfitFloorDollars >= 0 &&
         config.risk.directWinnerActivationDollars >= config.risk.minimumProfitFloorDollars &&
         config.risk.recoveredActivationDollars >= config.risk.directWinnerActivationDollars &&

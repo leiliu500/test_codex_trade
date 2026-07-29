@@ -92,11 +92,15 @@ export class TradeStateEstimator {
         position.tradeState = "PROTECTED_WINNER";
         position.protectionActivatedAt = timestamp;
         delete position.softProtectionCandidateObservationCount;
+        delete position.softFloorBreachStartedAt;
+        delete position.softFloorBreachCandidateObservationCount;
       } else if (meaningfulAdversePath &&
           executablePnl >= this.#config.risk.recoveredActivationDollars) {
         position.tradeState = "PROTECTED_RECOVERED";
         position.protectionActivatedAt = timestamp;
         delete position.softProtectionCandidateObservationCount;
+        delete position.softFloorBreachStartedAt;
+        delete position.softFloorBreachCandidateObservationCount;
       }
     }
 
