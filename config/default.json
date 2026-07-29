@@ -1,5 +1,5 @@
 {
-  "version": "spy-0dte-entry-confirmation-11-unified-order-management-9-confirmed-soft-profit-floor",
+  "version": "spy-0dte-entry-confirmation-12-unified-order-management-9-all-morning-quality-gates",
   "symbol": "SPY",
   "timeZone": "America/New_York",
   "session": {
@@ -55,10 +55,10 @@
     "lateBullishImpulseRequiresUpRegime": true,
     "bullishImpulseCutoff": "13:00:00",
     "followThroughMinSec": 5,
-    "followThroughMaxSec": 15,
+    "followThroughMaxSec": 20,
     "followThroughMinimumBps": 0,
     "followThroughNoiseMultiplier": 1.25,
-    "followThroughScope": "BULLISH_IMPULSE",
+    "followThroughScope": "ALL",
     "shadowFollowThroughScope": "BULLISH_IMPULSE",
     "morningEntryGuard": {
       "mode": "ENFORCE",
@@ -74,7 +74,7 @@
       "start": "12:00:00",
       "maxDailyEntries": 1000,
       "minProjectedMoveBps": 2.0,
-      "minCostMarginBps": 1.0,
+      "minCostMarginBps": 1.25,
       "maxOptionSpreadPct": 0.008,
       "followThroughMinSec": 5,
       "followThroughMaxSec": 15,

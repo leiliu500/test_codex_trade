@@ -160,7 +160,7 @@ test("bullish impulses stop after 13:00 and all executable signals stop after 14
   assert.equal(researchSignal.signal?.direction, "BEARISH");
 });
 
-test("causal follow-through confirms only aligned movement observed 5-15 seconds later", () => {
+test("causal follow-through confirms only aligned movement observed 5-20 seconds later", () => {
   const winnerEngine = new SignalEngine(enforcedSignalConfig);
   const first = feature(1);
   const regime: RegimeDecision = { regime: "STRONG_UP", confidence: 1, reasons: [] };
@@ -180,22 +180,35 @@ test("causal follow-through confirms only aligned movement observed 5-15 seconds
   assert.ok(confirmed.signal?.reasons.some((reason) => reason.includes("causal follow-through confirmed")));
   assert.ok(confirmed.signal?.reasons.some((reason) => reason.includes("2.500 bps required")));
 
+  const delayedWinnerEngine = new SignalEngine(enforcedSignalConfig);
+  assert.equal(delayedWinnerEngine.evaluate(first, regime), undefined);
+  const stillDeveloping = delayedWinnerEngine.evaluateDetailed(
+    { ...first, timestamp: first.timestamp + 15_000, price: first.price * (1 + 2.4 / 10_000) }, regime,
+  );
+  assert.equal(stillDeveloping.signal, undefined);
+  assert.deepEqual(stillDeveloping.reasons, ["FOLLOW_THROUGH_NOT_CONFIRMED"]);
+  const delayedWinner = delayedWinnerEngine.evaluateDetailed(
+    { ...first, timestamp: first.timestamp + 20_000, price: first.price * (1 + 2.6 / 10_000) }, regime,
+  );
+  assert.equal(delayedWinner.signal?.direction, "BULLISH");
+  assert.ok(delayedWinner.signal?.reasons.some((reason) =>
+    reason.includes("causal follow-through confirmed after 20.0s")));
+
   const loserEngine = new SignalEngine(enforcedSignalConfig);
   assert.equal(loserEngine.evaluate(first, regime), undefined);
   assert.equal(loserEngine.evaluate(
     { ...first, timestamp: first.timestamp + 5_000, price: 500.99 }, regime,
   ), undefined);
   const failed = loserEngine.evaluateDetailed(
-    { ...first, timestamp: first.timestamp + 15_000, price: 500.98 }, regime,
+    { ...first, timestamp: first.timestamp + 20_000, price: 500.98 }, regime,
   );
   assert.equal(failed.signal, undefined);
   assert.deepEqual(failed.reasons, ["FOLLOW_THROUGH_FAILED"]);
 });
 
-test("default confirmation targets bullish impulses without delaying other setup classes", () => {
+test("default confirmation delays every morning setup for causal follow-through", () => {
   const bearish = feature(-1);
   const down: RegimeDecision = { regime: "STRONG_DOWN", confidence: 1, reasons: [] };
-  assert.equal(new SignalEngine(defaultConfig).evaluate(bearish, down)?.direction, "BEARISH");
   const bullish = feature(1);
   const up: RegimeDecision = { regime: "STRONG_UP", confidence: 1, reasons: [] };
   assert.equal(new SignalEngine(immediateSignalConfig).evaluate(bullish, up)?.direction, "BULLISH");
@@ -203,20 +216,17 @@ test("default confirmation targets bullish impulses without delaying other setup
   const bullishOnly = new SignalEngine(defaultConfig).evaluateDetailed(bullish, up);
   assert.equal(bullishOnly.signal, undefined);
   assert.deepEqual(bullishOnly.reasons, ["FOLLOW_THROUGH_PENDING"]);
-  assert.equal(new SignalEngine(enforcedSignalConfig).evaluate(bearish, down)?.direction, "BEARISH");
-
-  const allEntryConfig = structuredClone(defaultConfig);
-  allEntryConfig.signals.entryConfirmationMode = "ENFORCE";
-  allEntryConfig.signals.followThroughScope = "ALL";
-  const shadow = new SignalEngine(allEntryConfig).evaluateDetailed(bearish, down);
-  assert.equal(shadow.signal, undefined);
-  assert.deepEqual(shadow.reasons, ["FOLLOW_THROUGH_PENDING"]);
+  const bearishPending = new SignalEngine(enforcedSignalConfig).evaluateDetailed(bearish, down);
+  assert.equal(bearishPending.signal, undefined);
+  assert.deepEqual(bearishPending.reasons, ["FOLLOW_THROUGH_PENDING"]);
 });
 
-test("morning bearish impulses require causal follow-through only when OFI horizons conflict", () => {
+test("morning bearish impulses use standard confirmation and retain explicit OFI-conflict reasons", () => {
   const aligned = feature(-1);
   const down: RegimeDecision = { regime: "UNCLASSIFIED", confidence: 0, reasons: [] };
-  assert.equal(new SignalEngine(defaultConfig).evaluate(aligned, down)?.direction, "BEARISH");
+  const alignedPending = new SignalEngine(defaultConfig).evaluateDetailed(aligned, down);
+  assert.equal(alignedPending.signal, undefined);
+  assert.deepEqual(alignedPending.reasons, ["FOLLOW_THROUGH_PENDING"]);
 
   const conflicted = { ...aligned, ofi15: Math.abs(aligned.ofi15) };
   const engine = new SignalEngine(defaultConfig);
@@ -237,7 +247,7 @@ test("morning bearish impulses require causal follow-through only when OFI horiz
   assert.equal(failedEngine.evaluateDetailed(conflicted, down).signal, undefined);
   const failed = failedEngine.evaluateDetailed({
     ...conflicted,
-    timestamp: conflicted.timestamp + 15_000,
+    timestamp: conflicted.timestamp + 20_000,
     price: conflicted.price * (1 + 0.5 / 10_000),
   }, down);
   assert.equal(failed.signal, undefined);
@@ -245,7 +255,9 @@ test("morning bearish impulses require causal follow-through only when OFI horiz
 
   const disabledConfig = structuredClone(defaultConfig);
   disabledConfig.signals.morningEntryGuard.ofiConflictRequiresFollowThrough = false;
-  assert.equal(new SignalEngine(disabledConfig).evaluate(conflicted, down)?.direction, "BEARISH");
+  const standardPending = new SignalEngine(disabledConfig).evaluateDetailed(conflicted, down);
+  assert.equal(standardPending.signal, undefined);
+  assert.deepEqual(standardPending.reasons, ["FOLLOW_THROUGH_PENDING"]);
 
   const shadowConfig = structuredClone(defaultConfig);
   shadowConfig.signals.entryConfirmationMode = "SHADOW";
@@ -686,16 +698,41 @@ test("late-session option selection requires tighter spread, post-cost margin, a
   const wide = new OptionSelector(defaultConfig).evaluate(contract, book.get(contract.symbol), signal, timestamp + 1);
   assert.ok(wide.rejectionReasons.includes("LATE_ENTRY_OPTION_SPREAD_TOO_WIDE"));
 
+  book.updateQuote({
+    symbol: contract.symbol,
+    timestamp: timestamp + 2,
+    bidPrice: 1.994,
+    askPrice: 2.006,
+    bidSize: 100,
+    askSize: 100,
+  });
+  const belowDefaultMargin = new OptionSelector(defaultConfig).evaluate(
+    contract,
+    book.get(contract.symbol),
+    { ...signal, projectedMoveBps: 2.3 },
+    timestamp + 2,
+  );
+  assert.ok(belowDefaultMargin.costMarginBps! < defaultConfig.signals.lateEntryGuard.minCostMarginBps);
+  assert.ok(belowDefaultMargin.rejectionReasons.includes("LATE_ENTRY_COST_MARGIN_BELOW_MINIMUM"));
+  const aboveDefaultMargin = new OptionSelector(defaultConfig).evaluate(
+    contract,
+    book.get(contract.symbol),
+    { ...signal, projectedMoveBps: 2.4 },
+    timestamp + 2,
+  );
+  assert.ok(aboveDefaultMargin.costMarginBps! >= defaultConfig.signals.lateEntryGuard.minCostMarginBps);
+  assert.equal(aboveDefaultMargin.eligible, true);
+
   const strictMarginConfig = structuredClone(defaultConfig);
   strictMarginConfig.signals.lateEntryGuard.minCostMarginBps = 10;
   const lowMargin = new OptionSelector(strictMarginConfig).evaluate(
-    contract, book.get(contract.symbol), signal, timestamp + 1,
+    contract, book.get(contract.symbol), signal, timestamp + 2,
   );
   assert.ok(lowMargin.rejectionReasons.includes("LATE_ENTRY_COST_MARGIN_BELOW_MINIMUM"));
 
   const weakSignal = { ...signal, projectedMoveBps: 1.99 };
   const weak = new OptionSelector(defaultConfig).evaluate(
-    contract, book.get(contract.symbol), weakSignal, timestamp + 1,
+    contract, book.get(contract.symbol), weakSignal, timestamp + 2,
   );
   assert.ok(weak.rejectionReasons.includes("LATE_ENTRY_PROJECTED_MOVE_BELOW_MINIMUM"));
 });
