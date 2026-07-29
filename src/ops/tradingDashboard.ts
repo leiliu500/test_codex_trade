@@ -3,6 +3,8 @@ import type { HistoricalMarketEvent, HistoricalMarketEventType, MarketHistorySin
 import { marketDate, zonedDateTimeToEpoch } from "../utils/time.js";
 import {
   classifyOrderCardEntryQuality,
+  compactOrderCardDynamics,
+  sameOrderCardTimelineState,
   type DashboardOrderEntryQuality,
   type DashboardOrderCard,
   type DashboardOrderDynamicsUpdate,
@@ -430,7 +432,7 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
     for (const card of cards) {
       const timestamp = orderCardDisplayTimestamp(card);
       if (timestamp === undefined || dashboardDisplayDate(timestamp) !== this.#displayDate) continue;
-      this.#orderCards.set(card.id, cloneOrderCard(card));
+      this.#orderCards.set(card.id, compactOrderCardDynamics(card));
     }
   }
 
@@ -1811,11 +1813,10 @@ function copyOrderManagement(
 }
 
 function sameOrderManagement(
-  left: DashboardOrderManagement,
-  right: DashboardOrderManagement,
+  left: DashboardOrderDynamicsUpdate,
+  right: DashboardOrderDynamicsUpdate,
 ): boolean {
-  return JSON.stringify(copyOrderManagement(left)) ===
-    JSON.stringify(copyOrderManagement(right));
+  return sameOrderCardTimelineState(left, right);
 }
 
 function recordValue(value: unknown): Record<string, unknown> {
@@ -1952,8 +1953,8 @@ const fields=node('div','live-fields');
 fields.append(field('Position',x.remainingQuantity+' / '+x.quantity+' contracts'),field('Entry',x.entryPrice===undefined?'—':money(x.entryPrice)),field(x.active?'Bid / Ask':'Exit',x.active?(x.currentBid===undefined?'—':money(x.currentBid)+' / '+money(x.currentAsk)):(x.exitPrice===undefined?'—':money(x.exitPrice))),field('Hard stop',x.stopPrice===undefined?'—':money(x.stopPrice)),field('Protected floor',x.protectedFloorPnl===undefined?'—':money(x.protectedFloorPnl)),field('Elapsed',duration(x.elapsedMs)),field('Realized',money(x.realizedPnl)),field(x.active?'Quote age':'Exit reason',x.active?(x.quoteAgeMs===undefined?'Waiting for quote':duration(x.quoteAgeMs)):(x.exitReason||x.managementReason||x.status)),field('Direction',x.direction||'Pending entry'));
 card.append(head,quality,management,fields);
 if(x.workingOrder){const order=x.workingOrder,strip=node('div','order-strip'),row=node('div','order-strip-row'),left=node('span','',order.purpose+' '+order.status+' · '+order.filledQuantity+'/'+order.requestedQuantity+' filled'),right=node('span','',money(order.limitPrice)+' limit · '+order.replacements+' replaces'),details=[],triggerText=(order.triggers||x.exitTriggers||[]).map(value=>value.replaceAll('_',' ')).join(' · ');row.append(left,right);if(order.urgency!==undefined)details.push('urgency '+percent(100*order.urgency,0));if(order.actionTtlMs!==undefined)details.push('TTL '+order.actionTtlMs+' ms');if(order.priceCollar!==undefined)details.push('collar '+money(order.priceCollar));if(order.attempt!==undefined)details.push('attempt '+order.attempt);if(order.exitIntentId)details.push('intent '+order.exitIntentId);strip.append(row);if(details.length)strip.append(node('div','order-strip-detail',details.join(' · ')));if(triggerText)strip.append(node('div','order-strip-detail','Exit triggers · '+triggerText));card.append(strip)}
-const updates=x.updates||[],managementUpdates=updates.filter(update=>update.lifecycle||update.tradeState||update.managementDecision).length,dynamics=node('div','dynamics'),title=node('div','dynamics-title','Durable timeline · '+updates.length+' changes · '+managementUpdates+' manager states'),list=node('div','dynamics-list');
-for(const update of [...updates].reverse()){const total=update.totalPnl===undefined?update.unrealizedPnl:update.totalPnl,change=update.pnlChange,row=node('div','dynamics-row'),at=node('span','dynamics-time',new Date(update.timestamp).toLocaleTimeString('en-US',{timeZone:'America/New_York'})),stateParts=[update.tradeState||update.lifecycle||update.stage,update.managementDecision||update.status];if(update.managementReason)stateParts.push(update.managementReason);if(update.currentBid!==undefined)stateParts.push('bid '+money(update.currentBid));if(update.protectedFloorPnl!==undefined)stateParts.push('floor '+money(update.protectedFloorPnl));const state=node('span','dynamics-state',stateParts.map(value=>String(value).replaceAll('_',' ')).join(' · ')),value=node('span','dynamics-pnl '+(total>0?'positive':total<0?'negative':''),total===undefined?(update.executablePnl===undefined?'—':money(update.executablePnl)):money(total)),delta=node('span','dynamics-change '+(change>0?'positive':change<0?'negative':''),change===undefined?'—':(change>0?'+':'')+money(change));row.append(at,state,value,delta);list.append(row)}
+const updates=x.updates||[],managementUpdates=updates.filter(update=>update.lifecycle||update.tradeState||update.managementDecision).length,dynamics=node('div','dynamics'),title=node('div','dynamics-title','Durable timeline · '+updates.length+' material changes · '+managementUpdates+' manager states'),list=node('div','dynamics-list');
+for(const update of [...updates].reverse()){const total=update.totalPnl===undefined?update.unrealizedPnl:update.totalPnl,change=update.pnlChange,row=node('div','dynamics-row'),at=node('span','dynamics-time',new Date(update.timestamp).toLocaleTimeString('en-US',{timeZone:'America/New_York',fractionalSecondDigits:3})),stateParts=[update.tradeState||update.lifecycle||update.stage,update.managementDecision||update.status];if(update.managementReason)stateParts.push(update.managementReason);if(update.currentBid!==undefined)stateParts.push('bid '+money(update.currentBid));if(update.protectedFloorPnl!==undefined)stateParts.push('floor '+money(update.protectedFloorPnl));const state=node('span','dynamics-state',stateParts.map(value=>String(value).replaceAll('_',' ')).join(' · ')),value=node('span','dynamics-pnl '+(total>0?'positive':total<0?'negative':''),total===undefined?(update.executablePnl===undefined?'—':money(update.executablePnl)):money(total)),delta=node('span','dynamics-change '+(change>0?'positive':change<0?'negative':''),change===undefined?'—':(change>0?'+':'')+money(change));row.append(at,state,value,delta);list.append(row)}
 if(updates.length===0)list.append(node('div','muted','Waiting for the first P&L, controller, or broker-state update.'));
 dynamics.append(title,list);card.append(dynamics);return card});
 root.replaceChildren(...cards)

@@ -283,7 +283,7 @@ export function mergeOrderCardQuoteDynamics(
   }
 
   const mergedCard = { ...cloneCard(card), updates };
-  return { ...mergedCard, ...classifyOrderCardEntryQuality(mergedCard) };
+  return compactOrderCardDynamics(mergedCard);
 }
 
 function sameDynamics(left: DashboardOrderDynamicsUpdate, right: DashboardOrderDynamicsUpdate): boolean {
@@ -294,7 +294,7 @@ function sameDynamics(left: DashboardOrderDynamicsUpdate, right: DashboardOrderD
     left.currentBid === right.currentBid &&
     left.unrealizedPnl === right.unrealizedPnl &&
     left.totalPnl === right.totalPnl &&
-    sameManagementState(left, right);
+    sameOrderCardTimelineState(left, right);
 }
 
 function cloneCard(card: DashboardOrderCard): DashboardOrderCard {
@@ -320,6 +320,33 @@ function cloneCard(card: DashboardOrderCard): DashboardOrderCard {
         : {}),
     })),
   };
+}
+
+/**
+ * Removes consecutive controller updates that render identically on the order
+ * card. Raw market/audit history remains available; this only keeps material
+ * lifecycle, P&L, and displayed controller changes in the card timeline.
+ */
+export function compactOrderCardDynamics(
+  card: DashboardOrderCard,
+): DashboardOrderCard {
+  const cloned = cloneCard(card);
+  const updates: DashboardOrderDynamicsUpdate[] = [];
+  let previousPnl: number | undefined;
+  for (const source of cloned.updates) {
+    const update = { ...source };
+    const previous = updates.at(-1);
+    if (previous && sameDynamics(previous, update)) continue;
+    delete update.pnlChange;
+    const pnl = update.totalPnl ?? update.unrealizedPnl;
+    if (pnl !== undefined) {
+      if (previousPnl !== undefined) update.pnlChange = pnl - previousPnl;
+      previousPnl = pnl;
+    }
+    updates.push(update);
+  }
+  const compacted = { ...cloned, updates };
+  return { ...compacted, ...classifyOrderCardEntryQuality(compacted) };
 }
 
 function copyManagementState(
@@ -364,7 +391,7 @@ function copyManagementState(
   };
 }
 
-function sameManagementState(
+export function sameMaterialOrderManagement(
   left: DashboardOrderManagement,
   right: DashboardOrderManagement,
 ): boolean {
@@ -373,19 +400,64 @@ function sameManagementState(
     left.managementDecision === right.managementDecision &&
     left.managementReason === right.managementReason &&
     JSON.stringify(left.exitTriggers ?? []) === JSON.stringify(right.exitTriggers ?? []) &&
-    left.executablePnl === right.executablePnl &&
-    left.liquidationPrice === right.liquidationPrice &&
-    left.protectedFloorPnl === right.protectedFloorPnl &&
-    left.floorBufferDollars === right.floorBufferDollars &&
-    left.highWaterPnl === right.highWaterPnl &&
-    left.lowWaterPnl === right.lowWaterPnl &&
-    left.recoveryProbability === right.recoveryProbability &&
-    left.continuationLcbDollars === right.continuationLcbDollars &&
-    left.reversalCusum === right.reversalCusum &&
+    sameDisplayedNumber(left.executablePnl, right.executablePnl, 100) &&
+    sameDisplayedNumber(left.liquidationPrice, right.liquidationPrice, 100) &&
+    sameDisplayedNumber(left.protectedFloorPnl, right.protectedFloorPnl, 100) &&
+    sameDisplayedNumber(left.floorBufferDollars, right.floorBufferDollars, 100) &&
+    sameDisplayedNumber(left.highWaterPnl, right.highWaterPnl, 100) &&
+    sameDisplayedNumber(left.lowWaterPnl, right.lowWaterPnl, 100) &&
+    sameDisplayedNumber(left.recoveryProbability, right.recoveryProbability, 1_000) &&
+    sameDisplayedNumber(left.continuationLcbDollars, right.continuationLcbDollars, 100) &&
+    sameDisplayedNumber(left.reversalCusum, right.reversalCusum, 100) &&
     left.zeroCrossings === right.zeroCrossings &&
     left.pnlObservationCount === right.pnlObservationCount &&
-    JSON.stringify(left.optionContinuation ?? {}) ===
-      JSON.stringify(right.optionContinuation ?? {});
+    sameOptionContinuation(left.optionContinuation, right.optionContinuation);
+}
+
+/**
+ * Compares the controller fields actually rendered on an individual timeline
+ * row. Detailed risk diagnostics remain on the card and in durable audits, but
+ * do not create visually duplicate rows when P&L and lifecycle are unchanged.
+ */
+export function sameOrderCardTimelineState(
+  left: DashboardOrderDynamicsUpdate,
+  right: DashboardOrderDynamicsUpdate,
+): boolean {
+  const leftHasTimelinePnl = left.totalPnl !== undefined || left.unrealizedPnl !== undefined;
+  const rightHasTimelinePnl = right.totalPnl !== undefined || right.unrealizedPnl !== undefined;
+  return left.lifecycle === right.lifecycle &&
+    left.tradeState === right.tradeState &&
+    left.managementDecision === right.managementDecision &&
+    left.managementReason === right.managementReason &&
+    JSON.stringify(left.exitTriggers ?? []) === JSON.stringify(right.exitTriggers ?? []) &&
+    sameDisplayedNumber(left.protectedFloorPnl, right.protectedFloorPnl, 100) &&
+    ((leftHasTimelinePnl || rightHasTimelinePnl) ||
+      sameDisplayedNumber(left.executablePnl, right.executablePnl, 100));
+}
+
+function sameOptionContinuation(
+  left: DashboardOptionContinuation | undefined,
+  right: DashboardOptionContinuation | undefined,
+): boolean {
+  if (!left || !right) return left === right;
+  return sameDisplayedNumber(left.deltaDollars, right.deltaDollars, 100) &&
+    sameDisplayedNumber(left.gammaDollars, right.gammaDollars, 100) &&
+    sameDisplayedNumber(left.vegaDollars, right.vegaDollars, 100) &&
+    sameDisplayedNumber(left.thetaDollars, right.thetaDollars, 100) &&
+    sameDisplayedNumber(left.holdingCostDollars, right.holdingCostDollars, 100) &&
+    sameDisplayedNumber(left.uncertaintyDollars, right.uncertaintyDollars, 100) &&
+    sameDisplayedNumber(left.expectedChangeDollars, right.expectedChangeDollars, 100) &&
+    sameDisplayedNumber(left.lcbDollars, right.lcbDollars, 100) &&
+    left.ivCrushDetected === right.ivCrushDetected;
+}
+
+function sameDisplayedNumber(
+  left: number | undefined,
+  right: number | undefined,
+  scale: number,
+): boolean {
+  if (left === undefined || right === undefined) return left === right;
+  return Math.round(left * scale) === Math.round(right * scale);
 }
 
 function formatSignedPnl(value: number): string {
