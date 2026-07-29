@@ -1,5 +1,5 @@
 {
-  "version": "spy-0dte-entry-confirmation-11-unified-order-management-8-buffered-soft-profit-floor",
+  "version": "spy-0dte-entry-confirmation-11-unified-order-management-9-confirmed-soft-profit-floor",
   "symbol": "SPY",
   "timeZone": "America/New_York",
   "session": {
@@ -153,6 +153,9 @@
     "softProtectionRetentionRatio": 0.15,
     "softProtectionMinimumFloorDollars": 0,
     "softProtectionMaximumFloorDollars": 2,
+    "softFloorBreachConfirmationMs": 500,
+    "softFloorBreachMinimumObservations": 2,
+    "softProtectionEmergencyLossDollars": 0,
     "minimumProfitFloorDollars": 5,
     "directWinnerActivationDollars": 12,
     "recoveredActivationDollars": 15,
