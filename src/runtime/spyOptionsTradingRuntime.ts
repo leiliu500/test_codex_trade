@@ -23,6 +23,7 @@ import { SpySipReceiver } from "./spySipReceiver.js";
 import { isAtOrAfter, marketDate, parseClock, secondsSinceMidnight, zonedDateTimeToEpoch } from "../utils/time.js";
 import type { DailyRiskState } from "../risk/riskManager.js";
 import { lateEntryGuardAudit, morningEntryGuardAudit } from "../strategy/lateEntryGuard.js";
+import { validateOptionQuote } from "../features/quoteSanitizer.js";
 
 export interface SpyOptionsRuntimeClient extends TradingRestClient {
   getLatestSpySipQuote(): Promise<StockQuote>;
@@ -658,18 +659,27 @@ export class SpyOptionsTradingRuntime {
           this.#optionQuoteStalled = false;
         }
         this.#recordOptionHistory(quotes);
-        let activeSymbol = this.#execution.position?.symbol ?? this.#execution.pending?.order.symbol;
+        const decisionTimestamp = this.#now();
+        const activeSymbol = this.#execution.position?.symbol ?? this.#execution.pending?.order.symbol;
+        let latestActiveQuote: OptionQuote | undefined;
         for (const quote of quotes) {
           this.#optionQuoteCount += 1;
           this.#lastOptionQuoteTimestamp = Math.max(this.#lastOptionQuoteTimestamp ?? -Infinity, quote.timestamp);
-          if (!this.#book.updateQuote(quote)) {
+          const validation = validateOptionQuote(
+            quote,
+            decisionTimestamp,
+            this.#config.dataQuality,
+          );
+          if (!validation.usable || !this.#book.updateQuote(validation.value!)) {
             this.#rejectedOptionQuotes += 1;
             continue;
           }
           if (activeSymbol === quote.symbol) {
-            await this.#tickExecution(this.#now(), quote);
-            activeSymbol = this.#execution.position?.symbol ?? this.#execution.pending?.order.symbol;
+            latestActiveQuote = quote;
           }
+        }
+        if (latestActiveQuote) {
+          await this.#tickExecution(decisionTimestamp, latestActiveQuote);
         }
       });
     } catch (error) {

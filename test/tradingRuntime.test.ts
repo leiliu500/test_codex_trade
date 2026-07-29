@@ -443,14 +443,17 @@ test("OPRA quote bursts update the option book through one causal batch without 
   });
   await runtime.start();
   const before = runtime.healthState().receivedOptionQuotes ?? 0;
+  const beforeRejected = runtime.healthState().rejectedMarketEvents ?? 0;
   await optionStream.quotes([
     { symbol: callSymbol, timestamp: now - 2, bidPrice: 1.99, askPrice: 2.01, bidSize: 10, askSize: 12 },
+    { symbol: callSymbol, timestamp: now - 1, bidPrice: 2, askPrice: 2, bidSize: 10, askSize: 10 },
     { symbol: callSymbol, timestamp: now - 1, bidPrice: 2, askPrice: 2.02, bidSize: 11, askSize: 13 },
     { symbol: callSymbol, timestamp: now, bidPrice: 2.01, askPrice: 2.03, bidSize: 12, askSize: 14 },
   ]);
 
-  assert.equal(runtime.healthState().receivedOptionQuotes, before + 3);
-  assert.equal(history.events.filter((event) => event.type === "option_quote").length, 3);
+  assert.equal(runtime.healthState().receivedOptionQuotes, before + 4);
+  assert.equal(runtime.healthState().rejectedMarketEvents, beforeRejected + 1);
+  assert.equal(history.events.filter((event) => event.type === "option_quote").length, 4);
   await runtime.close();
 });
 

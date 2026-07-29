@@ -42,15 +42,16 @@ export class TradeStateEstimator {
     const previousPnl = position.executablePnl;
     const previousTimestamp = position.lastPnlTimestamp;
     const elapsedSec = Math.max(0, (timestamp - previousTimestamp) / 1000);
+    const pnlChanged = Math.abs(executablePnl - previousPnl) > Number.EPSILON;
 
     position.previousExecutablePnl = previousPnl;
     position.executablePnl = executablePnl;
     position.highWaterPnl = Math.max(position.highWaterPnl, executablePnl);
     position.lowWaterPnl = Math.min(position.lowWaterPnl, executablePnl);
 
-    if (executablePnl >= original.highWaterPnl) position.lastHighTimestamp = timestamp;
+    if (executablePnl > original.highWaterPnl) position.lastHighTimestamp = timestamp;
 
-    if (elapsedSec > 0) {
+    if (elapsedSec > 0 && pnlChanged) {
       const lambda = 1 - Math.exp(-Math.LN2 * elapsedSec / this.#config.risk.pnlEwmaHalfLifeSec);
       const previousDrift = position.pnlEwmaDriftPerSec;
       const observedDrift = (executablePnl - previousPnl) / elapsedSec;
@@ -60,6 +61,7 @@ export class TradeStateEstimator {
       position.pnlEwmaVariancePerSec =
         (1 - lambda) * position.pnlEwmaVariancePerSec + lambda * observedVariancePerSec;
       position.pnlObservationCount += 1;
+      position.lastPnlTimestamp = timestamp;
     }
 
     const pnlSign = sign(executablePnl);
@@ -69,13 +71,16 @@ export class TradeStateEstimator {
     }
     position.previousPnlSign = pnlSign;
 
-    if (feature?.fast && Number.isFinite(feature.fast.normalizedSlope)) {
+    if (feature?.fast &&
+        Number.isFinite(feature.fast.normalizedSlope) &&
+        feature.timestamp > (position.lastReversalFeatureTimestamp ?? position.entryTimestamp)) {
       const directionSign = position.direction === "BULLISH" ? 1 : -1;
       const signedSlope = directionSign * feature.fast.normalizedSlope;
       position.reversalCusum = Math.max(
         0,
         position.reversalCusum - signedSlope - this.#config.risk.reversalCusumReference,
       );
+      position.lastReversalFeatureTimestamp = feature.timestamp;
     }
 
     const tradeState = position.tradeState;
@@ -138,7 +143,6 @@ export class TradeStateEstimator {
       );
     }
 
-    position.lastPnlTimestamp = timestamp;
     return {
       position,
       markPrice,

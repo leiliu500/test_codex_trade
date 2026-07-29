@@ -264,6 +264,7 @@ export interface PositionState {
   pnlEwmaDriftPerSec: number;
   pnlEwmaVariancePerSec: number;
   reversalCusum: number;
+  lastReversalFeatureTimestamp?: number;
   zeroCrossings: number;
   previousPnlSign: -1 | 0 | 1;
   protectionActivatedAt?: number;
