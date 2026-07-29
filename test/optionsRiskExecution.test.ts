@@ -367,6 +367,27 @@ test("bad entries exit on path-implied recovery probability before the hard-loss
   assert.ok(decision.liquidationPrice! > position.stopPrice);
 });
 
+test("fallback recovery probability does not cut an ordinary developing winner", () => {
+  const config = structuredClone(defaultConfig);
+  config.risk.recoveryProbabilityMinAgeSec = 0;
+  config.risk.recoveryProbabilityMinObservations = 2;
+  config.risk.recoveryProbabilityGraceSec = 0;
+  const timestamp = zonedDateTimeToEpoch("2026-07-22", "11:00:00");
+  const risk = new RiskManager(config);
+  const manager = new ExitManager(config);
+  let position = risk.createFilledPosition(
+    "SPY260722C00500000", "BULLISH", 1, 2, timestamp, 500,
+  );
+  let decision = manager.evaluate(exitContext(position, timestamp + 1_000, 2.02));
+  assert.equal(decision.exit, false);
+  position = decision.updatedPosition;
+  decision = manager.evaluate(exitContext(position, timestamp + 2_000, 1.99));
+  assert.equal(decision.exit, false);
+  assert.ok(decision.updatedPosition.lowWaterPnl >
+    -config.risk.meaningfulAdverseExcursionDollars);
+  assert.equal(decision.recoveryProbability, undefined);
+});
+
 test("a losing entry that recovers promptly becomes protected instead of taking a premature recovery exit", () => {
   const config = structuredClone(defaultConfig);
   config.risk.recoveryProbabilityMinAgeSec = 0;

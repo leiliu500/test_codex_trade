@@ -423,7 +423,8 @@ test("order cards classify entry quality from the best observed and final P&L", 
 
   assert.equal(classified([-7, 20, 12], 12), "GOOD");
   assert.equal(classified([-6, 16, -6], -6), "GOOD_ENTRY_POOR_EXIT");
-  assert.equal(classified([-6, 12, -6], -6), "MARGINAL");
+  assert.equal(classified([-6, 12, -6], -6), "GOOD_ENTRY_POOR_EXIT");
+  assert.equal(classified([-6, 11, -6], -6), "MARGINAL");
   assert.equal(classified([-7, 0, -21], -21), "MARGINAL");
   assert.equal(classified([-9, -7, -28], -28), "POOR");
   assert.equal(classified([-7], -7, true), "EVALUATING");

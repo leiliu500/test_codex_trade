@@ -120,6 +120,9 @@ export class ExitManager {
     let recoveryProbability = context.recoveryProbability;
     if (recoveryProbability === undefined &&
         position.tradeState === "OPEN_UNPROTECTED" &&
+        position.lowWaterPnl <=
+          -this.#config.risk.meaningfulAdverseExcursionDollars &&
+        position.executablePnl < 0 &&
         ageSec >= this.#config.risk.recoveryProbabilityMinAgeSec &&
         position.pnlObservationCount >=
           this.#config.risk.recoveryProbabilityMinObservations) {
