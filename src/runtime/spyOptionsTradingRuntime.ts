@@ -331,19 +331,7 @@ export class SpyOptionsTradingRuntime {
           : null;
         const primaryShadowScope = this.#config.signals.shadowFollowThroughScope;
         const shadowAudit = primaryShadowScope === "DISABLED" ? null : shadowEvaluations[primaryShadowScope] ?? null;
-        const runtimeBlocks: string[] = [];
-        if (!this.#executionEnabled) runtimeBlocks.push("EXECUTION_DISABLED");
-        if (this.#killSwitch) runtimeBlocks.push("KILL_SWITCH");
-        if (this.#execution.halted) runtimeBlocks.push("EXECUTION_HALTED");
-        if (this.#executionEnabled && !this.#strategyStateReady) runtimeBlocks.push("STRATEGY_STATE_NOT_READY");
-        if (this.#executionEnabled && this.#isOptionQuoteStalled(this.#now())) {
-          runtimeBlocks.push("OPTION_FEED_STALLED");
-        } else if (this.#executionEnabled && !this.#optionConnected &&
-            optionUniverseRequired(this.#now(), this.#marketOpen, false, this.#config)) {
-          runtimeBlocks.push("OPTION_FEED_DISCONNECTED");
-        }
-        if (this.#execution.position) runtimeBlocks.push("POSITION_ALREADY_OPEN");
-        if (this.#execution.pending) runtimeBlocks.push("ORDER_ALREADY_PENDING");
+        const runtimeBlocks = this.#entryRuntimeBlockReasons(this.#now());
         if (runtimeBlocks.length > 0) {
           await this.#auditRuntime(feature.timestamp, "live_entry_evaluation", {
             timestamp: feature.timestamp,
@@ -484,6 +472,7 @@ export class SpyOptionsTradingRuntime {
   healthState(): HealthState {
     const now = this.#now();
     const stock = this.#stockReceiver.healthState(this.#killSwitch);
+    const recorderHealthy = this.#recorder.healthy();
     const brokerReady = !this.#executionEnabled || (this.#brokerAvailable && this.#positionsReconciled && this.#account?.optionsApproved === true);
     const streamsConnected = stock.websocketConnected && this.#optionConnected;
     const streamsReady = this.#marketDataIdle || streamsConnected;
@@ -495,7 +484,8 @@ export class SpyOptionsTradingRuntime {
     const optionQuoteStalled = this.#isOptionQuoteStalled(now);
     return {
       ...stock,
-      ready: streamsReady && brokerReady && universeReady && strategyReady && !optionQuoteStalled &&
+      ready: streamsReady && brokerReady && universeReady && strategyReady && recorderHealthy &&
+        !optionQuoteStalled &&
         !this.#execution.halted && !this.#queue.halted,
       brokerRequired: this.#executionEnabled,
       optionDataFeed: "opra",
@@ -526,7 +516,7 @@ export class SpyOptionsTradingRuntime {
         this.#marketDataIdle ? "market-closed-idle" : "market-closed",
       openOrderCount: this.#execution.pending ? 1 : 0,
       positionsReconciled: this.#positionsReconciled,
-      recorderHealthy: this.#recorder.healthy(),
+      recorderHealthy,
       strategyStateReady: this.#strategyStateReady,
       strategyStateStatus: this.#strategyStateStatus,
       ...(this.#strategyStateMarketDate ? { strategyStateMarketDate: this.#strategyStateMarketDate } : {}),
@@ -534,6 +524,34 @@ export class SpyOptionsTradingRuntime {
       restoredFeatureBars: this.#restoredFeatureBars,
       ...(this.#strategyRecoveryError ? { strategyRecoveryError: this.#strategyRecoveryError } : {}),
     };
+  }
+
+  #entryRuntimeBlockReasons(timestamp: number): string[] {
+    const reasons: string[] = [];
+    if (!this.#executionEnabled) reasons.push("EXECUTION_DISABLED");
+    if (this.#killSwitch) reasons.push("KILL_SWITCH");
+    if (this.#execution.halted) reasons.push("EXECUTION_HALTED");
+    if (this.#execution.safeMode) reasons.push("EXECUTION_SAFE_MODE");
+    if (this.#executionEnabled && !this.#brokerAvailable) reasons.push("BROKER_UNAVAILABLE");
+    if (this.#executionEnabled && !this.#positionsReconciled) reasons.push("POSITIONS_NOT_RECONCILED");
+    if (this.#executionEnabled &&
+        (this.#account?.active !== true || this.#account.optionsApproved !== true)) {
+      reasons.push("ACCOUNT_NOT_READY");
+    }
+    if (this.#executionEnabled && !this.#recorder.healthy()) reasons.push("AUDIT_RECORDER_UNHEALTHY");
+    if (this.#executionEnabled && !this.#strategyStateReady) reasons.push("STRATEGY_STATE_NOT_READY");
+    if (this.#executionEnabled && !this.#stockReceiver.healthState(this.#killSwitch).websocketConnected) {
+      reasons.push("STOCK_FEED_DISCONNECTED");
+    }
+    if (this.#executionEnabled && this.#isOptionQuoteStalled(timestamp)) {
+      reasons.push("OPTION_FEED_STALLED");
+    } else if (this.#executionEnabled && !this.#optionConnected &&
+        optionUniverseRequired(timestamp, this.#marketOpen, false, this.#config)) {
+      reasons.push("OPTION_FEED_DISCONNECTED");
+    }
+    if (this.#execution.position) reasons.push("POSITION_ALREADY_OPEN");
+    if (this.#execution.pending) reasons.push("ORDER_ALREADY_PENDING");
+    return reasons;
   }
 
   async #restoreStrategyState(timestamp: number): Promise<void> {

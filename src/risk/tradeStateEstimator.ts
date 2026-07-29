@@ -84,17 +84,38 @@ export class TradeStateEstimator {
     }
 
     const tradeState = position.tradeState;
-    if (tradeState === "OPEN_UNPROTECTED") {
+    if (tradeState === "OPEN_UNPROTECTED" || tradeState === "PROTECTED_SOFT") {
       const meaningfulAdversePath =
         position.lowWaterPnl <= -this.#config.risk.meaningfulAdverseExcursionDollars;
       if (!meaningfulAdversePath &&
           executablePnl >= this.#config.risk.directWinnerActivationDollars) {
         position.tradeState = "PROTECTED_WINNER";
         position.protectionActivatedAt = timestamp;
+        delete position.softProtectionCandidateObservationCount;
       } else if (meaningfulAdversePath &&
           executablePnl >= this.#config.risk.recoveredActivationDollars) {
         position.tradeState = "PROTECTED_RECOVERED";
         position.protectionActivatedAt = timestamp;
+        delete position.softProtectionCandidateObservationCount;
+      }
+    }
+
+    if (position.tradeState === "OPEN_UNPROTECTED") {
+      if (executablePnl >= this.#config.risk.softProtectionActivationDollars) {
+        if (position.softProtectionCandidateObservationCount === undefined) {
+          position.softProtectionCandidateObservationCount = position.pnlObservationCount;
+        }
+        const candidateObservationCount = position.softProtectionCandidateObservationCount;
+        if (position.pnlObservationCount - candidateObservationCount >=
+            this.#config.risk.softProtectionConfirmationObservations) {
+          position.tradeState = "PROTECTED_SOFT";
+          position.softProtectionActivatedAt = timestamp;
+          delete position.softProtectionCandidateObservationCount;
+        }
+      } else {
+        // Confirmation must be consecutive. A failed touch must not leave a
+        // stale latch that arms protection during a later pullback.
+        delete position.softProtectionCandidateObservationCount;
       }
     }
 
@@ -105,7 +126,23 @@ export class TradeStateEstimator {
       (spread * (1 + this.#config.execution.adverseFillSpreadFraction) +
         this.#config.execution.optionTickSize);
 
-    if (position.tradeState === "PROTECTED_WINNER" ||
+    if (position.tradeState === "PROTECTED_SOFT") {
+      // Executable P&L already includes adverse-fill spread cost, so the soft
+      // floor stays deliberately loose without subtracting that cost twice.
+      // Low retention plus a hard cap protects a small win while preserving
+      // pullback room for a trade that has not yet proven itself.
+      const peak = Math.max(0, position.highWaterPnl);
+      const candidateFloor = clamp(
+        peak * this.#config.risk.softProtectionRetentionRatio,
+        this.#config.risk.softProtectionMinimumFloorDollars,
+        this.#config.risk.softProtectionMaximumFloorDollars,
+      );
+      position.protectedFloorPnl = Math.max(
+        position.protectedFloorPnl ??
+          this.#config.risk.softProtectionMinimumFloorDollars,
+        candidateFloor,
+      );
+    } else if (position.tradeState === "PROTECTED_WINNER" ||
         position.tradeState === "PROTECTED_RECOVERED") {
       const peak = Math.max(0, position.highWaterPnl);
       const peakProgress = 1 - Math.exp(

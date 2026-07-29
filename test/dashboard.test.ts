@@ -319,6 +319,29 @@ test("order cards expose and persist unified order-management state changes", as
     symbol,
     direction: "BULLISH",
     entryTimestamp: timestamp,
+    lifecycle: "PROTECTED_SOFT",
+    tradeState: "PROTECTED_SOFT",
+    decision: "HOLD",
+    triggers: [],
+    liquidationPrice: 2.04,
+    executablePnl: 4,
+    protectedFloorPnl: 0.6,
+    floorBufferDollars: 3.4,
+    highWaterPnl: 4,
+    lowWaterPnl: -3,
+    reversalCusum: 0,
+    zeroCrossings: 1,
+    pnlObservationCount: 4,
+  }, 50));
+  let card = dashboard.snapshot().orderCards[0]!;
+  assert.equal(card.tradeState, "PROTECTED_SOFT");
+  assert.equal(card.protectedFloorPnl, 0.6);
+  assert.equal(card.floorBufferDollars, 3.4);
+
+  await dashboard.record(event("order_management_state", {
+    symbol,
+    direction: "BULLISH",
+    entryTimestamp: timestamp,
     lifecycle: "PROTECTED_RECOVERED",
     tradeState: "PROTECTED_RECOVERED",
     decision: "HOLD",
@@ -347,7 +370,7 @@ test("order cards expose and persist unified order-management state changes", as
     },
   }, 100));
 
-  let card = dashboard.snapshot().orderCards[0]!;
+  card = dashboard.snapshot().orderCards[0]!;
   assert.equal(card.lifecycle, "PROTECTED_RECOVERED");
   assert.equal(card.tradeState, "PROTECTED_RECOVERED");
   assert.equal(card.managementDecision, "HOLD");

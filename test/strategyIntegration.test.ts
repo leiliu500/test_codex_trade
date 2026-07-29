@@ -213,6 +213,45 @@ test("default confirmation targets bullish impulses without delaying other setup
   assert.deepEqual(shadow.reasons, ["FOLLOW_THROUGH_PENDING"]);
 });
 
+test("morning bearish impulses require causal follow-through only when OFI horizons conflict", () => {
+  const aligned = feature(-1);
+  const down: RegimeDecision = { regime: "UNCLASSIFIED", confidence: 0, reasons: [] };
+  assert.equal(new SignalEngine(defaultConfig).evaluate(aligned, down)?.direction, "BEARISH");
+
+  const conflicted = { ...aligned, ofi15: Math.abs(aligned.ofi15) };
+  const engine = new SignalEngine(defaultConfig);
+  const pending = engine.evaluateDetailed(conflicted, down);
+  assert.equal(pending.signal, undefined);
+  assert.deepEqual(pending.reasons, ["MORNING_ENTRY_FOLLOW_THROUGH_PENDING"]);
+
+  const confirmed = engine.evaluateDetailed({
+    ...conflicted,
+    timestamp: conflicted.timestamp + 5_000,
+    price: conflicted.price * (1 - 2.6 / 10_000),
+  }, down);
+  assert.equal(confirmed.signal?.direction, "BEARISH");
+  assert.ok(confirmed.signal?.reasons.some((reason) =>
+    reason.includes("causal follow-through confirmed after 5.0s")));
+
+  const failedEngine = new SignalEngine(defaultConfig);
+  assert.equal(failedEngine.evaluateDetailed(conflicted, down).signal, undefined);
+  const failed = failedEngine.evaluateDetailed({
+    ...conflicted,
+    timestamp: conflicted.timestamp + 15_000,
+    price: conflicted.price * (1 + 0.5 / 10_000),
+  }, down);
+  assert.equal(failed.signal, undefined);
+  assert.deepEqual(failed.reasons, ["MORNING_ENTRY_FOLLOW_THROUGH_FAILED"]);
+
+  const disabledConfig = structuredClone(defaultConfig);
+  disabledConfig.signals.morningEntryGuard.ofiConflictRequiresFollowThrough = false;
+  assert.equal(new SignalEngine(disabledConfig).evaluate(conflicted, down)?.direction, "BEARISH");
+
+  const shadowConfig = structuredClone(defaultConfig);
+  shadowConfig.signals.entryConfirmationMode = "SHADOW";
+  assert.equal(new SignalEngine(shadowConfig).evaluate(conflicted, down)?.direction, "BEARISH");
+});
+
 test("morning bullish impulses and late-session entries require causal follow-through", () => {
   const morning = feature(1);
   const up: RegimeDecision = { regime: "STRONG_UP", confidence: 1, reasons: [] };

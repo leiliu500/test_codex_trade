@@ -1,5 +1,5 @@
 {
-  "version": "spy-0dte-entry-confirmation-10-unified-order-management-5",
+  "version": "spy-0dte-entry-confirmation-11-unified-order-management-8-buffered-soft-profit-floor",
   "symbol": "SPY",
   "timeZone": "America/New_York",
   "session": {
@@ -66,7 +66,8 @@
       "end": "12:00:00",
       "minProjectedMoveBps": 1.7,
       "minCostMarginBps": 1.0,
-      "maxOptionSpreadPct": 0.0075
+      "maxOptionSpreadPct": 0.0075,
+      "ofiConflictRequiresFollowThrough": true
     },
     "lateEntryGuard": {
       "mode": "ENFORCE",
@@ -147,6 +148,11 @@
     "trendInvalidationGraceSec": 8,
     "staleDataEmergencySec": 10,
     "onePositionAtATime": true,
+    "softProtectionActivationDollars": 3,
+    "softProtectionConfirmationObservations": 2,
+    "softProtectionRetentionRatio": 0.15,
+    "softProtectionMinimumFloorDollars": 0,
+    "softProtectionMaximumFloorDollars": 2,
     "minimumProfitFloorDollars": 5,
     "directWinnerActivationDollars": 12,
     "recoveredActivationDollars": 15,

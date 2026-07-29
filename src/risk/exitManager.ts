@@ -80,7 +80,8 @@ export class ExitManager {
       if (executablePnl <= -riskBudget || liquidationPrice! <= position.stopPrice) {
         trigger("HARD_LOSS_BOUNDARY");
       }
-      if ((position.tradeState === "PROTECTED_WINNER" ||
+      if ((position.tradeState === "PROTECTED_SOFT" ||
+           position.tradeState === "PROTECTED_WINNER" ||
            position.tradeState === "PROTECTED_RECOVERED") &&
           position.protectedFloorPnl !== undefined &&
           executablePnl <= position.protectedFloorPnl) {
@@ -111,7 +112,7 @@ export class ExitManager {
     }
 
     if (position.reversalCusum >= this.#config.risk.reversalCusumThreshold &&
-        position.tradeState !== "OPEN_UNPROTECTED") {
+        isFullyProtected(position)) {
       trigger("REVERSAL_CUSUM");
     }
 
@@ -119,7 +120,7 @@ export class ExitManager {
     const usingFallbackRecoveryProbability = context.recoveryProbability === undefined;
     let recoveryProbability = context.recoveryProbability;
     if (recoveryProbability === undefined &&
-        position.tradeState === "OPEN_UNPROTECTED" &&
+        isRecoveryManaged(position) &&
         position.lowWaterPnl <=
           -this.#config.risk.meaningfulAdverseExcursionDollars &&
         position.executablePnl < 0 &&
@@ -177,11 +178,11 @@ export class ExitManager {
     }
     if (context.trendProbability !== undefined &&
         context.trendProbability < 0.5 &&
-        position.tradeState !== "OPEN_UNPROTECTED") {
+        isFullyProtected(position)) {
       trigger("CONTINUATION_LCB_NON_POSITIVE");
     }
 
-    const recoveryDeadlineFired = position.tradeState === "OPEN_UNPROTECTED" &&
+    const recoveryDeadlineFired = isRecoveryManaged(position) &&
       ageSec >= this.#config.risk.recoveryDeadlineSec;
     if (recoveryDeadlineFired) {
       trigger("RECOVERY_PROBABILITY_TOO_LOW");
@@ -193,7 +194,7 @@ export class ExitManager {
       (context.timestamp - position.lastHighTimestamp) / 1000;
     if (executablePnl !== undefined &&
         executablePnl > 0 &&
-        position.tradeState === "OPEN_UNPROTECTED" &&
+        isRecoveryManaged(position) &&
         timeSinceHighSec >= this.#config.risk.stallSec &&
         context.continuationLcbDollars !== undefined &&
         context.continuationLcbDollars <= 0) {
@@ -345,4 +346,14 @@ function isOppositeRegime(
 
 function clamp(value: number, minimum: number, maximum: number): number {
   return Math.min(maximum, Math.max(minimum, value));
+}
+
+function isFullyProtected(position: PositionState): boolean {
+  return position.tradeState === "PROTECTED_WINNER" ||
+    position.tradeState === "PROTECTED_RECOVERED";
+}
+
+function isRecoveryManaged(position: PositionState): boolean {
+  return position.tradeState === "OPEN_UNPROTECTED" ||
+    position.tradeState === "PROTECTED_SOFT";
 }

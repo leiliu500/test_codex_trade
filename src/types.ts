@@ -252,7 +252,11 @@ export interface PositionState {
   underlyingEntryPrice?: number;
   invalidSince?: number;
   /** Broker-confirmed trade state. Order submission never changes quantity. */
-  tradeState: "OPEN_UNPROTECTED" | "PROTECTED_WINNER" | "PROTECTED_RECOVERED";
+  tradeState:
+    | "OPEN_UNPROTECTED"
+    | "PROTECTED_SOFT"
+    | "PROTECTED_WINNER"
+    | "PROTECTED_RECOVERED";
   /** Conservative, bid-based liquidation P&L after modeled execution error. */
   executablePnl: number;
   highWaterPnl: number;
@@ -267,6 +271,9 @@ export interface PositionState {
   lastReversalFeatureTimestamp?: number;
   zeroCrossings: number;
   previousPnlSign: -1 | 0 | 1;
+  /** Observation count at the first executable soft-activation touch. */
+  softProtectionCandidateObservationCount?: number;
+  softProtectionActivatedAt?: number;
   protectionActivatedAt?: number;
   pnlObservationCount: number;
   estimatedRecoveryProbability?: number;
