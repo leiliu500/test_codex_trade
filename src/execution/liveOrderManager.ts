@@ -1016,7 +1016,16 @@ function validatedUnifiedPosition(position: PositionState): PositionState {
        !(Number.isInteger(position.softProtectionCandidateObservationCount) &&
          position.softProtectionCandidateObservationCount >= 0)) ||
       (position.softProtectionActivatedAt !== undefined &&
-       !Number.isFinite(position.softProtectionActivatedAt))) {
+       !Number.isFinite(position.softProtectionActivatedAt)) ||
+      (position.softFloorBreachStartedAt !== undefined &&
+       !Number.isFinite(position.softFloorBreachStartedAt)) ||
+      (position.softFloorBreachCandidateObservationCount !== undefined &&
+       !(Number.isInteger(position.softFloorBreachCandidateObservationCount) &&
+         position.softFloorBreachCandidateObservationCount >= 0 &&
+         position.softFloorBreachCandidateObservationCount <=
+           position.pnlObservationCount)) ||
+      ((position.softFloorBreachStartedAt === undefined) !==
+       (position.softFloorBreachCandidateObservationCount === undefined))) {
     throw new Error("Restored position contains an invalid soft-protection state");
   }
   return { ...position };

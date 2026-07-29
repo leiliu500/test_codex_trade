@@ -80,12 +80,45 @@ export class ExitManager {
       if (executablePnl <= -riskBudget || liquidationPrice! <= position.stopPrice) {
         trigger("HARD_LOSS_BOUNDARY");
       }
-      if ((position.tradeState === "PROTECTED_SOFT" ||
-           position.tradeState === "PROTECTED_WINNER" ||
-           position.tradeState === "PROTECTED_RECOVERED") &&
-          position.protectedFloorPnl !== undefined &&
-          executablePnl <= position.protectedFloorPnl) {
-        trigger("PROFIT_FLOOR_BREACH");
+      if (position.tradeState === "PROTECTED_SOFT" &&
+          position.protectedFloorPnl !== undefined) {
+        if (executablePnl > position.protectedFloorPnl) {
+          delete position.softFloorBreachStartedAt;
+          delete position.softFloorBreachCandidateObservationCount;
+        } else if (
+          executablePnl <= -this.#config.risk.softProtectionEmergencyLossDollars
+        ) {
+          trigger("PROFIT_FLOOR_BREACH");
+        } else {
+          if (position.softFloorBreachStartedAt === undefined ||
+              position.softFloorBreachCandidateObservationCount === undefined) {
+            position.softFloorBreachStartedAt = context.timestamp;
+            position.softFloorBreachCandidateObservationCount =
+              position.pnlObservationCount;
+          }
+          const breachObservations = 1 + Math.max(
+            0,
+            position.pnlObservationCount -
+              position.softFloorBreachCandidateObservationCount,
+          );
+          if (
+            context.timestamp - position.softFloorBreachStartedAt >=
+              this.#config.risk.softFloorBreachConfirmationMs &&
+            breachObservations >=
+              this.#config.risk.softFloorBreachMinimumObservations
+          ) {
+            trigger("PROFIT_FLOOR_BREACH");
+          }
+        }
+      } else {
+        delete position.softFloorBreachStartedAt;
+        delete position.softFloorBreachCandidateObservationCount;
+        if ((position.tradeState === "PROTECTED_WINNER" ||
+             position.tradeState === "PROTECTED_RECOVERED") &&
+            position.protectedFloorPnl !== undefined &&
+            executablePnl <= position.protectedFloorPnl) {
+          trigger("PROFIT_FLOOR_BREACH");
+        }
       }
     }
 
