@@ -154,7 +154,7 @@ export class ExitManager {
     }
 
     let greeksContinuationFired = false;
-    if (quote && context.optionSnapshot) {
+    if (quote) {
       const continuation = estimateOptionContinuation(
         position,
         quote,
@@ -228,6 +228,8 @@ export class ExitManager {
         greeksContinuationFired,
         maxHoldFired,
         recoveryDeadlineFired,
+        quoteStale,
+        quoteInvalid,
       }),
       triggers,
       mark,
@@ -285,14 +287,16 @@ function reasonForTrigger(
     greeksContinuationFired: boolean;
     maxHoldFired: boolean;
     recoveryDeadlineFired: boolean;
+    quoteStale: boolean;
+    quoteInvalid: boolean;
   },
 ): ExitReason {
   switch (trigger) {
     case "BROKER_OR_POSITION_RISK":
       if (context.killSwitch) return "KILL_SWITCH";
       if (context.brokerStateReliable === false) return "BROKER_OR_POSITION_RISK";
-      if (!context.optionQuote ||
-          context.timestamp - context.optionQuote.timestamp > 0) return "STALE_DATA";
+      if (flags.quoteStale) return "STALE_DATA";
+      if (flags.quoteInvalid) return "BROKER_OR_POSITION_RISK";
       return "BROKER_OR_POSITION_RISK";
     case "FORCED_TIME_EXIT": return "FORCED_SESSION_EXIT";
     case "HARD_LOSS_BOUNDARY": return "HARD_STOP";

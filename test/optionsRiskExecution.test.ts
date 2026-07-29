@@ -239,6 +239,51 @@ test("exit manager enforces emergency precedence and protects a strong winner", 
   assert.equal(manager.evaluate({ timestamp: entry + 11_000, position, killSwitch: false }).reason, "STALE_DATA");
 });
 
+test("exit manager distinguishes a fresh invalid quote from genuinely stale data", () => {
+  const manager = new ExitManager(defaultConfig);
+  const entry = zonedDateTimeToEpoch("2026-07-22", "11:00:00");
+  const position = unifiedPosition(entry);
+  const validQuote = {
+    symbol: position.symbol,
+    timestamp: entry,
+    bidPrice: 1.99,
+    askPrice: 2.01,
+    bidSize: 10,
+    askSize: 10,
+  };
+  const fresh = manager.evaluate({
+    timestamp: entry + 57,
+    position,
+    optionQuote: validQuote,
+    killSwitch: false,
+  });
+  assert.equal(fresh.exit, false);
+  assert.equal(fresh.reason, undefined);
+
+  const locked = manager.evaluate({
+    timestamp: entry + 57,
+    position,
+    optionQuote: {
+      ...validQuote,
+      timestamp: entry + 50,
+      bidPrice: 1.94,
+      askPrice: 1.94,
+    },
+    killSwitch: false,
+  });
+  assert.equal(locked.exit, true);
+  assert.equal(locked.reason, "BROKER_OR_POSITION_RISK");
+  assert.ok(locked.triggers?.includes("BROKER_OR_POSITION_RISK"));
+
+  const stale = manager.evaluate({
+    timestamp: entry + defaultConfig.risk.staleDataEmergencySec * 1_000 + 1,
+    position,
+    optionQuote: validQuote,
+    killSwitch: false,
+  });
+  assert.equal(stale.reason, "STALE_DATA");
+});
+
 test("opposite regimes and 8-second trend invalidation exit", () => {
   const manager = new ExitManager(defaultConfig);
   const entry = zonedDateTimeToEpoch("2026-07-22", "11:00:00");
@@ -320,6 +365,59 @@ test("unified trade state uses executable bid P&L and distinguishes recovered fr
     askSize: 10,
   }, timestamp + 2_000).position;
   assert.equal(recovered.tradeState, "PROTECTED_RECOVERED");
+});
+
+test("trade-state observations and reversal CUSUM advance only on new market evidence", () => {
+  const timestamp = zonedDateTimeToEpoch("2026-07-22", "11:00:00");
+  const estimator = new TradeStateEstimator(defaultConfig);
+  let position = new RiskManager(defaultConfig).createFilledPosition(
+    "SPY260722C00500000", "BULLISH", 1, 2, timestamp, 500,
+  );
+  const feature = {
+    timestamp: timestamp + 1_000,
+    fast: { normalizedSlope: -1 },
+  } as unknown as FeatureSnapshot;
+  const first = estimator.estimate(position, {
+    symbol: position.symbol,
+    timestamp: timestamp + 1_000,
+    bidPrice: 1.98,
+    askPrice: 2,
+    bidSize: 10,
+    askSize: 10,
+  }, timestamp + 1_000, feature);
+  position = first.position;
+  assert.equal(position.pnlObservationCount, 1);
+  assert.ok(position.reversalCusum > 0);
+  const firstCusum = position.reversalCusum;
+  const firstPnlTimestamp = position.lastPnlTimestamp;
+
+  const duplicate = estimator.estimate(position, {
+    symbol: position.symbol,
+    timestamp: timestamp + 1_100,
+    bidPrice: 1.98,
+    askPrice: 2,
+    bidSize: 12,
+    askSize: 12,
+  }, timestamp + 1_100, feature);
+  position = duplicate.position;
+  assert.equal(position.pnlObservationCount, 1);
+  assert.equal(position.lastPnlTimestamp, firstPnlTimestamp);
+  assert.equal(position.reversalCusum, firstCusum);
+
+  const later = estimator.estimate(position, {
+    symbol: position.symbol,
+    timestamp: timestamp + 2_000,
+    bidPrice: 1.97,
+    askPrice: 1.99,
+    bidSize: 10,
+    askSize: 10,
+  }, timestamp + 2_000, {
+    ...feature,
+    timestamp: timestamp + 2_000,
+  });
+  assert.equal(later.position.pnlObservationCount, 2);
+  assert.equal(later.position.lastPnlTimestamp, timestamp + 2_000);
+  assert.ok(later.position.reversalCusum > firstCusum);
 });
 
 test("winner protection never lowers an established executable profit floor", () => {
@@ -511,6 +609,46 @@ test("positive delta/gamma continuation lets a strong direct winner run", () => 
   assert.ok(decision.continuationLcbDollars! > 0);
 });
 
+test("continuation metrics use deterministic modeled Greeks when snapshots contain only volume", () => {
+  const config = structuredClone(defaultConfig);
+  config.risk.recoveryProbabilityMinAgeSec = 60;
+  config.risk.greeksExitGraceSec = 0;
+  const timestamp = zonedDateTimeToEpoch("2026-07-22", "11:00:00");
+  const position = new RiskManager(config).createFilledPosition(
+    "SPY260722C00500000", "BULLISH", 1, 2, timestamp, 500,
+  );
+  const feature = {
+    symbol: "SPY",
+    timestamp: timestamp + 1_000,
+    price: 500.05,
+    fast: {
+      normalizedSlope: 1,
+      windowSec: 10,
+      realizedVolatilityBps: 0.2,
+      regression: { slopeBpsPerSec: 0 },
+    },
+    medium: { normalizedSlope: 1 },
+    vwap: { sessionVwap: 499 },
+  } as unknown as FeatureSnapshot;
+  const decision = new ExitManager(config).evaluate({
+    ...exitContext(position, timestamp + 1_000, 2.02),
+    feature,
+    optionSnapshot: {
+      symbol: position.symbol,
+      timestamp: timestamp + 1_000,
+      dailyVolume: 1_000,
+    },
+  });
+  assert.equal(decision.exit, false);
+  assert.ok(decision.updatedPosition.optionContinuation);
+  assert.ok(Number.isFinite(decision.continuationLcbDollars));
+  assert.ok(decision.continuationLcbDollars! < 0);
+  assert.ok(Number.isFinite(decision.updatedPosition.optionContinuation!.deltaDollars));
+  assert.ok(Number.isFinite(decision.updatedPosition.optionContinuation!.gammaDollars));
+  assert.ok(Number.isFinite(decision.updatedPosition.optionContinuation!.thetaDollars));
+  assert.ok(Number.isFinite(decision.updatedPosition.optionContinuation!.vegaDollars));
+});
+
 test("protected trades exit on adverse SPY reversal CUSUM before the hard floor", () => {
   const config = structuredClone(defaultConfig);
   config.risk.reversalCusumThreshold = 0.5;
@@ -522,6 +660,7 @@ test("protected trades exit on adverse SPY reversal CUSUM before the hard floor"
   );
   position = manager.evaluate(exitContext(position, timestamp + 1_000, 2.20)).updatedPosition;
   const adverseFeature = {
+    timestamp: timestamp + 2_000,
     price: 500.01,
     fast: { normalizedSlope: -1 },
     medium: { normalizedSlope: 1 },
