@@ -63,6 +63,8 @@ export function morningEntryGuardAudit(
     minProjectedMoveBps: config.signals.morningEntryGuard.minProjectedMoveBps,
     minCostMarginBps: config.signals.morningEntryGuard.minCostMarginBps,
     maxOptionSpreadPct: config.signals.morningEntryGuard.maxOptionSpreadPct,
+    ofiConflictRequiresFollowThrough:
+      config.signals.morningEntryGuard.ofiConflictRequiresFollowThrough,
     followThrough: config.signals.entryConfirmationMode === "ENFORCE"
       ? config.signals.followThroughScope
       : "DISABLED",

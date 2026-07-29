@@ -3,7 +3,9 @@ import type { Direction, FeatureSnapshot, RegimeDecision, SignalVote, TradeSigna
 import { inSessionWindow, parseClock, secondsSinceMidnight } from "../utils/time.js";
 import { hashString, stableStringify } from "../utils/statistics.js";
 import { boundedProjectionBps } from "./projection.js";
-import { activeStaticEntryGuard, lateEntryGuardActive } from "./lateEntryGuard.js";
+import {
+  activeStaticEntryGuard, lateEntryGuardActive, morningEntryGuardActive,
+} from "./lateEntryGuard.js";
 
 export interface SignalDirectionEvaluation {
   direction: Direction;
@@ -32,7 +34,7 @@ interface PendingFollowThrough {
   entryReferencePrice: number;
   entryNoiseFloorBps: number;
   maxSec: number;
-  reasonPrefix: "" | "LATE_ENTRY_";
+  reasonPrefix: "" | "MORNING_ENTRY_" | "LATE_ENTRY_";
 }
 
 interface FollowThroughRequirement {
@@ -40,7 +42,7 @@ interface FollowThroughRequirement {
   maxSec: number;
   minimumBps: number;
   noiseMultiplier: number;
-  reasonPrefix: "" | "LATE_ENTRY_";
+  reasonPrefix: "" | "MORNING_ENTRY_" | "LATE_ENTRY_";
 }
 
 export class SignalEngine {
@@ -196,6 +198,19 @@ export class SignalEngine {
   }
 
   #followThroughRequirement(signal: TradeSignal): FollowThroughRequirement | undefined {
+    if (morningEntryGuardActive(this.#config, signal.timestamp) &&
+        this.#config.signals.entryConfirmationMode === "ENFORCE" &&
+        this.#config.signals.morningEntryGuard.ofiConflictRequiresFollowThrough &&
+        signal.kind === "IMPULSE" &&
+        hasDirectionalOfiConflict(signal)) {
+      return {
+        minSec: this.#config.signals.followThroughMinSec,
+        maxSec: this.#config.signals.followThroughMaxSec,
+        minimumBps: this.#config.signals.followThroughMinimumBps,
+        noiseMultiplier: this.#config.signals.followThroughNoiseMultiplier,
+        reasonPrefix: "MORNING_ENTRY_",
+      };
+    }
     if (lateEntryGuardActive(this.#config, signal.timestamp)) {
       const guard = this.#config.signals.lateEntryGuard;
       if (signal.direction === "BEARISH" && signal.kind === "GRIND" &&
@@ -364,4 +379,10 @@ export class SignalEngine {
     const id = `sig-${feature.timestamp}-${hashString(stableStringify({ direction, kind, price: feature.price }))}`;
     return { id, timestamp: feature.timestamp, direction, kind, regime: regime.regime, projectedMoveBps, votes, reasons, featureSnapshot: feature };
   }
+}
+
+function hasDirectionalOfiConflict(signal: TradeSignal): boolean {
+  const direction = signal.direction === "BULLISH" ? 1 : -1;
+  return direction * signal.featureSnapshot.ofi5 > 0 &&
+    direction * signal.featureSnapshot.ofi15 < 0;
 }

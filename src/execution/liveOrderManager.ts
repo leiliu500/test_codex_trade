@@ -42,6 +42,7 @@ export type TradeLifecycleState =
   | "FLAT"
   | "ENTRY_PENDING"
   | "OPEN_UNPROTECTED"
+  | "PROTECTED_SOFT"
   | "PROTECTED_WINNER"
   | "PROTECTED_RECOVERED"
   | "EXIT_PENDING"
@@ -990,7 +991,12 @@ function maximumEntryPremium(
 }
 
 function validatedUnifiedPosition(position: PositionState): PositionState {
-  if (!["OPEN_UNPROTECTED", "PROTECTED_WINNER", "PROTECTED_RECOVERED"].includes(position.tradeState) ||
+  if (![
+    "OPEN_UNPROTECTED",
+    "PROTECTED_SOFT",
+    "PROTECTED_WINNER",
+    "PROTECTED_RECOVERED",
+  ].includes(position.tradeState) ||
       ![
         position.executablePnl,
         position.highWaterPnl,
@@ -1005,6 +1011,13 @@ function validatedUnifiedPosition(position: PositionState): PositionState {
         position.pnlObservationCount,
       ].every(Number.isFinite)) {
     throw new Error("Restored position does not contain a complete unified order-management state");
+  }
+  if ((position.softProtectionCandidateObservationCount !== undefined &&
+       !(Number.isInteger(position.softProtectionCandidateObservationCount) &&
+         position.softProtectionCandidateObservationCount >= 0)) ||
+      (position.softProtectionActivatedAt !== undefined &&
+       !Number.isFinite(position.softProtectionActivatedAt))) {
+    throw new Error("Restored position contains an invalid soft-protection state");
   }
   return { ...position };
 }

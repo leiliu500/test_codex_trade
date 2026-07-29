@@ -75,6 +75,7 @@ export interface EngineConfig {
       minProjectedMoveBps: number;
       minCostMarginBps: number;
       maxOptionSpreadPct: number;
+      ofiConflictRequiresFollowThrough: boolean;
     };
     lateEntryGuard: {
       mode: LateEntryGuardMode;
@@ -155,6 +156,11 @@ export interface EngineConfig {
     trendInvalidationGraceSec: number;
     staleDataEmergencySec: number;
     onePositionAtATime: boolean;
+    softProtectionActivationDollars: number;
+    softProtectionConfirmationObservations: number;
+    softProtectionRetentionRatio: number;
+    softProtectionMinimumFloorDollars: number;
+    softProtectionMaximumFloorDollars: number;
     minimumProfitFloorDollars: number;
     directWinnerActivationDollars: number;
     recoveredActivationDollars: number;
@@ -212,6 +218,7 @@ export function validateConfig(config: EngineConfig): void {
     config.execution.exitLimitSpreadFraction,
     config.execution.adverseFillSpreadFraction,
     config.execution.exitPriceCollarPct,
+    config.risk.softProtectionRetentionRatio,
     config.risk.profitRetentionBase,
     config.risk.profitRetentionMax,
     config.risk.recoveredRetentionBonus,
@@ -299,7 +306,8 @@ export function validateConfig(config: EngineConfig): void {
   if (!(config.signals.morningEntryGuard.minProjectedMoveBps > 0 &&
         config.signals.morningEntryGuard.minCostMarginBps >= 0 &&
         config.signals.morningEntryGuard.maxOptionSpreadPct > 0 &&
-        config.signals.morningEntryGuard.maxOptionSpreadPct <= config.dataQuality.maxOptionSpreadPct)) {
+        config.signals.morningEntryGuard.maxOptionSpreadPct <= config.dataQuality.maxOptionSpreadPct &&
+        typeof config.signals.morningEntryGuard.ofiConflictRequiresFollowThrough === "boolean")) {
     throw new Error("Morning-entry guard thresholds are invalid");
   }
   if (!(Number.isInteger(config.signals.lateEntryGuard.maxDailyEntries) &&
@@ -331,7 +339,18 @@ export function validateConfig(config: EngineConfig): void {
         config.execution.exitMarketableOffsetTicks >= 0)) {
     throw new Error("Order-management TTL and marketable-offset settings are invalid");
   }
-  if (!(config.risk.minimumProfitFloorDollars >= 0 &&
+  if (!(config.risk.softProtectionActivationDollars > 0 &&
+        config.risk.softProtectionActivationDollars <
+        config.risk.directWinnerActivationDollars &&
+        Number.isInteger(config.risk.softProtectionConfirmationObservations) &&
+        config.risk.softProtectionConfirmationObservations >= 1 &&
+        config.risk.softProtectionRetentionRatio > 0 &&
+        config.risk.softProtectionMinimumFloorDollars >= 0 &&
+        config.risk.softProtectionMaximumFloorDollars >=
+          config.risk.softProtectionMinimumFloorDollars &&
+        config.risk.softProtectionMaximumFloorDollars <=
+          config.risk.minimumProfitFloorDollars &&
+        config.risk.minimumProfitFloorDollars >= 0 &&
         config.risk.directWinnerActivationDollars >= config.risk.minimumProfitFloorDollars &&
         config.risk.recoveredActivationDollars >= config.risk.directWinnerActivationDollars &&
         config.risk.meaningfulAdverseExcursionDollars >= 0 &&

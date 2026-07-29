@@ -70,9 +70,27 @@ test("configuration cannot enable later-dated or overnight option trading", () =
   invalidMorningSpread.signals.morningEntryGuard.maxOptionSpreadPct =
     defaultConfig.dataQuality.maxOptionSpreadPct + 0.01;
   assert.throws(() => validateConfig(invalidMorningSpread), /Morning-entry guard thresholds/);
+  const invalidMorningOfiConfirmation = structuredClone(defaultConfig);
+  invalidMorningOfiConfirmation.signals.morningEntryGuard.ofiConflictRequiresFollowThrough =
+    "true" as unknown as boolean;
+  assert.throws(() => validateConfig(invalidMorningOfiConfirmation), /Morning-entry guard thresholds/);
   const multipleContracts = structuredClone(defaultConfig);
   multipleContracts.risk.maxContracts = 2;
   assert.throws(() => validateConfig(multipleContracts), /exactly one option contract/);
+  const invalidSoftActivation = structuredClone(defaultConfig);
+  invalidSoftActivation.risk.softProtectionActivationDollars =
+    invalidSoftActivation.risk.directWinnerActivationDollars;
+  assert.throws(() => validateConfig(invalidSoftActivation), /stopping-controller/);
+  const invalidSoftConfirmation = structuredClone(defaultConfig);
+  invalidSoftConfirmation.risk.softProtectionConfirmationObservations = 0;
+  assert.throws(() => validateConfig(invalidSoftConfirmation), /stopping-controller/);
+  const invalidSoftRetention = structuredClone(defaultConfig);
+  invalidSoftRetention.risk.softProtectionRetentionRatio = 0;
+  assert.throws(() => validateConfig(invalidSoftRetention), /stopping-controller/);
+  const invalidSoftFloor = structuredClone(defaultConfig);
+  invalidSoftFloor.risk.softProtectionMaximumFloorDollars =
+    invalidSoftFloor.risk.minimumProfitFloorDollars + 1;
+  assert.throws(() => validateConfig(invalidSoftFloor), /stopping-controller/);
 });
 
 test("Black-Scholes values/Greeks and IV bisection are internally consistent", () => {
@@ -442,6 +460,119 @@ test("winner protection never lowers an established executable profit floor", ()
   const newHigh = manager.evaluate(exitContext(position, timestamp + 3_000, 3.20));
   assert.equal(newHigh.exit, false);
   assert.ok(newHigh.updatedPosition.protectedFloorPnl! >= position.protectedFloorPnl!);
+});
+
+test("soft protection resets failed touches and exits a confirmed small winner at its buffered floor", () => {
+  const timestamp = zonedDateTimeToEpoch("2026-07-29", "10:54:32");
+  const manager = new ExitManager(defaultConfig);
+  let position = unifiedPosition(timestamp);
+
+  let decision = manager.evaluate(exitContext(position, timestamp + 1_000, 2.0525));
+  assert.equal(decision.exit, false);
+  assert.equal(decision.updatedPosition.tradeState, "OPEN_UNPROTECTED");
+  assert.equal(
+    decision.updatedPosition.softProtectionCandidateObservationCount,
+    decision.updatedPosition.pnlObservationCount,
+  );
+  position = decision.updatedPosition;
+
+  decision = manager.evaluate(exitContext(position, timestamp + 2_000, 2.04));
+  assert.equal(decision.updatedPosition.tradeState, "OPEN_UNPROTECTED");
+  assert.equal(
+    decision.updatedPosition.softProtectionCandidateObservationCount,
+    undefined,
+  );
+  position = decision.updatedPosition;
+
+  decision = manager.evaluate(exitContext(position, timestamp + 3_000, 2.0475));
+  assert.equal(decision.updatedPosition.tradeState, "OPEN_UNPROTECTED");
+  position = decision.updatedPosition;
+
+  decision = manager.evaluate(exitContext(position, timestamp + 4_000, 2.0525));
+  assert.equal(decision.updatedPosition.tradeState, "OPEN_UNPROTECTED");
+  position = decision.updatedPosition;
+
+  decision = manager.evaluate(exitContext(position, timestamp + 5_000, 2.0625));
+  assert.equal(decision.exit, false);
+  assert.equal(decision.updatedPosition.tradeState, "PROTECTED_SOFT");
+  assert.ok(Math.abs(
+    decision.updatedPosition.protectedFloorPnl! -
+      decision.updatedPosition.highWaterPnl *
+        defaultConfig.risk.softProtectionRetentionRatio,
+  ) < 1e-9);
+  assert.ok(decision.updatedPosition.highWaterPnl < defaultConfig.risk.directWinnerActivationDollars);
+  position = decision.updatedPosition;
+
+  decision = manager.evaluate(exitContext(position, timestamp + 6_000, 2.025));
+  assert.equal(decision.exit, false);
+  assert.ok(decision.executablePnl! > decision.protectedFloorPnl!);
+  position = decision.updatedPosition;
+
+  decision = manager.evaluate(exitContext(position, timestamp + 7_000, 2.02));
+  assert.equal(decision.exit, true);
+  assert.equal(decision.reason, "PROFIT_FLOOR_EXIT");
+  assert.ok(decision.executablePnl! > 0);
+});
+
+test("buffered soft protection preserves the July 29 $14.75 winner path", () => {
+  const timestamp = zonedDateTimeToEpoch("2026-07-29", "11:05:14");
+  const manager = new ExitManager(defaultConfig);
+  let position = unifiedPosition(timestamp);
+
+  // The observed winner first touched +$3.75, then pulled back below zero.
+  // That failed touch must reset instead of arming a stale protection latch.
+  for (const [offsetMs, mid] of [
+    [1_000, 2.0525],
+    [2_000, 2.04],
+    [3_000, 2.01],
+  ] as const) {
+    const decision = manager.evaluate(exitContext(position, timestamp + offsetMs, mid));
+    assert.equal(decision.exit, false);
+    position = decision.updatedPosition;
+  }
+  assert.equal(position.tradeState, "OPEN_UNPROTECTED");
+  assert.equal(position.softProtectionCandidateObservationCount, undefined);
+
+  // Its sustained advance confirmed soft protection, peaked at +$7.75, and
+  // retraced to +$2.50 before continuing. The capped floor must leave it alive.
+  for (const [offsetMs, mid] of [
+    [4_000, 2.0525],
+    [5_000, 2.0625],
+    [6_000, 2.0725],
+    [7_000, 2.0925],
+    [8_000, 2.04],
+  ] as const) {
+    const decision = manager.evaluate(exitContext(position, timestamp + offsetMs, mid));
+    assert.equal(decision.exit, false);
+    position = decision.updatedPosition;
+  }
+  assert.equal(position.tradeState, "PROTECTED_SOFT");
+  assert.ok(position.protectedFloorPnl! < 2);
+  assert.ok(position.executablePnl > position.protectedFloorPnl!);
+
+  const fullWinner = manager.evaluate(
+    exitContext(position, timestamp + 9_000, 2.1425),
+  );
+  assert.equal(fullWinner.exit, false);
+  assert.equal(fullWinner.updatedPosition.tradeState, "PROTECTED_WINNER");
+  assert.ok(
+    fullWinner.updatedPosition.protectedFloorPnl! >=
+      defaultConfig.risk.minimumProfitFloorDollars,
+  );
+});
+
+test("soft protection does not arm reversal CUSUM exits before full confirmation", () => {
+  const timestamp = zonedDateTimeToEpoch("2026-07-29", "11:05:14");
+  const manager = new ExitManager(defaultConfig);
+  const position = unifiedPosition(timestamp, {
+    tradeState: "PROTECTED_SOFT",
+    executablePnl: 4,
+    highWaterPnl: 5,
+    reversalCusum: defaultConfig.risk.reversalCusumThreshold + 10,
+  });
+  const decision = manager.evaluate(exitContext(position, timestamp + 1_000, 2.04));
+  assert.equal(decision.exit, false);
+  assert.equal(decision.updatedPosition.tradeState, "PROTECTED_SOFT");
 });
 
 test("bad entries exit on path-implied recovery probability before the hard-loss boundary", () => {

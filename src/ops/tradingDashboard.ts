@@ -1200,6 +1200,15 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
     const entryTimestamp = numberValue(event.data.entryTimestamp);
     if (entryTimestamp !== undefined && entryTimestamp !== trade.entryTimestamp) return;
     Object.assign(trade, orderManagementFields(event.data));
+    for (const field of [
+      "protectedFloorPnl",
+      "floorBufferDollars",
+      "recoveryProbability",
+      "continuationLcbDollars",
+      "optionContinuation",
+    ] as const) {
+      if (Object.hasOwn(event.data, field) && event.data[field] === null) delete trade[field];
+    }
   }
 
   #recordExitFill(event: AuditEvent): void {
@@ -1419,11 +1428,21 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
       if (previousPnl !== undefined && nextPnl !== undefined) next.pnlChange = nextPnl - previousPnl;
       updates.push(next);
     }
-    this.#orderCards.set(projected.id, {
+    const nextCard: DashboardOrderCard = {
       ...(existing ?? {}),
       ...projected,
       updates,
-    });
+    };
+    for (const field of [
+      "protectedFloorPnl",
+      "floorBufferDollars",
+      "recoveryProbability",
+      "continuationLcbDollars",
+      "optionContinuation",
+    ] as const) {
+      if (projected[field] === undefined) delete nextCard[field];
+    }
+    this.#orderCards.set(projected.id, nextCard);
     return !projected.active && (!existing || changed);
   }
 
@@ -1876,7 +1895,7 @@ export function tradingDashboardHtml(): string {
 <div class="card"><div class="muted">Open Trades</div><div class="value" id="openTrades">0</div></div>
 <div class="card"><div class="muted">Option Subs</div><div class="value" id="subscriptions">0</div></div>
 </section>
-<section class="panel"><h2>Orders</h2><div class="section-note">Cards show broker execution plus the order manager lifecycle, direct/recovered protection state, executable P&amp;L, profit floor, recovery and continuation evidence, exit triggers, urgency, and retries. The complete timeline is stored in PostgreSQL for order-history restoration.</div><div id="orderCards" class="live-grid"><div class="empty">Waiting for an option order…</div></div></section>
+<section class="panel"><h2>Orders</h2><div class="section-note">Cards show broker execution plus the order manager lifecycle, buffered soft and full winner-protection states, executable P&amp;L, profit floor, recovery and continuation evidence, exit triggers, urgency, and retries. The complete timeline is stored in PostgreSQL for order-history restoration.</div><div id="orderCards" class="live-grid"><div class="empty">Waiting for an option order…</div></div></section>
 <section class="panel"><h2>Signal → Trade Funnel</h2><div class="section-note">A fired signal is not an order. Each row shows option selection, risk, and submission status explicitly.</div><table><thead><tr><th>Time</th><th>Direction</th><th>Kind</th><th>Regime</th><th>Projected</th><th>Option</th><th>Risk</th><th>Status</th><th>Reason</th></tr></thead><tbody id="signals"></tbody></table></section>
 <section class="panel"><h2>Potential Missed Entry Review</h2><div class="section-note">Hindsight diagnostic, not an automatic trade recommendation. A row appears only when directional gates produced NO SIGNAL and SPY subsequently moved at least ${MISSED_ENTRY_MOVE_THRESHOLD_BPS.toFixed(1)} bps in one direction over the ${MISSED_ENTRY_HORIZON_SEC}-second projection horizon. Consecutive rows are clustered for readability.</div><table><thead><tr><th>Evaluation</th><th>Direction</th><th>Regime</th><th>SPY Start</th><th>SPY +${MISSED_ENTRY_HORIZON_SEC}s</th><th>Forward Move</th><th>Failed Gates / Votes</th><th>Decision Reason</th></tr></thead><tbody id="potentialMissRows"></tbody></table></section>
 <section class="panel"><h2>Entry Gate Blocks</h2><div class="section-note">Counts every top-level reason that prevented an entry evaluation. This exposes global state failures such as incomplete opening-range recovery even when no hindsight row is created.</div><table><thead><tr><th>Gate / Reason</th><th>Blocked Evaluations</th><th>Share of Evaluations</th></tr></thead><tbody id="gateBlockRows"></tbody></table></section>

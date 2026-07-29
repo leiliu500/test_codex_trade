@@ -334,6 +334,34 @@ test("OPRA quote silence fails readiness and reconnects the option stream", asyn
   await runtime.close();
 });
 
+test("entry evaluation fails closed when the live stock feed is disconnected", async () => {
+  const client = new FakeRuntimeClient();
+  const stockStream = new FakeStockStream();
+  const recorder = new MemoryRecorder();
+  const runtime = new SpyOptionsTradingRuntime({
+    config: immediateRuntimeConfig,
+    client,
+    stockStream,
+    optionStream: new FakeOptionStream(),
+    executionEnabled: true,
+    executionMode: "paper",
+    now: () => now,
+    executionTickMs: 60_000,
+    recorder,
+  });
+  await runtime.start();
+  stockStream.handlers?.onState?.(false);
+  assert.equal(runtime.healthState().ready, false);
+
+  await runtime.ingestFeature(bullishFeature());
+
+  const evaluation = recorder.events.find((event) => event.type === "live_entry_evaluation");
+  assert.equal(evaluation?.data.decision, "SKIPPED");
+  assert.deepEqual(evaluation?.data.reasons, ["STOCK_FEED_DISCONNECTED"]);
+  assert.equal(client.requests.length, 0);
+  await runtime.close();
+});
+
 test("end-to-end paper runtime arms SIP/OPRA and routes an eligible signal to a same-day SPY option order", async () => {
   const client = new FakeRuntimeClient();
   const stockStream = new FakeStockStream();
