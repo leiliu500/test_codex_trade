@@ -99,6 +99,13 @@ test("configuration cannot enable later-dated or overnight option trading", () =
   const invalidSoftConfirmation = structuredClone(defaultConfig);
   invalidSoftConfirmation.risk.softProtectionConfirmationObservations = 0;
   assert.throws(() => validateConfig(invalidSoftConfirmation), /stopping-controller/);
+  const invalidProfitRetention = structuredClone(defaultConfig);
+  invalidProfitRetention.risk.profitRetentionMax = 1.01;
+  assert.throws(() => validateConfig(invalidProfitRetention), /fraction outside/);
+  const invalidProtectedGreeksGrace = structuredClone(defaultConfig);
+  invalidProtectedGreeksGrace.risk.protectedGreeksExitGraceSec =
+    invalidProtectedGreeksGrace.risk.greeksExitGraceSec + 1;
+  assert.throws(() => validateConfig(invalidProtectedGreeksGrace), /stopping-controller/);
   const invalidSoftRetention = structuredClone(defaultConfig);
   invalidSoftRetention.risk.softProtectionRetentionRatio = 0;
   assert.throws(() => validateConfig(invalidSoftRetention), /stopping-controller/);
@@ -527,12 +534,12 @@ test("soft protection resets quote flicker and exits only a persistent buffered-
   assert.ok(decision.updatedPosition.highWaterPnl < defaultConfig.risk.directWinnerActivationDollars);
   position = decision.updatedPosition;
 
-  decision = manager.evaluate(exitContext(position, timestamp + 6_000, 2.025));
+  decision = manager.evaluate(exitContext(position, timestamp + 6_000, 2.03));
   assert.equal(decision.exit, false);
   assert.ok(decision.executablePnl! > decision.protectedFloorPnl!);
   position = decision.updatedPosition;
 
-  decision = manager.evaluate(exitContext(position, timestamp + 7_000, 2.02));
+  decision = manager.evaluate(exitContext(position, timestamp + 7_000, 2.025));
   assert.equal(decision.exit, false);
   assert.equal(
     decision.updatedPosition.softFloorBreachCandidateObservationCount,
@@ -540,7 +547,7 @@ test("soft protection resets quote flicker and exits only a persistent buffered-
   );
   position = decision.updatedPosition;
 
-  decision = manager.evaluate(exitContext(position, timestamp + 7_100, 2.025));
+  decision = manager.evaluate(exitContext(position, timestamp + 7_100, 2.03));
   assert.equal(decision.exit, false);
   assert.equal(decision.updatedPosition.softFloorBreachStartedAt, undefined);
   assert.equal(
@@ -549,15 +556,15 @@ test("soft protection resets quote flicker and exits only a persistent buffered-
   );
   position = decision.updatedPosition;
 
-  decision = manager.evaluate(exitContext(position, timestamp + 7_200, 2.02));
+  decision = manager.evaluate(exitContext(position, timestamp + 7_200, 2.025));
   assert.equal(decision.exit, false);
   position = decision.updatedPosition;
 
-  decision = manager.evaluate(exitContext(position, timestamp + 7_300, 2.0175));
+  decision = manager.evaluate(exitContext(position, timestamp + 7_300, 2.0225));
   assert.equal(decision.exit, false);
   position = decision.updatedPosition;
 
-  decision = manager.evaluate(exitContext(position, timestamp + 7_800, 2.0175));
+  decision = manager.evaluate(exitContext(position, timestamp + 7_800, 2.0225));
   assert.equal(decision.exit, true);
   assert.equal(decision.reason, "PROFIT_FLOOR_EXIT");
   assert.ok(decision.executablePnl! > 0);
@@ -646,6 +653,57 @@ test("soft protection preserves the newest July 29 winner through sub-500ms quot
   );
 });
 
+test("an unconfirmed pullback is not promoted into a stale giveback exit before recovery", () => {
+  const timestamp = zonedDateTimeToEpoch("2026-07-29", "11:05:14");
+  const manager = new ExitManager(defaultConfig);
+  let position = unifiedPosition(timestamp, {
+    executablePnl: 3.75,
+    highWaterPnl: 3.75,
+    lowWaterPnl: -2,
+    lastHighTimestamp: timestamp,
+    pnlObservationCount: 10,
+  });
+
+  let decision = manager.evaluate(exitContext(position, timestamp + 4_000, 2.02));
+  assert.equal(decision.exit, false);
+  assert.equal(decision.updatedPosition.tradeState, "OPEN_UNPROTECTED");
+  position = decision.updatedPosition;
+
+  decision = manager.evaluate(exitContext(position, timestamp + 5_000, 2.1425));
+  assert.equal(decision.exit, false);
+  assert.equal(decision.updatedPosition.tradeState, "PROTECTED_WINNER");
+});
+
+test("a capped soft floor keeps its buffer through the July 24 big-winner pullback", () => {
+  const timestamp = zonedDateTimeToEpoch("2026-07-24", "10:50:11");
+  const manager = new ExitManager(defaultConfig);
+  let position = unifiedPosition(timestamp, {
+    tradeState: "PROTECTED_SOFT",
+    executablePnl: 6.75,
+    highWaterPnl: 6.75,
+    protectedFloorPnl: defaultConfig.risk.softProtectionMaximumFloorDollars,
+    pnlObservationCount: 20,
+    lastHighTimestamp: timestamp,
+  });
+
+  let decision = manager.evaluate(exitContext(position, timestamp + 1_000, 2.0325));
+  assert.equal(decision.exit, false);
+  assert.equal(
+    decision.updatedPosition.softFloorBreachCandidateObservationCount,
+    decision.updatedPosition.pnlObservationCount,
+  );
+  position = decision.updatedPosition;
+
+  decision = manager.evaluate(exitContext(position, timestamp + 1_400, 2.05));
+  assert.equal(decision.exit, false);
+  assert.equal(decision.updatedPosition.softFloorBreachStartedAt, undefined);
+  position = decision.updatedPosition;
+
+  decision = manager.evaluate(exitContext(position, timestamp + 2_000, 2.1425));
+  assert.equal(decision.exit, false);
+  assert.equal(decision.updatedPosition.tradeState, "PROTECTED_WINNER");
+});
+
 test("soft protection keeps a separate immediate emergency-loss escape", () => {
   const timestamp = zonedDateTimeToEpoch("2026-07-29", "11:30:01");
   const manager = new ExitManager(defaultConfig);
@@ -698,7 +756,10 @@ test("buffered soft protection preserves the July 29 $14.75 winner path", () => 
     position = decision.updatedPosition;
   }
   assert.equal(position.tradeState, "PROTECTED_SOFT");
-  assert.ok(position.protectedFloorPnl! < 2);
+  assert.equal(
+    position.protectedFloorPnl,
+    defaultConfig.risk.softProtectionMaximumFloorDollars,
+  );
   assert.ok(position.executablePnl > position.protectedFloorPnl!);
 
   const fullWinner = manager.evaluate(
@@ -850,6 +911,64 @@ test("Greeks continuation exits IV crush and theta drag despite a still-valid SP
   });
   assert.equal(decision.reason, "GREEKS_CONTINUATION_LCB_NON_POSITIVE");
   assert.ok(decision.triggers?.includes("CONTINUATION_LCB_NON_POSITIVE"));
+});
+
+test("a protected winner confirms negative option continuation faster", () => {
+  const config = structuredClone(defaultConfig);
+  config.risk.greeksExitGraceSec = 5;
+  config.risk.protectedGreeksExitGraceSec = 0.5;
+  config.risk.recoveryProbabilityMinAgeSec = 60;
+  const timestamp = zonedDateTimeToEpoch("2026-07-31", "10:42:03");
+  const manager = new ExitManager(config);
+  let position = unifiedPosition(timestamp, {
+    symbol: "SPY260731C00740000",
+    tradeState: "PROTECTED_WINNER",
+    executablePnl: 15,
+    highWaterPnl: 20,
+    lastHighTimestamp: timestamp,
+    protectionActivatedAt: timestamp,
+    entryImpliedVolatility: 0.50,
+    lastImpliedVolatility: 0.50,
+    lastOptionSnapshotTimestamp: timestamp,
+    lastUnderlyingPrice: 500,
+    lastUnderlyingTimestamp: timestamp,
+  });
+  const feature = {
+    symbol: "SPY",
+    timestamp: timestamp + 1_000,
+    price: 500.01,
+    fast: {
+      normalizedSlope: 0.2,
+      windowSec: 10,
+      realizedVolatilityBps: 0,
+      regression: { slopeBpsPerSec: 0.01 },
+    },
+    medium: { normalizedSlope: 0.2 },
+    vwap: { sessionVwap: 499.99 },
+  } as unknown as FeatureSnapshot;
+  const snapshot = {
+    symbol: position.symbol,
+    timestamp: timestamp + 1_000,
+    impliedVolatility: 0.30,
+    greeks: { delta: 0.50, gamma: 0.01, theta: -1.5, vega: 0.10 },
+  };
+
+  let decision = manager.evaluate({
+    ...exitContext(position, timestamp + 1_000, 2.15),
+    feature,
+    optionSnapshot: snapshot,
+  });
+  assert.equal(decision.exit, false);
+  assert.ok(decision.continuationLcbDollars! < 0);
+  position = decision.updatedPosition;
+
+  decision = manager.evaluate({
+    ...exitContext(position, timestamp + 1_500, 2.15),
+    feature: { ...feature, timestamp: timestamp + 1_500 },
+    optionSnapshot: { ...snapshot, timestamp: timestamp + 1_500 },
+  });
+  assert.equal(decision.reason, "GREEKS_CONTINUATION_LCB_NON_POSITIVE");
+  assert.ok(decision.executablePnl! > decision.protectedFloorPnl!);
 });
 
 test("positive delta/gamma continuation lets a strong direct winner run", () => {

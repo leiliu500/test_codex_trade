@@ -155,11 +155,15 @@ export function estimateOptionContinuation(
     delete position.optionContinuationInvalidSince;
   }
   const invalidSince = position.optionContinuationInvalidSince;
+  const graceSec = position.tradeState === "PROTECTED_WINNER" ||
+      position.tradeState === "PROTECTED_RECOVERED"
+    ? config.risk.protectedGreeksExitGraceSec
+    : config.risk.greeksExitGraceSec;
   const exitReady = hasProviderGreeks &&
     lcbDollars <= 0 &&
     invalidSince !== undefined &&
     timestamp - invalidSince >=
-      config.risk.greeksExitGraceSec * 1000;
+      graceSec * 1000;
   return { position, estimate, exitReady };
 }
 

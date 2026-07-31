@@ -196,6 +196,7 @@ export interface EngineConfig {
     recoveryProbabilityGraceSec: number;
     optionSnapshotMaxAgeSec: number;
     greeksExitGraceSec: number;
+    protectedGreeksExitGraceSec: number;
     continuationConfidenceZ: number;
     continuationSpreadCostFraction: number;
     ivCrushThreshold: number;
@@ -391,7 +392,11 @@ export function validateConfig(config: EngineConfig): void {
         config.risk.meaningfulAdverseExcursionDollars >= 0 &&
         config.risk.recoveryDeadlineSec > 0 &&
         config.risk.stallSec > 0 &&
+        config.risk.profitRetentionBase >= 0 &&
         config.risk.profitRetentionBase <= config.risk.profitRetentionMax &&
+        config.risk.profitRetentionMax <= 1 &&
+        config.risk.recoveredRetentionBonus >= 0 &&
+        config.risk.timeRetentionBonus >= 0 &&
         config.risk.profitRetentionPeakScaleDollars > 0 &&
         config.risk.pnlEwmaHalfLifeSec > 0 &&
         config.risk.pnlNoiseMultiplier >= 0 &&
@@ -403,6 +408,8 @@ export function validateConfig(config: EngineConfig): void {
         config.risk.recoveryProbabilityGraceSec >= 0 &&
         config.risk.optionSnapshotMaxAgeSec > 0 &&
         config.risk.greeksExitGraceSec >= 0 &&
+        config.risk.protectedGreeksExitGraceSec >= 0 &&
+        config.risk.protectedGreeksExitGraceSec <= config.risk.greeksExitGraceSec &&
         config.risk.continuationConfidenceZ >= 0 &&
         config.risk.ivCrushThreshold >= 0)) {
     throw new Error("Unified stopping-controller settings are invalid");
