@@ -1,5 +1,5 @@
 {
-  "version": "spy-0dte-entry-confirmation-14-low-noise-bullish-reentry",
+  "version": "spy-0dte-entry-confirmation-16-protected-continuation-exit",
   "symbol": "SPY",
   "timeZone": "America/New_York",
   "session": {
@@ -162,7 +162,7 @@
     "softProtectionActivationDollars": 3,
     "softProtectionRecoveryActivationDollars": 2,
     "softProtectionConfirmationObservations": 2,
-    "softProtectionRetentionRatio": 0.15,
+    "softProtectionRetentionRatio": 0.30,
     "softProtectionMinimumFloorDollars": 0,
     "softProtectionMaximumFloorDollars": 2,
     "softFloorBreachConfirmationMs": 500,
@@ -188,6 +188,7 @@
     "recoveryProbabilityGraceSec": 8,
     "optionSnapshotMaxAgeSec": 120,
     "greeksExitGraceSec": 5,
+    "protectedGreeksExitGraceSec": 0.5,
     "continuationConfidenceZ": 1,
     "continuationSpreadCostFraction": 0.25,
     "ivCrushThreshold": 0.03
