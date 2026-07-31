@@ -403,6 +403,10 @@ test("end-to-end paper runtime arms SIP/OPRA and routes an eligible signal to a 
   assert.deepEqual(selection?.data.candidateQuote, { timestamp: now, bidPrice: 1.995, askPrice: 2.005 });
   assert.equal((evaluation?.data.morningEntryGuard as Record<string, unknown>).active, true);
   assert.equal((evaluation?.data.morningEntryGuard as Record<string, unknown>).followThrough, "DISABLED");
+  assert.equal(
+    (evaluation?.data.morningEntryGuard as Record<string, unknown>).bullishGrindRequiresUpRegime,
+    true,
+  );
   assert.equal((evaluation?.data.morningEntryBaseline as Record<string, unknown>).decision, "SIGNAL");
   assert.equal(typeof (selection?.data.candidateMetrics as Record<string, unknown> | undefined)?.spreadPct, "number");
   const orderRequest = recorder.events.find((event) => event.type === "broker_order_request");

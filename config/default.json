@@ -1,5 +1,5 @@
 {
-  "version": "spy-0dte-entry-confirmation-12-unified-order-management-9-all-morning-quality-gates",
+  "version": "spy-0dte-entry-confirmation-13-unified-order-management-9-morning-regime-gate",
   "symbol": "SPY",
   "timeZone": "America/New_York",
   "session": {
@@ -67,7 +67,8 @@
       "minProjectedMoveBps": 1.7,
       "minCostMarginBps": 1.0,
       "maxOptionSpreadPct": 0.0075,
-      "ofiConflictRequiresFollowThrough": true
+      "ofiConflictRequiresFollowThrough": true,
+      "bullishGrindRequiresUpRegime": true
     },
     "lateEntryGuard": {
       "mode": "ENFORCE",

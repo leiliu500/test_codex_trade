@@ -76,6 +76,7 @@ export interface EngineConfig {
       minCostMarginBps: number;
       maxOptionSpreadPct: number;
       ofiConflictRequiresFollowThrough: boolean;
+      bullishGrindRequiresUpRegime: boolean;
     };
     lateEntryGuard: {
       mode: LateEntryGuardMode;
@@ -310,7 +311,8 @@ export function validateConfig(config: EngineConfig): void {
         config.signals.morningEntryGuard.minCostMarginBps >= 0 &&
         config.signals.morningEntryGuard.maxOptionSpreadPct > 0 &&
         config.signals.morningEntryGuard.maxOptionSpreadPct <= config.dataQuality.maxOptionSpreadPct &&
-        typeof config.signals.morningEntryGuard.ofiConflictRequiresFollowThrough === "boolean")) {
+        typeof config.signals.morningEntryGuard.ofiConflictRequiresFollowThrough === "boolean" &&
+        typeof config.signals.morningEntryGuard.bullishGrindRequiresUpRegime === "boolean")) {
     throw new Error("Morning-entry guard thresholds are invalid");
   }
   if (!(Number.isInteger(config.signals.lateEntryGuard.maxDailyEntries) &&
