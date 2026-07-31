@@ -81,6 +81,10 @@ test("configuration cannot enable later-dated or overnight option trading", () =
   invalidSoftActivation.risk.softProtectionActivationDollars =
     invalidSoftActivation.risk.directWinnerActivationDollars;
   assert.throws(() => validateConfig(invalidSoftActivation), /stopping-controller/);
+  const invalidRecoverySoftActivation = structuredClone(defaultConfig);
+  invalidRecoverySoftActivation.risk.softProtectionRecoveryActivationDollars =
+    invalidRecoverySoftActivation.risk.softProtectionActivationDollars + 1;
+  assert.throws(() => validateConfig(invalidRecoverySoftActivation), /stopping-controller/);
   const invalidSoftConfirmation = structuredClone(defaultConfig);
   invalidSoftConfirmation.risk.softProtectionConfirmationObservations = 0;
   assert.throws(() => validateConfig(invalidSoftConfirmation), /stopping-controller/);
@@ -546,6 +550,49 @@ test("soft protection resets quote flicker and exits only a persistent buffered-
   assert.equal(decision.exit, true);
   assert.equal(decision.reason, "PROFIT_FLOOR_EXIT");
   assert.ok(decision.executablePnl! > 0);
+});
+
+test("recovery-specific soft protection arms earlier without tightening clean developing trades", () => {
+  const timestamp = zonedDateTimeToEpoch("2026-07-30", "11:23:00");
+  const manager = new ExitManager(defaultConfig);
+  let recovered = unifiedPosition(timestamp);
+
+  let decision = manager.evaluate(exitContext(recovered, timestamp + 1_000, 1.96));
+  assert.equal(decision.exit, false);
+  assert.ok(
+    decision.updatedPosition.lowWaterPnl <=
+      -defaultConfig.risk.meaningfulAdverseExcursionDollars,
+  );
+  recovered = decision.updatedPosition;
+
+  for (const [offsetMs, mid] of [
+    [2_000, 2.035],
+    [3_000, 2.0375],
+    [4_000, 2.04],
+  ] as const) {
+    decision = manager.evaluate(exitContext(recovered, timestamp + offsetMs, mid));
+    assert.equal(decision.exit, false);
+    recovered = decision.updatedPosition;
+  }
+  assert.equal(recovered.tradeState, "PROTECTED_SOFT");
+  assert.ok(recovered.highWaterPnl < defaultConfig.risk.softProtectionActivationDollars);
+
+  decision = manager.evaluate(exitContext(recovered, timestamp + 5_000, 2.01));
+  assert.equal(decision.exit, true);
+  assert.equal(decision.reason, "PROFIT_FLOOR_EXIT");
+
+  let clean = unifiedPosition(timestamp);
+  for (const [offsetMs, mid] of [
+    [2_000, 2.035],
+    [3_000, 2.0375],
+    [4_000, 2.04],
+  ] as const) {
+    decision = manager.evaluate(exitContext(clean, timestamp + offsetMs, mid));
+    assert.equal(decision.exit, false);
+    clean = decision.updatedPosition;
+  }
+  assert.equal(clean.tradeState, "OPEN_UNPROTECTED");
+  assert.equal(clean.softProtectionCandidateObservationCount, undefined);
 });
 
 test("soft protection preserves the newest July 29 winner through sub-500ms quote flicker", () => {
