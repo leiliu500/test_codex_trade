@@ -158,6 +158,7 @@ export interface EngineConfig {
     staleDataEmergencySec: number;
     onePositionAtATime: boolean;
     softProtectionActivationDollars: number;
+    softProtectionRecoveryActivationDollars: number;
     softProtectionConfirmationObservations: number;
     softProtectionRetentionRatio: number;
     softProtectionMinimumFloorDollars: number;
@@ -347,6 +348,9 @@ export function validateConfig(config: EngineConfig): void {
   if (!(config.risk.softProtectionActivationDollars > 0 &&
         config.risk.softProtectionActivationDollars <
         config.risk.directWinnerActivationDollars &&
+        config.risk.softProtectionRecoveryActivationDollars > 0 &&
+        config.risk.softProtectionRecoveryActivationDollars <=
+          config.risk.softProtectionActivationDollars &&
         Number.isInteger(config.risk.softProtectionConfirmationObservations) &&
         config.risk.softProtectionConfirmationObservations >= 1 &&
         config.risk.softProtectionRetentionRatio > 0 &&

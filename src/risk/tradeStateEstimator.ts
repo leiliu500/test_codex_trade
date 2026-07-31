@@ -83,10 +83,10 @@ export class TradeStateEstimator {
       position.lastReversalFeatureTimestamp = feature.timestamp;
     }
 
+    const meaningfulAdversePath =
+      position.lowWaterPnl <= -this.#config.risk.meaningfulAdverseExcursionDollars;
     const tradeState = position.tradeState;
     if (tradeState === "OPEN_UNPROTECTED" || tradeState === "PROTECTED_SOFT") {
-      const meaningfulAdversePath =
-        position.lowWaterPnl <= -this.#config.risk.meaningfulAdverseExcursionDollars;
       if (!meaningfulAdversePath &&
           executablePnl >= this.#config.risk.directWinnerActivationDollars) {
         position.tradeState = "PROTECTED_WINNER";
@@ -105,7 +105,10 @@ export class TradeStateEstimator {
     }
 
     if (position.tradeState === "OPEN_UNPROTECTED") {
-      if (executablePnl >= this.#config.risk.softProtectionActivationDollars) {
+      const softProtectionActivationDollars = meaningfulAdversePath
+        ? this.#config.risk.softProtectionRecoveryActivationDollars
+        : this.#config.risk.softProtectionActivationDollars;
+      if (executablePnl >= softProtectionActivationDollars) {
         if (position.softProtectionCandidateObservationCount === undefined) {
           position.softProtectionCandidateObservationCount = position.pnlObservationCount;
         }

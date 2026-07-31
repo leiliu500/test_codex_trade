@@ -1,5 +1,5 @@
 {
-  "version": "spy-0dte-entry-confirmation-13-unified-order-management-9-morning-regime-gate",
+  "version": "spy-0dte-entry-confirmation-13-unified-order-management-10-recovery-soft-protection",
   "symbol": "SPY",
   "timeZone": "America/New_York",
   "session": {
@@ -150,6 +150,7 @@
     "staleDataEmergencySec": 10,
     "onePositionAtATime": true,
     "softProtectionActivationDollars": 3,
+    "softProtectionRecoveryActivationDollars": 2,
     "softProtectionConfirmationObservations": 2,
     "softProtectionRetentionRatio": 0.15,
     "softProtectionMinimumFloorDollars": 0,
