@@ -424,6 +424,43 @@ test("late bearish persistence profiles retain qualified July 23 setup classes w
   assert.deepEqual(pendingStrongDown.reasons, ["LATE_ENTRY_FOLLOW_THROUGH_PENDING"]);
 });
 
+test("morning bullish grinds require an established up regime", () => {
+  const bullishBase = feature(1);
+  const bullishGrind: FeatureSnapshot = {
+    ...bullishBase,
+    timestamp: zonedDateTimeToEpoch("2026-07-22", "10:30:00"),
+    micropriceDisplacementBps: -0.1,
+    ofi5: 0,
+    fast: {
+      ...bullishBase.fast,
+      normalizedSlope: 0.1,
+      normalizedAcceleration: 0,
+    },
+    medium: { ...bullishBase.medium, normalizedSlope: 0.3 },
+    slow: { ...bullishBase.slow, normalizedSlope: 0.15 },
+  };
+  const unclassified: RegimeDecision = { regime: "UNCLASSIFIED", confidence: 0, reasons: [] };
+  const blockedBullish = new SignalEngine(immediateSignalConfig).evaluateDetailed(
+    bullishGrind,
+    unclassified,
+  );
+  assert.equal(blockedBullish.signal, undefined);
+  assert.ok(blockedBullish.directions.find((item) => item.direction === "BULLISH")?.reasons
+    .includes("MORNING_ENTRY_BULLISH_GRIND_REQUIRES_UP_REGIME"));
+  const strongUp: RegimeDecision = { regime: "STRONG_UP", confidence: 1, reasons: [] };
+  assert.equal(
+    new SignalEngine(immediateSignalConfig).evaluate(bullishGrind, strongUp)?.kind,
+    "GRIND",
+  );
+
+  const permissiveBullishConfig = structuredClone(immediateSignalConfig);
+  permissiveBullishConfig.signals.morningEntryGuard.bullishGrindRequiresUpRegime = false;
+  assert.equal(
+    new SignalEngine(permissiveBullishConfig).evaluate(bullishGrind, unclassified)?.kind,
+    "GRIND",
+  );
+});
+
 test("steady grind passes with acceleration near zero, but excessive adverse acceleration blocks", () => {
   const base = feature();
   const grindFeature: FeatureSnapshot = {

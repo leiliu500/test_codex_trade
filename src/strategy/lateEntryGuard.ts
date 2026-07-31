@@ -65,6 +65,8 @@ export function morningEntryGuardAudit(
     maxOptionSpreadPct: config.signals.morningEntryGuard.maxOptionSpreadPct,
     ofiConflictRequiresFollowThrough:
       config.signals.morningEntryGuard.ofiConflictRequiresFollowThrough,
+    bullishGrindRequiresUpRegime:
+      config.signals.morningEntryGuard.bullishGrindRequiresUpRegime,
     followThrough: config.signals.entryConfirmationMode === "ENFORCE"
       ? config.signals.followThroughScope
       : "DISABLED",

@@ -355,9 +355,19 @@ export class SignalEngine {
       s * (f.vwap.rollingVwapSlopeBpsPerSec ?? 0) > 0 &&
       s * f.fast.normalizedAcceleration >= this.#config.signals.grindNegativeAccelerationLimit &&
       s * f.ofi15 >= 0;
-    if (grind) return this.#makeSignal(direction, "GRIND", directionalProjection, votes, f, regime, [
-      "structural gate passed", "persistent medium/slow slope", "rolling VWAP and OFI aligned", "acceleration within adverse limit",
-    ]);
+    if (grind) {
+      if (morningEntryGuardActive(this.#config, f.timestamp)) {
+        const guard = this.#config.signals.morningEntryGuard;
+        if (direction === "BULLISH" && guard.bullishGrindRequiresUpRegime &&
+            regime.regime !== "STRONG_UP" && regime.regime !== "GRIND_UP") {
+          blockedReasons.push("MORNING_ENTRY_BULLISH_GRIND_REQUIRES_UP_REGIME");
+          return undefined;
+        }
+      }
+      return this.#makeSignal(direction, "GRIND", directionalProjection, votes, f, regime, [
+        "structural gate passed", "persistent medium/slow slope", "rolling VWAP and OFI aligned", "acceleration within adverse limit",
+      ]);
+    }
     if (!locationGate) blockedReasons.push("OPENING_RANGE_LOCATION_NOT_CONFIRMED");
     if (voteCount < this.#config.signals.impulseVotesRequired) {
       blockedReasons.push(`IMPULSE_VOTES_${voteCount}_OF_${this.#config.signals.impulseVotesRequired}`);
