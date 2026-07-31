@@ -369,6 +369,100 @@ test("morning bullish impulses and late-session entries require causal follow-th
     .includes("LATE_ENTRY_PROJECTED_MOVE_BELOW_MINIMUM"));
 });
 
+test("clean low-noise late bullish grinds can reenter without weakening ordinary confirmation", () => {
+  const base = feature(1);
+  const timestamp = zonedDateTimeToEpoch("2026-07-22", "12:12:46");
+  const {
+    bullishBreakoutTimestamp: _bullishBreakoutTimestamp,
+    ...openingRangeWithoutBullishBreakout
+  } = base.openingRange;
+  const cleanGrind: FeatureSnapshot = {
+    ...base,
+    timestamp,
+    micropriceDisplacementBps: -0.1,
+    openingRange: {
+      ...openingRangeWithoutBullishBreakout,
+      high: base.price + 1,
+      nearHigh: false,
+    },
+    fast: {
+      ...base.fast,
+      noiseFloorBps: 0.8,
+      normalizedSlope: 4.5,
+      normalizedAcceleration: 1,
+    },
+    medium: {
+      ...base.medium,
+      normalizedSlope: 3.1,
+      regression: { ...base.medium.regression, r2: 0.8 },
+    },
+    slow: { ...base.slow, normalizedSlope: 0.45 },
+  };
+  const unclassified: RegimeDecision = { regime: "UNCLASSIFIED", confidence: 0, reasons: [] };
+  const profile = defaultConfig.signals.lateEntryGuard.bullishLowNoiseGrind;
+  const engine = new SignalEngine(defaultConfig);
+  engine.recordEntry("BULLISH", timestamp - profile.reentryCooldownSec * 1000);
+  const reentry = engine.evaluateDetailed(cleanGrind, unclassified);
+  assert.equal(reentry.signal?.direction, "BULLISH");
+  assert.equal(reentry.signal?.kind, "GRIND");
+  assert.ok(reentry.signal?.reasons.includes("late low-noise bullish grind profile passed"));
+  assert.equal(reentry.signal?.reasons.some((reason) => reason.includes("follow-through")), false);
+
+  const noisyEngine = new SignalEngine(defaultConfig);
+  noisyEngine.recordEntry("BULLISH", timestamp - profile.reentryCooldownSec * 1000);
+  const noisy = noisyEngine.evaluateDetailed({
+    ...cleanGrind,
+    fast: {
+      ...cleanGrind.fast,
+      noiseFloorBps: profile.maxFastNoiseFloorBps + 0.01,
+    },
+  }, unclassified);
+  assert.equal(noisy.signal, undefined);
+  assert.ok(noisy.directions.find((item) => item.direction === "BULLISH")?.reasons
+    .includes("SAME_DIRECTION_COOLDOWN"));
+
+  const weakSlowFitEngine = new SignalEngine(defaultConfig);
+  weakSlowFitEngine.recordEntry("BULLISH", timestamp - profile.reentryCooldownSec * 1000);
+  const weakSlowFit = weakSlowFitEngine.evaluateDetailed({
+    ...cleanGrind,
+    slow: {
+      ...cleanGrind.slow,
+      regression: {
+        ...cleanGrind.slow.regression,
+        r2: profile.minSlowR2 - 0.01,
+      },
+    },
+  }, unclassified);
+  assert.equal(weakSlowFit.signal, undefined);
+  assert.ok(weakSlowFit.directions.find((item) => item.direction === "BULLISH")?.reasons
+    .includes("SAME_DIRECTION_COOLDOWN"));
+
+  const impulseEngine = new SignalEngine(defaultConfig);
+  impulseEngine.recordEntry("BULLISH", timestamp - profile.reentryCooldownSec * 1000);
+  const impulse = impulseEngine.evaluateDetailed({
+    ...cleanGrind,
+    openingRange: {
+      ...cleanGrind.openingRange,
+      nearHigh: true,
+    },
+    micropriceDisplacementBps: 0.1,
+  }, { regime: "STRONG_UP", confidence: 1, reasons: [] });
+  assert.equal(impulse.signal, undefined);
+  assert.ok(impulse.directions.find((item) => item.direction === "BULLISH")?.reasons
+    .includes("SAME_DIRECTION_COOLDOWN"));
+
+  const ordinaryEngine = new SignalEngine(defaultConfig);
+  const ordinary = ordinaryEngine.evaluateDetailed({
+    ...cleanGrind,
+    fast: {
+      ...cleanGrind.fast,
+      noiseFloorBps: profile.maxFastNoiseFloorBps + 0.01,
+    },
+  }, unclassified);
+  assert.equal(ordinary.signal, undefined);
+  assert.deepEqual(ordinary.reasons, ["LATE_ENTRY_FOLLOW_THROUGH_PENDING"]);
+});
+
 test("late bearish persistence profiles retain qualified July 23 setup classes without weakening strong-down confirmation", () => {
   const unclassified: RegimeDecision = { regime: "UNCLASSIFIED", confidence: 0, reasons: [] };
   const bearishBase = feature(-1);

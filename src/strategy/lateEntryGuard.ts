@@ -95,6 +95,9 @@ export function lateEntryGuardAudit(
     followThroughNoiseMultiplier: config.signals.followThroughNoiseMultiplier,
     bearishGrindRequiresFollowThrough:
       config.signals.lateEntryGuard.bearishGrindRequiresFollowThrough,
+    bullishLowNoiseGrind: {
+      ...config.signals.lateEntryGuard.bullishLowNoiseGrind,
+    },
     bearishUnclassifiedImpulseFollowThroughStart:
       config.signals.lateEntryGuard.bearishUnclassifiedImpulseFollowThroughStart,
     bearishStrongDownImpulse: {

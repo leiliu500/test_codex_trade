@@ -1,5 +1,5 @@
 {
-  "version": "spy-0dte-entry-confirmation-13-unified-order-management-10-recovery-soft-protection",
+  "version": "spy-0dte-entry-confirmation-14-low-noise-bullish-reentry",
   "symbol": "SPY",
   "timeZone": "America/New_York",
   "session": {
@@ -81,6 +81,16 @@
       "followThroughMaxSec": 15,
       "followThroughMinimumBps": 0.1,
       "bearishGrindRequiresFollowThrough": false,
+      "bullishLowNoiseGrind": {
+        "enabled": true,
+        "maxFastNoiseFloorBps": 1.0,
+        "minFastNormalizedSlope": 4.0,
+        "minMediumNormalizedSlope": 3.0,
+        "minMediumR2": 0.7,
+        "minSlowNormalizedSlope": 0.4,
+        "minSlowR2": 0.6,
+        "reentryCooldownSec": 480
+      },
       "bearishUnclassifiedImpulseFollowThroughStart": "13:00:00",
       "bearishStrongDownImpulse": {
         "followThroughMinSec": 5,

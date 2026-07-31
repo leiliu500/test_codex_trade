@@ -213,6 +213,10 @@ export class SignalEngine {
     }
     if (lateEntryGuardActive(this.#config, signal.timestamp)) {
       const guard = this.#config.signals.lateEntryGuard;
+      if (isLateBullishLowNoiseGrind(this.#config, signal)) {
+        signal.reasons.push("late low-noise bullish grind profile passed");
+        return undefined;
+      }
       if (signal.direction === "BEARISH" && signal.kind === "GRIND" &&
           !guard.bearishGrindRequiresFollowThrough) {
         return undefined;
@@ -263,7 +267,11 @@ export class SignalEngine {
     evaluationVotes: SignalVote[],
   ): TradeSignal | undefined {
     const lastEntry = this.#lastEntries[direction];
-    if (lastEntry !== undefined && f.timestamp - lastEntry < this.#config.signals.sameDirectionCooldownSec * 1000) {
+    const sameDirectionCooldownSec =
+      isLateBullishLowNoiseGrindFeature(this.#config, direction, f)
+        ? this.#config.signals.lateEntryGuard.bullishLowNoiseGrind.reentryCooldownSec
+        : this.#config.signals.sameDirectionCooldownSec;
+    if (lastEntry !== undefined && f.timestamp - lastEntry < sameDirectionCooldownSec * 1000) {
       blockedReasons.push("SAME_DIRECTION_COOLDOWN");
       return undefined;
     }
@@ -395,4 +403,52 @@ function hasDirectionalOfiConflict(signal: TradeSignal): boolean {
   const direction = signal.direction === "BULLISH" ? 1 : -1;
   return direction * signal.featureSnapshot.ofi5 > 0 &&
     direction * signal.featureSnapshot.ofi15 < 0;
+}
+
+function isLateBullishLowNoiseGrind(
+  config: EngineConfig,
+  signal: TradeSignal,
+): boolean {
+  return signal.kind === "GRIND" &&
+    isLateBullishLowNoiseGrindFeature(config, signal.direction, signal.featureSnapshot);
+}
+
+function isLateBullishLowNoiseGrindFeature(
+  config: EngineConfig,
+  direction: Direction,
+  feature: FeatureSnapshot,
+): boolean {
+  if (direction !== "BULLISH" || !lateEntryGuardActive(config, feature.timestamp)) {
+    return false;
+  }
+  const profile = config.signals.lateEntryGuard.bullishLowNoiseGrind;
+  return profile.enabled &&
+    !isBullishImpulseSetup(config, feature) &&
+    feature.fast.noiseFloorBps <= profile.maxFastNoiseFloorBps &&
+    feature.fast.normalizedSlope >= profile.minFastNormalizedSlope &&
+    feature.medium.normalizedSlope >= profile.minMediumNormalizedSlope &&
+    (feature.medium.regression.r2 ?? -Infinity) >= profile.minMediumR2 &&
+    feature.slow.normalizedSlope >= profile.minSlowNormalizedSlope &&
+    (feature.slow.regression.r2 ?? -Infinity) >= profile.minSlowR2 &&
+    (feature.vwap.rollingVwapSlopeBpsPerSec ?? -Infinity) > 0 &&
+    feature.fast.normalizedAcceleration >= config.signals.grindNegativeAccelerationLimit &&
+    feature.ofi15 >= 0;
+}
+
+function isBullishImpulseSetup(config: EngineConfig, feature: FeatureSnapshot): boolean {
+  const openingRange = feature.openingRange;
+  const breakoutMemoryMs = config.signals.breakoutMemorySec * 1000;
+  const locationGate =
+    openingRange.nearHigh ||
+    feature.price >= openingRange.high! ||
+    openingRange.bullishRetest ||
+    (openingRange.bullishBreakoutTimestamp !== undefined &&
+      feature.timestamp - openingRange.bullishBreakoutTimestamp <= breakoutMemoryMs);
+  const voteCount = [
+    feature.fast.normalizedSlope >= feature.thresholds.fastSlope,
+    feature.fast.normalizedAcceleration >= feature.thresholds.fastAcceleration,
+    feature.ofi5 >= feature.thresholds.absoluteOfi5,
+    feature.micropriceDisplacementBps > 0,
+  ].filter(Boolean).length;
+  return locationGate && voteCount >= config.signals.impulseVotesRequired;
 }

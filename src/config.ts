@@ -89,6 +89,16 @@ export interface EngineConfig {
       followThroughMaxSec: number;
       followThroughMinimumBps: number;
       bearishGrindRequiresFollowThrough: boolean;
+      bullishLowNoiseGrind: {
+        enabled: boolean;
+        maxFastNoiseFloorBps: number;
+        minFastNormalizedSlope: number;
+        minMediumNormalizedSlope: number;
+        minMediumR2: number;
+        minSlowNormalizedSlope: number;
+        minSlowR2: number;
+        reentryCooldownSec: number;
+      };
       bearishUnclassifiedImpulseFollowThroughStart: string;
       bearishStrongDownImpulse: {
         followThroughMinSec: number;
@@ -327,6 +337,18 @@ export function validateConfig(config: EngineConfig): void {
         config.signals.lateEntryGuard.followThroughMaxSec >= config.signals.lateEntryGuard.followThroughMinSec &&
         config.signals.lateEntryGuard.followThroughMinimumBps >= 0 &&
         typeof config.signals.lateEntryGuard.bearishGrindRequiresFollowThrough === "boolean" &&
+        typeof config.signals.lateEntryGuard.bullishLowNoiseGrind.enabled === "boolean" &&
+        config.signals.lateEntryGuard.bullishLowNoiseGrind.maxFastNoiseFloorBps > 0 &&
+        config.signals.lateEntryGuard.bullishLowNoiseGrind.minFastNormalizedSlope > 0 &&
+        config.signals.lateEntryGuard.bullishLowNoiseGrind.minMediumNormalizedSlope > 0 &&
+        config.signals.lateEntryGuard.bullishLowNoiseGrind.minMediumR2 >= 0 &&
+        config.signals.lateEntryGuard.bullishLowNoiseGrind.minMediumR2 <= 1 &&
+        config.signals.lateEntryGuard.bullishLowNoiseGrind.minSlowNormalizedSlope > 0 &&
+        config.signals.lateEntryGuard.bullishLowNoiseGrind.minSlowR2 >= 0 &&
+        config.signals.lateEntryGuard.bullishLowNoiseGrind.minSlowR2 <= 1 &&
+        config.signals.lateEntryGuard.bullishLowNoiseGrind.reentryCooldownSec >= 0 &&
+        config.signals.lateEntryGuard.bullishLowNoiseGrind.reentryCooldownSec <=
+          config.signals.sameDirectionCooldownSec &&
         config.signals.lateEntryGuard.bearishStrongDownImpulse.followThroughMinSec >= 0 &&
         config.signals.lateEntryGuard.bearishStrongDownImpulse.followThroughMaxSec >=
           config.signals.lateEntryGuard.bearishStrongDownImpulse.followThroughMinSec &&
