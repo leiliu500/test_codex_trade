@@ -52,6 +52,17 @@ test("configuration cannot enable later-dated or overnight option trading", () =
   const invalidLateCap = structuredClone(defaultConfig);
   invalidLateCap.signals.lateEntryGuard.maxDailyEntries = 0;
   assert.throws(() => validateConfig(invalidLateCap), /Late-entry guard thresholds/);
+  const invalidLateBullishReentry = structuredClone(defaultConfig);
+  invalidLateBullishReentry.signals.lateEntryGuard.bullishLowNoiseGrind.reentryCooldownSec =
+    invalidLateBullishReentry.signals.sameDirectionCooldownSec + 1;
+  assert.throws(() => validateConfig(invalidLateBullishReentry), /Late-entry guard thresholds/);
+  const invalidLateBullishReentryEnabled = structuredClone(defaultConfig);
+  invalidLateBullishReentryEnabled.signals.lateEntryGuard.bullishLowNoiseGrind.enabled =
+    "INVALID" as unknown as boolean;
+  assert.throws(() => validateConfig(invalidLateBullishReentryEnabled), /Late-entry guard thresholds/);
+  const invalidLateBullishSlowFit = structuredClone(defaultConfig);
+  invalidLateBullishSlowFit.signals.lateEntryGuard.bullishLowNoiseGrind.minSlowR2 = 1.01;
+  assert.throws(() => validateConfig(invalidLateBullishSlowFit), /Late-entry guard thresholds/);
   const invalidLateBearishProfile = structuredClone(defaultConfig);
   invalidLateBearishProfile.signals.lateEntryGuard.bearishStrongDownImpulse.followThroughMinSec = 6;
   assert.throws(() => validateConfig(invalidLateBearishProfile), /Late-entry guard thresholds/);
