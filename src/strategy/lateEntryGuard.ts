@@ -1,4 +1,5 @@
 import type { EngineConfig } from "../config.js";
+import type { Direction, FeatureSnapshot, RegimeDecision, TradeSignal } from "../types.js";
 import { parseClock, secondsSinceMidnight } from "../utils/time.js";
 
 export type StaticEntryGuardReasonPrefix = "MORNING_ENTRY_" | "LATE_ENTRY_";
@@ -51,6 +52,51 @@ export function activeStaticEntryGuard(
   return undefined;
 }
 
+export function isBullishTrendContinuationFeature(
+  config: EngineConfig,
+  direction: Direction,
+  feature: FeatureSnapshot,
+  regime: RegimeDecision["regime"],
+  directionalProjectionBps: number,
+): boolean {
+  const profile = config.signals.bullishTrendContinuation;
+  const bullishTrendRegime = regime === "STRONG_UP" ||
+    regime === "GRIND_UP" ||
+    regime === "GAP_AND_GO_UP";
+  return profile.enabled &&
+    direction === "BULLISH" &&
+    bullishTrendRegime &&
+    directionalProjectionBps >= profile.minDirectionalProjectionBps &&
+    feature.fast.noiseFloorBps <= profile.maxFastNoiseFloorBps &&
+    feature.fast.normalizedSlope >= profile.minFastNormalizedSlope &&
+    feature.medium.normalizedSlope >= config.signals.grindMediumSlopeScore &&
+    (feature.medium.regression.r2 ?? -Infinity) >= profile.minMediumR2 &&
+    feature.slow.normalizedSlope >= config.signals.grindSlowSlopeScore &&
+    (feature.slow.regression.r2 ?? -Infinity) >= profile.minSlowR2 &&
+    feature.efficiency60 >= feature.thresholds.efficiency60 &&
+    (feature.vwap.rollingVwapSlopeBpsPerSec ?? -Infinity) > 0 &&
+    feature.fast.normalizedAcceleration >= config.signals.grindNegativeAccelerationLimit &&
+    feature.ofi5 >= feature.thresholds.absoluteOfi5;
+}
+
+export function projectedMoveContinuationGuard(
+  config: EngineConfig,
+  signal: TradeSignal,
+): ActiveStaticEntryGuard | undefined {
+  const guard = activeStaticEntryGuard(config, signal.timestamp);
+  return guard &&
+    signal.projectedMoveBps < guard.minProjectedMoveBps &&
+    isBullishTrendContinuationFeature(
+      config,
+      signal.direction,
+      signal.featureSnapshot,
+      signal.regime,
+      signal.projectedMoveBps,
+    )
+    ? guard
+    : undefined;
+}
+
 export function morningEntryGuardAudit(
   config: EngineConfig,
   timestamp: number,
@@ -74,6 +120,9 @@ export function morningEntryGuardAudit(
     followThroughMaxSec: config.signals.followThroughMaxSec,
     followThroughMinimumBps: config.signals.followThroughMinimumBps,
     followThroughNoiseMultiplier: config.signals.followThroughNoiseMultiplier,
+    bullishTrendContinuation: {
+      ...config.signals.bullishTrendContinuation,
+    },
   };
 }
 
@@ -95,6 +144,9 @@ export function lateEntryGuardAudit(
     followThroughNoiseMultiplier: config.signals.followThroughNoiseMultiplier,
     bearishGrindRequiresFollowThrough:
       config.signals.lateEntryGuard.bearishGrindRequiresFollowThrough,
+    bullishTrendContinuation: {
+      ...config.signals.bullishTrendContinuation,
+    },
     bullishLowNoiseGrind: {
       ...config.signals.lateEntryGuard.bullishLowNoiseGrind,
     },

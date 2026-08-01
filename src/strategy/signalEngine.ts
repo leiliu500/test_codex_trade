@@ -4,7 +4,8 @@ import { inSessionWindow, parseClock, secondsSinceMidnight } from "../utils/time
 import { hashString, stableStringify } from "../utils/statistics.js";
 import { boundedProjectionBps } from "./projection.js";
 import {
-  activeStaticEntryGuard, lateEntryGuardActive, morningEntryGuardActive,
+  activeStaticEntryGuard, isBullishTrendContinuationFeature, lateEntryGuardActive,
+  morningEntryGuardActive, projectedMoveContinuationGuard,
 } from "./lateEntryGuard.js";
 
 export interface SignalDirectionEvaluation {
@@ -35,6 +36,7 @@ interface PendingFollowThrough {
   entryNoiseFloorBps: number;
   maxSec: number;
   reasonPrefix: "" | "MORNING_ENTRY_" | "LATE_ENTRY_";
+  armedViaBullishTrendContinuation: boolean;
 }
 
 interface FollowThroughRequirement {
@@ -128,6 +130,11 @@ export class SignalEngine {
         `causal follow-through confirmed after ${confirmation.elapsedSec.toFixed(1)}s at ` +
         `${confirmation.moveBps.toFixed(3)} bps versus ${confirmation.requiredMoveBps.toFixed(3)} bps required`,
       );
+      if (confirmation.armedViaBullishTrendContinuation) {
+        selected.reasons.push(
+          "causal confirmation was armed by an aligned bullish continuation below the static projection minimum",
+        );
+      }
     } else {
       this.#pendingFollowThrough = undefined;
     }
@@ -147,6 +154,7 @@ export class SignalEngine {
     elapsedSec: number;
     moveBps: number;
     requiredMoveBps: number;
+    armedViaBullishTrendContinuation: boolean;
   } | { confirmed: false; reasons: string[] } {
     const pending = this.#pendingFollowThrough;
     const prefix = requirement.reasonPrefix;
@@ -160,6 +168,8 @@ export class SignalEngine {
         entryNoiseFloorBps: feature.fast.noiseFloorBps,
         maxSec: requirement.maxSec,
         reasonPrefix: prefix,
+        armedViaBullishTrendContinuation:
+          projectedMoveContinuationGuard(this.#config, selected) !== undefined,
       };
       return {
         confirmed: false,
@@ -180,7 +190,13 @@ export class SignalEngine {
     );
     if (elapsedMs <= requirement.maxSec * 1000 && moveBps >= requiredMoveBps) {
       this.#pendingFollowThrough = undefined;
-      return { confirmed: true, elapsedSec, moveBps, requiredMoveBps };
+      return {
+        confirmed: true,
+        elapsedSec,
+        moveBps,
+        requiredMoveBps,
+        armedViaBullishTrendContinuation: pending.armedViaBullishTrendContinuation,
+      };
     }
     if (elapsedMs < requirement.maxSec * 1000) {
       return { confirmed: false, reasons: [`${prefix}FOLLOW_THROUGH_NOT_CONFIRMED`] };
@@ -193,11 +209,26 @@ export class SignalEngine {
       entryNoiseFloorBps: feature.fast.noiseFloorBps,
       maxSec: requirement.maxSec,
       reasonPrefix: prefix,
+      armedViaBullishTrendContinuation:
+        projectedMoveContinuationGuard(this.#config, selected) !== undefined,
     };
     return { confirmed: false, reasons: [`${prefix}FOLLOW_THROUGH_FAILED`] };
   }
 
   #followThroughRequirement(signal: TradeSignal): FollowThroughRequirement | undefined {
+    const continuationGuard = projectedMoveContinuationGuard(this.#config, signal);
+    if (continuationGuard) {
+      const profile = continuationGuard.reasonPrefix === "LATE_ENTRY_"
+        ? this.#config.signals.lateEntryGuard
+        : this.#config.signals;
+      return {
+        minSec: profile.followThroughMinSec,
+        maxSec: profile.followThroughMaxSec,
+        minimumBps: profile.followThroughMinimumBps,
+        noiseMultiplier: this.#config.signals.followThroughNoiseMultiplier,
+        reasonPrefix: continuationGuard.reasonPrefix,
+      };
+    }
     if (morningEntryGuardActive(this.#config, signal.timestamp) &&
         this.#config.signals.entryConfirmationMode === "ENFORCE" &&
         this.#config.signals.morningEntryGuard.ofiConflictRequiresFollowThrough &&
@@ -310,10 +341,25 @@ export class SignalEngine {
       return undefined;
     }
     const staticEntryGuard = activeStaticEntryGuard(this.#config, f.timestamp);
-    if (staticEntryGuard && directionalProjection < staticEntryGuard.minProjectedMoveBps) {
+    const bullishTrendContinuation = isBullishTrendContinuationFeature(
+      this.#config,
+      direction,
+      f,
+      regime.regime,
+      directionalProjection,
+    );
+    const projectedMoveException = staticEntryGuard !== undefined &&
+      directionalProjection < staticEntryGuard.minProjectedMoveBps &&
+      bullishTrendContinuation;
+    if (staticEntryGuard && directionalProjection < staticEntryGuard.minProjectedMoveBps &&
+        !projectedMoveException) {
       blockedReasons.push(`${staticEntryGuard.reasonPrefix}PROJECTED_MOVE_BELOW_MINIMUM`);
       return undefined;
     }
+    const continuationReasons = projectedMoveException ? [
+      `aligned bullish continuation accepted ${directionalProjection.toFixed(3)} bps projection below ` +
+        `${staticEntryGuard!.minProjectedMoveBps.toFixed(3)} bps static minimum; causal confirmation required`,
+    ] : [];
 
     const votes: SignalVote[] = [
       { name: "FAST_SLOPE", passed: s * f.fast.normalizedSlope >= f.thresholds.fastSlope,
@@ -362,7 +408,7 @@ export class SignalEngine {
       s * f.slow.normalizedSlope >= this.#config.signals.grindSlowSlopeScore &&
       s * (f.vwap.rollingVwapSlopeBpsPerSec ?? 0) > 0 &&
       s * f.fast.normalizedAcceleration >= this.#config.signals.grindNegativeAccelerationLimit &&
-      s * f.ofi15 >= 0;
+      (s * f.ofi15 >= 0 || projectedMoveException);
     if (grind) {
       if (morningEntryGuardActive(this.#config, f.timestamp)) {
         const guard = this.#config.signals.morningEntryGuard;
@@ -374,6 +420,7 @@ export class SignalEngine {
       }
       return this.#makeSignal(direction, "GRIND", directionalProjection, votes, f, regime, [
         "structural gate passed", "persistent medium/slow slope", "rolling VWAP and OFI aligned", "acceleration within adverse limit",
+        ...continuationReasons,
       ]);
     }
     if (!locationGate) blockedReasons.push("OPENING_RANGE_LOCATION_NOT_CONFIRMED");

@@ -68,6 +68,14 @@ export interface EngineConfig {
     followThroughNoiseMultiplier: number;
     followThroughScope: FollowThroughScope;
     shadowFollowThroughScope: FollowThroughScope | "DISABLED";
+    bullishTrendContinuation: {
+      enabled: boolean;
+      minDirectionalProjectionBps: number;
+      maxFastNoiseFloorBps: number;
+      minFastNormalizedSlope: number;
+      minMediumR2: number;
+      minSlowR2: number;
+    };
     morningEntryGuard: {
       mode: MorningEntryGuardMode;
       start: string;
@@ -296,6 +304,21 @@ export function validateConfig(config: EngineConfig): void {
     throw new Error(
       "Follow-through confirmation requires 0 <= minSec <= maxSec and non-negative bps/noise multiplier",
     );
+  }
+  if (!(typeof config.signals.bullishTrendContinuation.enabled === "boolean" &&
+        Number.isFinite(config.signals.bullishTrendContinuation.minDirectionalProjectionBps) &&
+        config.signals.bullishTrendContinuation.minDirectionalProjectionBps > 0 &&
+        Number.isFinite(config.signals.bullishTrendContinuation.maxFastNoiseFloorBps) &&
+        config.signals.bullishTrendContinuation.maxFastNoiseFloorBps > 0 &&
+        Number.isFinite(config.signals.bullishTrendContinuation.minFastNormalizedSlope) &&
+        config.signals.bullishTrendContinuation.minFastNormalizedSlope > 0 &&
+        Number.isFinite(config.signals.bullishTrendContinuation.minMediumR2) &&
+        config.signals.bullishTrendContinuation.minMediumR2 >= 0 &&
+        config.signals.bullishTrendContinuation.minMediumR2 <= 1 &&
+        Number.isFinite(config.signals.bullishTrendContinuation.minSlowR2) &&
+        config.signals.bullishTrendContinuation.minSlowR2 >= 0 &&
+        config.signals.bullishTrendContinuation.minSlowR2 <= 1)) {
+    throw new Error("Bullish trend-continuation thresholds are invalid");
   }
   if (!(Number.isFinite(config.signals.sameDirectionCooldownSec) &&
         config.signals.sameDirectionCooldownSec >= 0 &&
