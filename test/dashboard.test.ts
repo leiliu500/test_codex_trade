@@ -54,6 +54,13 @@ test("dashboard exposes liveness and feed tabs before any entries, orders, or hi
   assert.match(html, /Continuation LCB/);
   assert.match(html, /material changes/);
   assert.match(html, /fractionalSecondDigits:3/);
+  assert.match(html, /Entry time \(ET\)/);
+  assert.match(html, /Last monitored \(ET\)/);
+  assert.match(html, /Exit time \(ET\)/);
+  assert.match(html, /Event time \(ET\)/);
+  assert.match(html, /Monitored change/);
+  assert.match(html, /monitoredTimeNode/);
+  assert.match(html, /monitorChanges/);
   assert.match(html, /STATE NOT RECORDED/);
   assert.match(html, /DECISION NOT RECORDED/);
   assert.doesNotMatch(html, /x\.tradeState\|\|\(!x\.entryPrice\?'AWAITING FILL':'OPEN UNPROTECTED'\)/);
@@ -444,6 +451,43 @@ test("order cards expose and persist unified order-management state changes", as
   ]);
   assert.ok(completed.updates.some((update) =>
     update.managementDecision === "EXIT" && update.reversalCusum === 2.8));
+});
+
+test("order cards timestamp changes to every monitored management field", async () => {
+  const dashboard = historicalDashboard();
+  await dashboard.record(event("entry_fill", {
+    position: {
+      symbol, direction: "BULLISH", quantity: 1, averageEntryPrice: 2,
+      entryTimestamp: timestamp, stopPrice: 1.5, tradeState: "OPEN_UNPROTECTED",
+      executablePnl: 1, highWaterPnl: 1, lowWaterPnl: -1,
+    },
+  }));
+  const management = (recoveryProbability: number) => ({
+    symbol,
+    direction: "BULLISH",
+    entryTimestamp: timestamp,
+    lifecycle: "OPEN_UNPROTECTED",
+    tradeState: "OPEN_UNPROTECTED",
+    decision: "HOLD",
+    triggers: [],
+    liquidationPrice: 2.01,
+    executablePnl: 1,
+    highWaterPnl: 1,
+    lowWaterPnl: -1,
+    recoveryProbability,
+    continuationLcbDollars: 2,
+    reversalCusum: 0,
+    zeroCrossings: 0,
+    pnlObservationCount: 3,
+  });
+  await dashboard.record(event("order_management_state", management(0.51), 50));
+  const firstCount = dashboard.snapshot().orderCards[0]!.updates.length;
+  await dashboard.record(event("order_management_state", management(0.57), 60));
+
+  const updates = dashboard.snapshot().orderCards[0]!.updates;
+  assert.equal(updates.length, firstCount + 1);
+  assert.equal(updates.at(-1)?.timestamp, timestamp + 60);
+  assert.equal(updates.at(-1)?.recoveryProbability, 0.57);
 });
 
 test("historical order cards rebuild every bid-driven P&L change as a trackable list", () => {
