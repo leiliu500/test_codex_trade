@@ -369,6 +369,122 @@ test("morning bullish impulses and late-session entries require causal follow-th
     .includes("LATE_ENTRY_PROJECTED_MOVE_BELOW_MINIMUM"));
 });
 
+test("aligned bullish continuations below the static projection floor require causal proof", () => {
+  const base = feature(1);
+  const timestamp = zonedDateTimeToEpoch("2026-07-31", "13:23:49");
+  const {
+    bullishBreakoutTimestamp: _bullishBreakoutTimestamp,
+    ...openingRangeWithoutBullishBreakout
+  } = base.openingRange;
+  const continuation: FeatureSnapshot = {
+    ...base,
+    timestamp,
+    marketDate: "2026-07-31",
+    ofi15: -0.1,
+    openingRange: {
+      ...openingRangeWithoutBullishBreakout,
+      high: base.price + 1,
+      nearHigh: false,
+      bullishRetest: false,
+    },
+    fast: {
+      ...base.fast,
+      noiseFloorBps: 0.5,
+      normalizedSlope: 4.1,
+      normalizedAcceleration: 1,
+      regression: {
+        ...base.fast.regression,
+        slopeBpsPerSec: 0.22,
+        accelerationBpsPerSec2: 0.03,
+        r2: 0.9,
+      },
+    },
+    medium: {
+      ...base.medium,
+      normalizedSlope: 1.4,
+      regression: { ...base.medium.regression, r2: 0.75 },
+    },
+    slow: {
+      ...base.slow,
+      normalizedSlope: 3.8,
+      regression: { ...base.slow.regression, r2: 0.85 },
+    },
+    efficiency60: 0.4,
+    vwap: { ...base.vwap, rollingVwapSlopeBpsPerSec: 0.06 },
+  };
+  const up: RegimeDecision = { regime: "STRONG_UP", confidence: 1, reasons: [] };
+  const engine = new SignalEngine(defaultConfig);
+  const armed = engine.evaluateDetailed(continuation, up);
+  assert.equal(armed.signal, undefined);
+  assert.deepEqual(armed.reasons, ["LATE_ENTRY_FOLLOW_THROUGH_PENDING"]);
+  const armedBullish = armed.directions.find((item) => item.direction === "BULLISH");
+  assert.equal(armedBullish?.passed, true);
+  assert.ok(armedBullish!.projectedMoveBps! < defaultConfig.signals.lateEntryGuard.minProjectedMoveBps);
+  assert.ok(armedBullish?.reasons.some((reason) => reason.includes("aligned bullish continuation accepted")));
+
+  const confirmed = engine.evaluateDetailed({
+    ...continuation,
+    timestamp: timestamp + 5_000,
+    price: continuation.price * (1 + 1 / 10_000),
+  }, up);
+  assert.equal(confirmed.signal?.direction, "BULLISH");
+  assert.equal(confirmed.signal?.kind, "GRIND");
+  assert.ok(confirmed.signal?.reasons.some((reason) => reason.includes("causal follow-through confirmed")));
+  assert.ok(confirmed.signal?.reasons.some((reason) =>
+    reason.includes("armed by an aligned bullish continuation")));
+
+  const contract: OptionContract = {
+    symbol: "SPY260731C00501000",
+    underlying: "SPY",
+    expirationDate: "2026-07-31",
+    strike: 501,
+    type: "call",
+    active: true,
+    tradable: true,
+  };
+  const book = new OptionBook();
+  book.upsertContract(contract);
+  book.updateSnapshot({
+    symbol: contract.symbol,
+    timestamp: confirmed.signal!.timestamp,
+    impliedVolatility: 0.22,
+    greeks: { delta: 0.52, gamma: 0.02 },
+    dailyVolume: 1_000,
+    openInterest: 5_000,
+  });
+  book.updateQuote({
+    symbol: contract.symbol,
+    timestamp: confirmed.signal!.timestamp,
+    bidPrice: 1.9995,
+    askPrice: 2.0005,
+    bidSize: 100,
+    askSize: 100,
+  });
+  const option = new OptionSelector(defaultConfig).evaluate(
+    contract,
+    book.get(contract.symbol),
+    confirmed.signal!,
+  );
+  assert.equal(option.eligible, true);
+  assert.ok(option.costMarginBps! >= defaultConfig.signals.lateEntryGuard.minCostMarginBps);
+  assert.equal(option.rejectionReasons.includes("LATE_ENTRY_PROJECTED_MOVE_BELOW_MINIMUM"), false);
+
+  const ordinaryConfig = structuredClone(defaultConfig);
+  ordinaryConfig.signals.bullishTrendContinuation.enabled = false;
+  const ordinary = new SignalEngine(ordinaryConfig).evaluateDetailed(continuation, up);
+  assert.equal(ordinary.signal, undefined);
+  assert.ok(ordinary.directions.find((item) => item.direction === "BULLISH")?.reasons
+    .includes("LATE_ENTRY_PROJECTED_MOVE_BELOW_MINIMUM"));
+
+  const weakOfi = new SignalEngine(defaultConfig).evaluateDetailed({
+    ...continuation,
+    ofi5: continuation.thresholds.absoluteOfi5 - 0.01,
+  }, up);
+  assert.equal(weakOfi.signal, undefined);
+  assert.ok(weakOfi.directions.find((item) => item.direction === "BULLISH")?.reasons
+    .includes("LATE_ENTRY_PROJECTED_MOVE_BELOW_MINIMUM"));
+});
+
 test("clean low-noise late bullish grinds can reenter without weakening ordinary confirmation", () => {
   const base = feature(1);
   const timestamp = zonedDateTimeToEpoch("2026-07-22", "12:12:46");

@@ -22,6 +22,7 @@
     "calibrate": "tsx src/cli/calibrate.ts",
     "demo": "tsx src/cli/generateDemoReplay.ts",
     "test:historical": "tsx src/cli/historicalSignalTest.ts",
+    "verify:feature-regression": "tsx src/cli/historicalFeatureRegression.ts",
     "export:history": "tsx src/cli/exportPostgresReplay.ts"
   },
   "engines": {

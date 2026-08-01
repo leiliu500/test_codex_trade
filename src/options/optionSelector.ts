@@ -6,7 +6,9 @@ import { blackScholes, impliedVolatility } from "./blackScholes.js";
 import { evaluateOptionCost, gammaAwareProjectedOptionMove } from "./costGate.js";
 import type { OptionBook, OptionBookEntry } from "./optionBook.js";
 import { sameDaySpyOptionContractReasons } from "./tradingInvariants.js";
-import { activeStaticEntryGuard } from "../strategy/lateEntryGuard.js";
+import {
+  activeStaticEntryGuard, projectedMoveContinuationGuard,
+} from "../strategy/lateEntryGuard.js";
 
 export interface SelectionResult {
   selected?: OptionCandidateEvaluation;
@@ -107,7 +109,8 @@ export class OptionSelector {
         rejectionReasons.push(`${staticEntryGuard.reasonPrefix}COST_MARGIN_BELOW_MINIMUM`);
       }
     }
-    if (staticEntryGuard && signal.projectedMoveBps < staticEntryGuard.minProjectedMoveBps) {
+    if (staticEntryGuard && signal.projectedMoveBps < staticEntryGuard.minProjectedMoveBps &&
+        !projectedMoveContinuationGuard(this.#config, signal)) {
       rejectionReasons.push(`${staticEntryGuard.reasonPrefix}PROJECTED_MOVE_BELOW_MINIMUM`);
     }
     const eligible = rejectionReasons.length === 0;

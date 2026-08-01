@@ -1,5 +1,5 @@
 {
-  "version": "spy-0dte-entry-confirmation-16-protected-continuation-exit",
+  "version": "spy-0dte-entry-confirmation-17-aligned-bullish-continuation",
   "symbol": "SPY",
   "timeZone": "America/New_York",
   "session": {
@@ -60,6 +60,14 @@
     "followThroughNoiseMultiplier": 1.25,
     "followThroughScope": "ALL",
     "shadowFollowThroughScope": "BULLISH_IMPULSE",
+    "bullishTrendContinuation": {
+      "enabled": true,
+      "minDirectionalProjectionBps": 0.1,
+      "maxFastNoiseFloorBps": 1.5,
+      "minFastNormalizedSlope": 0.1,
+      "minMediumR2": 0.3,
+      "minSlowR2": 0.8
+    },
     "morningEntryGuard": {
       "mode": "ENFORCE",
       "start": "10:15:00",

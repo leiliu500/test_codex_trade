@@ -133,6 +133,11 @@ async function main(): Promise<void> {
   allEntryConfirmationConfig.signals.entryConfirmationMode = "ENFORCE";
   allEntryConfirmationConfig.signals.followThroughScope = "ALL";
   const allEntryConfirmationSignals = evaluateSignals(bars, priorClose, allEntryConfirmationConfig);
+  const staticProjectionOnlyConfig = structuredClone(defaultConfig);
+  staticProjectionOnlyConfig.signals.bullishTrendContinuation.enabled = false;
+  const staticProjectionOnlySignals = evaluateSignals(bars, priorClose, staticProjectionOnlyConfig);
+  const continuationDependentSignals = signals.filter((signal) => signal.reasons.some((reason) =>
+    reason.includes("aligned bullish continuation")));
   const baselineSummary = summarizeSignals(baselineSignals, bars);
   const guardedSummary = summarizeSignals(bullishImpulseConfirmationSignals, bars);
   process.stdout.write(`${JSON.stringify({
@@ -154,8 +159,14 @@ async function main(): Promise<void> {
         bullishImpulseConfirmation: guardedSummary,
         impulseConfirmation: summarizeSignals(impulseConfirmationSignals, bars),
         allEntryConfirmation: summarizeSignals(allEntryConfirmationSignals, bars),
+        staticProjectionOnly: summarizeSignals(staticProjectionOnlySignals, bars),
       },
       suppressedOrDelayedSignals: Math.max(0, baselineSignals.length - bullishImpulseConfirmationSignals.length),
+    },
+    bullishTrendContinuationComparison: {
+      active: summarizeSignals(signals, bars),
+      staticProjectionOnly: summarizeSignals(staticProjectionOnlySignals, bars),
+      dependentSignals: signalForwardDetails(continuationDependentSignals, bars),
     },
     optionBacktest: {
       performed: false,
@@ -164,6 +175,33 @@ async function main(): Promise<void> {
       pnl: null,
     },
   }, null, 2)}\n`);
+}
+
+function signalForwardDetails(
+  signals: readonly TradeSignal[], bars: readonly SecondBar[],
+): Array<Record<string, unknown>> {
+  const prices = new Map<number, number>();
+  for (const bar of bars) {
+    const price = bar.microprice ?? bar.mid ?? bar.tradeVwap;
+    if (price !== undefined && Number.isFinite(price)) prices.set(bar.timestamp, price);
+  }
+  return signals.map((signal) => {
+    const sign = signal.direction === "BULLISH" ? 1 : -1;
+    const forwardDirectionalBps = Object.fromEntries([5, 15, 30, 60].map((horizonSec) => {
+      const future = prices.get(signal.timestamp + horizonSec * 1000);
+      return [String(horizonSec), future === undefined
+        ? null
+        : sign * (future / signal.featureSnapshot.price - 1) * 10_000];
+    }));
+    return {
+      timeEt: formatEt(signal.timestamp),
+      direction: signal.direction,
+      kind: signal.kind,
+      regime: signal.regime,
+      projectedMoveBps: signal.projectedMoveBps,
+      forwardDirectionalBps,
+    };
+  });
 }
 
 function evaluateSignals(
