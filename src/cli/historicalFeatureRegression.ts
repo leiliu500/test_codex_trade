@@ -14,6 +14,7 @@ interface DayResult {
   date: string;
   featureSeconds: number;
   active: SignalSummary;
+  experimentalContinuation: SignalSummary;
   staticProjectionOnly: SignalSummary;
   continuationDependent: SignalDetail[];
 }
@@ -72,10 +73,14 @@ async function main(): Promise<void> {
     for (const date of datesBetween(startDate, endDate)) {
       const features = await loadFeatures(client, date);
       if (features.length === 0) continue;
-      const activeSignals = evaluate(features, true);
+      const activeSignals = evaluate(
+        features,
+        defaultConfig.signals.bullishTrendContinuation.enabled,
+      );
+      const experimentalSignals = evaluate(features, true);
       const staticSignals = evaluate(features, false);
       const priceByTimestamp = new Map(features.map((feature) => [feature.timestamp, feature.price]));
-      const dependentSignals = activeSignals.filter((signal) => signal.reasons.some((reason) =>
+      const dependentSignals = experimentalSignals.filter((signal) => signal.reasons.some((reason) =>
         reason.includes("aligned bullish continuation")));
       const continuationDependent: SignalDetail[] = [];
       for (const signal of dependentSignals) {
@@ -88,6 +93,7 @@ async function main(): Promise<void> {
         date,
         featureSeconds: features.length,
         active: summarize(activeSignals, priceByTimestamp),
+        experimentalContinuation: summarize(experimentalSignals, priceByTimestamp),
         staticProjectionOnly: summarize(staticSignals, priceByTimestamp),
         continuationDependent,
       });
@@ -260,6 +266,8 @@ function aggregate(days: readonly DayResult[]): Record<string, unknown> {
     tradingDays: days.length,
     featureSeconds: days.reduce((sum, day) => sum + day.featureSeconds, 0),
     activeSignals: days.reduce((sum, day) => sum + day.active.signals, 0),
+    experimentalContinuationSignals:
+      days.reduce((sum, day) => sum + day.experimentalContinuation.signals, 0),
     staticProjectionOnlySignals: days.reduce((sum, day) => sum + day.staticProjectionOnly.signals, 0),
     continuationDependentSignals: dependent.length,
     optionEligibleContinuationSignals: optionEligible.length,

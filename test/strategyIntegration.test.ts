@@ -413,13 +413,21 @@ test("aligned bullish continuations below the static projection floor require ca
     vwap: { ...base.vwap, rollingVwapSlopeBpsPerSec: 0.06 },
   };
   const up: RegimeDecision = { regime: "STRONG_UP", confidence: 1, reasons: [] };
-  const engine = new SignalEngine(defaultConfig);
+  const production = new SignalEngine(defaultConfig).evaluateDetailed(continuation, up);
+  assert.equal(defaultConfig.signals.bullishTrendContinuation.enabled, false);
+  assert.equal(production.signal, undefined);
+  assert.ok(production.directions.find((item) => item.direction === "BULLISH")?.reasons
+    .includes("LATE_ENTRY_PROJECTED_MOVE_BELOW_MINIMUM"));
+
+  const continuationConfig = structuredClone(defaultConfig);
+  continuationConfig.signals.bullishTrendContinuation.enabled = true;
+  const engine = new SignalEngine(continuationConfig);
   const armed = engine.evaluateDetailed(continuation, up);
   assert.equal(armed.signal, undefined);
   assert.deepEqual(armed.reasons, ["LATE_ENTRY_FOLLOW_THROUGH_PENDING"]);
   const armedBullish = armed.directions.find((item) => item.direction === "BULLISH");
   assert.equal(armedBullish?.passed, true);
-  assert.ok(armedBullish!.projectedMoveBps! < defaultConfig.signals.lateEntryGuard.minProjectedMoveBps);
+  assert.ok(armedBullish!.projectedMoveBps! < continuationConfig.signals.lateEntryGuard.minProjectedMoveBps);
   assert.ok(armedBullish?.reasons.some((reason) => reason.includes("aligned bullish continuation accepted")));
 
   const confirmed = engine.evaluateDetailed({
@@ -460,23 +468,21 @@ test("aligned bullish continuations below the static projection floor require ca
     bidSize: 100,
     askSize: 100,
   });
-  const option = new OptionSelector(defaultConfig).evaluate(
+  const option = new OptionSelector(continuationConfig).evaluate(
     contract,
     book.get(contract.symbol),
     confirmed.signal!,
   );
   assert.equal(option.eligible, true);
-  assert.ok(option.costMarginBps! >= defaultConfig.signals.lateEntryGuard.minCostMarginBps);
+  assert.ok(option.costMarginBps! >= continuationConfig.signals.lateEntryGuard.minCostMarginBps);
   assert.equal(option.rejectionReasons.includes("LATE_ENTRY_PROJECTED_MOVE_BELOW_MINIMUM"), false);
 
-  const ordinaryConfig = structuredClone(defaultConfig);
-  ordinaryConfig.signals.bullishTrendContinuation.enabled = false;
-  const ordinary = new SignalEngine(ordinaryConfig).evaluateDetailed(continuation, up);
+  const ordinary = new SignalEngine(defaultConfig).evaluateDetailed(continuation, up);
   assert.equal(ordinary.signal, undefined);
   assert.ok(ordinary.directions.find((item) => item.direction === "BULLISH")?.reasons
     .includes("LATE_ENTRY_PROJECTED_MOVE_BELOW_MINIMUM"));
 
-  const weakOfi = new SignalEngine(defaultConfig).evaluateDetailed({
+  const weakOfi = new SignalEngine(continuationConfig).evaluateDetailed({
     ...continuation,
     ofi5: continuation.thresholds.absoluteOfi5 - 0.01,
   }, up);
