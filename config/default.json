@@ -1,5 +1,5 @@
 {
-  "version": "spy-0dte-entry-confirmation-17-aligned-bullish-continuation",
+  "version": "spy-0dte-entry-confirmation-18-block-losing-continuations",
   "symbol": "SPY",
   "timeZone": "America/New_York",
   "session": {
@@ -61,7 +61,7 @@
     "followThroughScope": "ALL",
     "shadowFollowThroughScope": "BULLISH_IMPULSE",
     "bullishTrendContinuation": {
-      "enabled": true,
+      "enabled": false,
       "minDirectionalProjectionBps": 0.1,
       "maxFastNoiseFloorBps": 1.5,
       "minFastNormalizedSlope": 0.1,
