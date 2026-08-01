@@ -294,7 +294,7 @@ function sameDynamics(left: DashboardOrderDynamicsUpdate, right: DashboardOrderD
     left.currentBid === right.currentBid &&
     left.unrealizedPnl === right.unrealizedPnl &&
     left.totalPnl === right.totalPnl &&
-    sameOrderCardTimelineState(left, right);
+    sameMaterialOrderManagement(left, right);
 }
 
 function cloneCard(card: DashboardOrderCard): DashboardOrderCard {
@@ -323,9 +323,10 @@ function cloneCard(card: DashboardOrderCard): DashboardOrderCard {
 }
 
 /**
- * Removes consecutive controller updates that render identically on the order
- * card. Raw market/audit history remains available; this only keeps material
- * lifecycle, P&L, and displayed controller changes in the card timeline.
+ * Removes consecutive controller updates that are materially identical. Raw
+ * market/audit history remains available; the card timeline retains changes to
+ * every monitored order-management field so each can be shown with its event
+ * time.
  */
 export function compactOrderCardDynamics(
   card: DashboardOrderCard,
