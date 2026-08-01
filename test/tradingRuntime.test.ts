@@ -168,6 +168,41 @@ function bullishFeature(): FeatureSnapshot {
   };
 }
 
+function lateLowNoiseBullishGrindFeature(timestamp: number): FeatureSnapshot {
+  const base = bullishFeature();
+  const {
+    bullishBreakoutTimestamp: _bullishBreakoutTimestamp,
+    ...openingRangeWithoutBullishBreakout
+  } = base.openingRange;
+  return {
+    ...base,
+    timestamp,
+    micropriceDisplacementBps: -0.1,
+    fast: {
+      ...base.fast,
+      noiseFloorBps: 0.8,
+      normalizedSlope: 4.5,
+      normalizedAcceleration: 1,
+    },
+    medium: {
+      ...base.medium,
+      normalizedSlope: 3.1,
+      regression: { ...base.medium.regression, r2: 0.8 },
+    },
+    slow: {
+      ...base.slow,
+      normalizedSlope: 0.45,
+      regression: { ...base.slow.regression, r2: 0.8 },
+    },
+    openingRange: {
+      ...openingRangeWithoutBullishBreakout,
+      high: base.price + 1,
+      nearHigh: false,
+      bullishRetest: false,
+    },
+  };
+}
+
 function bearishFeature(timestamp = now, price = 499): FeatureSnapshot {
   const bullish = bullishFeature();
   return {
@@ -632,7 +667,10 @@ test("late-session runtime audits and blocks an option whose spread exceeds the 
   assert.equal(evaluation?.data.decision, "SIGNAL");
   const lateEntryGuard = evaluation?.data.lateEntryGuard as Record<string, unknown>;
   assert.equal(lateEntryGuard.active, true);
-  assert.equal(lateEntryGuard.bearishGrindRequiresFollowThrough, false);
+  assert.equal(lateEntryGuard.bearishGrindRequiresFollowThrough, true);
+  assert.equal(lateEntryGuard.bearishUnclassifiedImpulseMinMediumToFastRatio, 0.4);
+  assert.equal(lateEntryGuard.bullishGrindMinMediumNormalizedSlope, 2.5);
+  assert.equal(lateEntryGuard.bullishNoisyGrindMinMediumToFastRatio, 1.25);
   assert.equal(lateEntryGuard.bearishUnclassifiedImpulseFollowThroughStart, "13:00:00");
   assert.equal((evaluation?.data.lateEntryBaseline as Record<string, unknown>).decision, "SIGNAL");
   const selection = recorder.events.find((event) => event.type === "live_signal_selection");
@@ -670,6 +708,68 @@ test("late-session audit preserves an unguarded baseline while active follow-thr
   assert.equal(baseline.decision, "SIGNAL");
   assert.equal(baseline.direction, "BULLISH");
   assert.equal(client.requests.length, 0);
+  await runtime.close();
+});
+
+test("late low-noise bullish grind waits for option response and records each monitored time", async () => {
+  let decisionTime = zonedDateTimeToEpoch(date, "12:12:46");
+  const client = new FakeRuntimeClient();
+  client.clock.timestamp = decisionTime;
+  const optionStream = new FakeOptionStream();
+  const recorder = new MemoryRecorder();
+  const runtime = new SpyOptionsTradingRuntime({
+    config: defaultConfig,
+    client,
+    stockStream: new FakeStockStream(),
+    optionStream,
+    executionEnabled: true,
+    executionMode: "paper",
+    now: () => decisionTime,
+    executionTickMs: 60_000,
+    recorder,
+  });
+  await runtime.start();
+  await optionStream.quote({
+    symbol: callSymbol, timestamp: decisionTime,
+    bidPrice: 1.9, askPrice: 1.91, bidSize: 100, askSize: 100,
+  });
+  await runtime.ingestFeature(lateLowNoiseBullishGrindFeature(decisionTime));
+  assert.equal(client.requests.length, 0);
+  assert.equal(
+    recorder.events.find((event) =>
+      event.type === "late_bullish_grind_confirmation")?.data.decision,
+    "ARMED",
+  );
+
+  decisionTime += 1_000;
+  client.clock.timestamp = decisionTime;
+  await optionStream.quote({
+    symbol: callSymbol, timestamp: decisionTime,
+    bidPrice: 1.91, askPrice: 1.92, bidSize: 100, askSize: 100,
+  });
+  await runtime.ingestFeature(lateLowNoiseBullishGrindFeature(decisionTime));
+  assert.equal(client.requests.length, 0);
+
+  decisionTime += 2_000;
+  client.clock.timestamp = decisionTime;
+  await optionStream.quote({
+    symbol: callSymbol, timestamp: decisionTime,
+    bidPrice: 1.93, askPrice: 1.94, bidSize: 100, askSize: 100,
+  });
+  await runtime.ingestFeature(lateLowNoiseBullishGrindFeature(decisionTime));
+  assert.equal(client.requests.length, 1);
+  const confirmationEvents = recorder.events.filter(
+    (event) => event.type === "late_bullish_grind_confirmation",
+  );
+  assert.deepEqual(
+    confirmationEvents.map((event) => event.data.decision),
+    ["ARMED", "PENDING", "CONFIRMED"],
+  );
+  assert.deepEqual(
+    confirmationEvents.map((event) => event.timestamp),
+    [decisionTime - 3_000, decisionTime - 2_000, decisionTime],
+  );
+  assert.equal((confirmationEvents.at(-1)?.data.bidImprovement as number) >= 0.03, true);
   await runtime.close();
 });
 

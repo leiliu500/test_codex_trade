@@ -386,6 +386,18 @@ export class SignalEngine {
       direction === "BULLISH" &&
       secondsSinceMidnight(f.timestamp, this.#config.timeZone) >= parseClock(this.#config.signals.lateBullishImpulseStart) &&
       regime.regime !== "STRONG_UP" && regime.regime !== "GRIND_UP";
+    const weakLateBearishImpulsePersistence =
+      impulsePassed &&
+      lateEntryGuardActive(this.#config, f.timestamp) &&
+      direction === "BEARISH" &&
+      regime.regime === "UNCLASSIFIED" &&
+      s * f.medium.normalizedSlope <
+        this.#config.signals.lateEntryGuard.bearishUnclassifiedImpulseMinMediumToFastRatio *
+          Math.max(0, s * f.fast.normalizedSlope);
+    if (weakLateBearishImpulsePersistence) {
+      blockedReasons.push("LATE_ENTRY_BEARISH_IMPULSE_MEDIUM_PERSISTENCE");
+      return undefined;
+    }
     if (impulsePassed && lateBullishImpulseNeedsConfirmation) {
       blockedReasons.push("LATE_BULLISH_IMPULSE_REQUIRES_UP_REGIME");
       return undefined;
@@ -410,6 +422,13 @@ export class SignalEngine {
       s * f.fast.normalizedAcceleration >= this.#config.signals.grindNegativeAccelerationLimit &&
       (s * f.ofi15 >= 0 || projectedMoveException);
     if (grind) {
+      if (lateEntryGuardActive(this.#config, f.timestamp) &&
+          direction === "BULLISH" &&
+          f.medium.normalizedSlope <
+            this.#config.signals.lateEntryGuard.bullishGrindMinMediumNormalizedSlope) {
+        blockedReasons.push("LATE_ENTRY_BULLISH_GRIND_MEDIUM_PERSISTENCE");
+        return undefined;
+      }
       if (morningEntryGuardActive(this.#config, f.timestamp)) {
         const guard = this.#config.signals.morningEntryGuard;
         if (direction === "BULLISH" && guard.bullishGrindRequiresUpRegime &&

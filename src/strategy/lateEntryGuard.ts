@@ -144,11 +144,20 @@ export function lateEntryGuardAudit(
     followThroughNoiseMultiplier: config.signals.followThroughNoiseMultiplier,
     bearishGrindRequiresFollowThrough:
       config.signals.lateEntryGuard.bearishGrindRequiresFollowThrough,
+    bearishUnclassifiedImpulseMinMediumToFastRatio:
+      config.signals.lateEntryGuard.bearishUnclassifiedImpulseMinMediumToFastRatio,
+    bullishGrindMinMediumNormalizedSlope:
+      config.signals.lateEntryGuard.bullishGrindMinMediumNormalizedSlope,
+    bullishNoisyGrindMinMediumToFastRatio:
+      config.signals.lateEntryGuard.bullishNoisyGrindMinMediumToFastRatio,
     bullishTrendContinuation: {
       ...config.signals.bullishTrendContinuation,
     },
     bullishLowNoiseGrind: {
       ...config.signals.lateEntryGuard.bullishLowNoiseGrind,
+    },
+    bullishGrindOptionConfirmation: {
+      ...config.signals.lateEntryGuard.bullishGrindOptionConfirmation,
     },
     bearishUnclassifiedImpulseFollowThroughStart:
       config.signals.lateEntryGuard.bearishUnclassifiedImpulseFollowThroughStart,

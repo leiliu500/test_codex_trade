@@ -11,6 +11,9 @@ import { OptionSelector } from "../src/options/optionSelector.js";
 import { FeatureEngine } from "../src/features/featureEngine.js";
 import { OpeningRangeTracker } from "../src/features/openingRange.js";
 import { zonedDateTimeToEpoch } from "../src/utils/time.js";
+import {
+  evaluateLateBullishGrindOptionConfirmation, requiresLateBullishGrindOptionConfirmation,
+} from "../src/strategy/lateBullishGrindConfirmation.js";
 
 function windowMetric(windowSec: number, slope: number, acceleration: number, normalizedSlope: number, normalizedAcceleration: number): WindowMetrics {
   return {
@@ -401,7 +404,7 @@ test("aligned bullish continuations below the static projection floor require ca
     },
     medium: {
       ...base.medium,
-      normalizedSlope: 1.4,
+      normalizedSlope: 3.0,
       regression: { ...base.medium.regression, r2: 0.75 },
     },
     slow: {
@@ -491,6 +494,86 @@ test("aligned bullish continuations below the static projection floor require ca
     .includes("LATE_ENTRY_PROJECTED_MOVE_BELOW_MINIMUM"));
 });
 
+test("late persistence gates reject short bearish bursts and weak-medium bullish grinds", () => {
+  const unclassified: RegimeDecision = { regime: "UNCLASSIFIED", confidence: 0, reasons: [] };
+  const bearishBase = feature(-1);
+  const weakBearishImpulse: FeatureSnapshot = {
+    ...bearishBase,
+    timestamp: zonedDateTimeToEpoch("2026-07-22", "12:20:00"),
+    fast: { ...bearishBase.fast, normalizedSlope: -4 },
+    medium: { ...bearishBase.medium, normalizedSlope: -1.59 },
+  };
+  const weakBearish = new SignalEngine(defaultConfig).evaluateDetailed(
+    weakBearishImpulse,
+    unclassified,
+  );
+  assert.equal(weakBearish.signal, undefined);
+  assert.ok(weakBearish.directions.find((item) => item.direction === "BEARISH")?.reasons
+    .includes("LATE_ENTRY_BEARISH_IMPULSE_MEDIUM_PERSISTENCE"));
+
+  const persistentBearish = new SignalEngine(defaultConfig).evaluateDetailed({
+    ...weakBearishImpulse,
+    medium: { ...weakBearishImpulse.medium, normalizedSlope: -1.6 },
+  }, unclassified);
+  assert.equal(persistentBearish.signal?.direction, "BEARISH");
+  assert.equal(persistentBearish.signal?.kind, "IMPULSE");
+
+  const bullishBase = feature(1);
+  const {
+    bullishBreakoutTimestamp: _bullishBreakoutTimestamp,
+    ...openingRangeWithoutBullishBreakout
+  } = bullishBase.openingRange;
+  const weakBullishGrind: FeatureSnapshot = {
+    ...bullishBase,
+    timestamp: zonedDateTimeToEpoch("2026-07-22", "13:22:00"),
+    micropriceDisplacementBps: -0.1,
+    openingRange: {
+      ...openingRangeWithoutBullishBreakout,
+      high: bullishBase.price + 1,
+      nearHigh: false,
+      bullishRetest: false,
+    },
+    fast: {
+      ...bullishBase.fast,
+      normalizedSlope: 3.9,
+      normalizedAcceleration: 2,
+    },
+    medium: { ...bullishBase.medium, normalizedSlope: 2.49 },
+    slow: { ...bullishBase.slow, normalizedSlope: 4.5 },
+  };
+  const strongUp: RegimeDecision = { regime: "STRONG_UP", confidence: 1, reasons: [] };
+  const weakBullish = new SignalEngine(defaultConfig).evaluateDetailed(weakBullishGrind, strongUp);
+  assert.equal(weakBullish.signal, undefined);
+  assert.ok(weakBullish.directions.find((item) => item.direction === "BULLISH")?.reasons
+    .includes("LATE_ENTRY_BULLISH_GRIND_MEDIUM_PERSISTENCE"));
+
+  const persistentBullish = new SignalEngine(defaultConfig).evaluateDetailed({
+    ...weakBullishGrind,
+    fast: { ...weakBullishGrind.fast, noiseFloorBps: 0.8 },
+    medium: { ...weakBullishGrind.medium, normalizedSlope: 2.5 },
+  }, strongUp);
+  assert.equal(persistentBullish.signal, undefined);
+  assert.deepEqual(persistentBullish.reasons, ["LATE_ENTRY_FOLLOW_THROUGH_PENDING"]);
+
+  const immediateLateConfig = structuredClone(defaultConfig);
+  immediateLateConfig.signals.lateEntryGuard.followThroughMinSec = 0;
+  immediateLateConfig.signals.lateEntryGuard.followThroughMaxSec = 0;
+  const noisyBurst = new SignalEngine(immediateLateConfig).evaluateDetailed({
+    ...weakBullishGrind,
+    fast: {
+      ...weakBullishGrind.fast,
+      noiseFloorBps: 1.2,
+      normalizedSlope: 3.5,
+    },
+    medium: { ...weakBullishGrind.medium, normalizedSlope: 4.3 },
+  }, strongUp);
+  assert.equal(noisyBurst.signal?.kind, "GRIND");
+  assert.equal(
+    requiresLateBullishGrindOptionConfirmation(immediateLateConfig, noisyBurst.signal!),
+    true,
+  );
+});
+
 test("clean low-noise late bullish grinds can reenter without weakening ordinary confirmation", () => {
   const base = feature(1);
   const timestamp = zonedDateTimeToEpoch("2026-07-22", "12:12:46");
@@ -529,6 +612,27 @@ test("clean low-noise late bullish grinds can reenter without weakening ordinary
   assert.equal(reentry.signal?.kind, "GRIND");
   assert.ok(reentry.signal?.reasons.includes("late low-noise bullish grind profile passed"));
   assert.equal(reentry.signal?.reasons.some((reason) => reason.includes("follow-through")), false);
+  assert.equal(requiresLateBullishGrindOptionConfirmation(defaultConfig, reentry.signal!), true);
+
+  const pendingOption = evaluateLateBullishGrindOptionConfirmation(
+    defaultConfig,
+    { armedAt: timestamp, referenceBidPrice: 1.9 },
+    { ...cleanGrind, timestamp: timestamp + 1_000 },
+    { symbol: "SPY260722C00501000", timestamp: timestamp + 1_000,
+      bidPrice: 1.91, askPrice: 1.92, bidSize: 100, askSize: 100 },
+  );
+  assert.equal(pendingOption.confirmed, false);
+  assert.ok(pendingOption.reasons.includes("LATE_ENTRY_BULLISH_GRIND_CONFIRMATION_MIN_WAIT"));
+  assert.ok(pendingOption.reasons.includes("LATE_ENTRY_BULLISH_GRIND_CONFIRMATION_BID_RESPONSE"));
+
+  const confirmedOption = evaluateLateBullishGrindOptionConfirmation(
+    defaultConfig,
+    { armedAt: timestamp, referenceBidPrice: 1.9 },
+    { ...cleanGrind, timestamp: timestamp + 3_000 },
+    { symbol: "SPY260722C00501000", timestamp: timestamp + 3_000,
+      bidPrice: 1.93, askPrice: 1.94, bidSize: 100, askSize: 100 },
+  );
+  assert.equal(confirmedOption.confirmed, true);
 
   const noisyEngine = new SignalEngine(defaultConfig);
   noisyEngine.recordEntry("BULLISH", timestamp - profile.reentryCooldownSec * 1000);
@@ -580,12 +684,13 @@ test("clean low-noise late bullish grinds can reenter without weakening ordinary
       ...cleanGrind.fast,
       noiseFloorBps: profile.maxFastNoiseFloorBps + 0.01,
     },
+    medium: { ...cleanGrind.medium, normalizedSlope: 5.7 },
   }, unclassified);
   assert.equal(ordinary.signal, undefined);
   assert.deepEqual(ordinary.reasons, ["LATE_ENTRY_FOLLOW_THROUGH_PENDING"]);
 });
 
-test("late bearish persistence profiles retain qualified July 23 setup classes without weakening strong-down confirmation", () => {
+test("late bearish grinds require follow-through by default without weakening strong-down confirmation", () => {
   const unclassified: RegimeDecision = { regime: "UNCLASSIFIED", confidence: 0, reasons: [] };
   const bearishBase = feature(-1);
   const lateBearishGrind: FeatureSnapshot = {
@@ -604,15 +709,18 @@ test("late bearish persistence profiles retain qualified July 23 setup classes w
     medium: { ...bearishBase.medium, normalizedSlope: -0.3 },
     slow: { ...bearishBase.slow, normalizedSlope: -0.15 },
   };
-  const immediateGrind = new SignalEngine(defaultConfig).evaluateDetailed(lateBearishGrind, unclassified);
+  const pendingGrind = new SignalEngine(defaultConfig).evaluateDetailed(lateBearishGrind, unclassified);
+  assert.deepEqual(pendingGrind.reasons, ["LATE_ENTRY_FOLLOW_THROUGH_PENDING"]);
+
+  const legacyImmediateConfig = structuredClone(defaultConfig);
+  legacyImmediateConfig.signals.lateEntryGuard.bearishGrindRequiresFollowThrough = false;
+  const immediateGrind = new SignalEngine(legacyImmediateConfig).evaluateDetailed(
+    lateBearishGrind,
+    unclassified,
+  );
   assert.equal(immediateGrind.signal?.direction, "BEARISH");
   assert.equal(immediateGrind.signal?.kind, "GRIND");
   assert.equal(immediateGrind.signal?.reasons.some((reason) => reason.includes("follow-through")), false);
-
-  const confirmedGrindConfig = structuredClone(defaultConfig);
-  confirmedGrindConfig.signals.lateEntryGuard.bearishGrindRequiresFollowThrough = true;
-  const pendingGrind = new SignalEngine(confirmedGrindConfig).evaluateDetailed(lateBearishGrind, unclassified);
-  assert.deepEqual(pendingGrind.reasons, ["LATE_ENTRY_FOLLOW_THROUGH_PENDING"]);
 
   const earlyUnclassifiedImpulse = {
     ...bearishBase,

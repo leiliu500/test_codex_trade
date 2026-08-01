@@ -15,6 +15,7 @@ export * from "./strategy/trendPhase.js";
 export * from "./strategy/projection.js";
 export * from "./strategy/regimeClassifier.js";
 export * from "./strategy/signalEngine.js";
+export * from "./strategy/lateBullishGrindConfirmation.js";
 export * from "./options/occSymbol.js";
 export * from "./options/optionBook.js";
 export * from "./options/optionUniverse.js";
