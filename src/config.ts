@@ -97,6 +97,9 @@ export interface EngineConfig {
       followThroughMaxSec: number;
       followThroughMinimumBps: number;
       bearishGrindRequiresFollowThrough: boolean;
+      bearishUnclassifiedImpulseMinMediumToFastRatio: number;
+      bullishGrindMinMediumNormalizedSlope: number;
+      bullishNoisyGrindMinMediumToFastRatio: number;
       bullishLowNoiseGrind: {
         enabled: boolean;
         maxFastNoiseFloorBps: number;
@@ -106,6 +109,13 @@ export interface EngineConfig {
         minSlowNormalizedSlope: number;
         minSlowR2: number;
         reentryCooldownSec: number;
+      };
+      bullishGrindOptionConfirmation: {
+        enabled: boolean;
+        minSec: number;
+        maxSec: number;
+        minimumBidImprovement: number;
+        minimumProjectedMoveBps: number;
       };
       bearishUnclassifiedImpulseFollowThroughStart: string;
       bearishStrongDownImpulse: {
@@ -361,6 +371,10 @@ export function validateConfig(config: EngineConfig): void {
         config.signals.lateEntryGuard.followThroughMaxSec >= config.signals.lateEntryGuard.followThroughMinSec &&
         config.signals.lateEntryGuard.followThroughMinimumBps >= 0 &&
         typeof config.signals.lateEntryGuard.bearishGrindRequiresFollowThrough === "boolean" &&
+        config.signals.lateEntryGuard.bearishUnclassifiedImpulseMinMediumToFastRatio >= 0 &&
+        config.signals.lateEntryGuard.bearishUnclassifiedImpulseMinMediumToFastRatio <= 1 &&
+        config.signals.lateEntryGuard.bullishGrindMinMediumNormalizedSlope > 0 &&
+        config.signals.lateEntryGuard.bullishNoisyGrindMinMediumToFastRatio > 0 &&
         typeof config.signals.lateEntryGuard.bullishLowNoiseGrind.enabled === "boolean" &&
         config.signals.lateEntryGuard.bullishLowNoiseGrind.maxFastNoiseFloorBps > 0 &&
         config.signals.lateEntryGuard.bullishLowNoiseGrind.minFastNormalizedSlope > 0 &&
@@ -373,6 +387,14 @@ export function validateConfig(config: EngineConfig): void {
         config.signals.lateEntryGuard.bullishLowNoiseGrind.reentryCooldownSec >= 0 &&
         config.signals.lateEntryGuard.bullishLowNoiseGrind.reentryCooldownSec <=
           config.signals.sameDirectionCooldownSec &&
+        typeof config.signals.lateEntryGuard.bullishGrindOptionConfirmation.enabled === "boolean" &&
+        config.signals.lateEntryGuard.bullishGrindOptionConfirmation.minSec >= 0 &&
+        config.signals.lateEntryGuard.bullishGrindOptionConfirmation.maxSec >=
+          config.signals.lateEntryGuard.bullishGrindOptionConfirmation.minSec &&
+        config.signals.lateEntryGuard.bullishGrindOptionConfirmation.minimumBidImprovement > 0 &&
+        config.signals.lateEntryGuard.bullishGrindOptionConfirmation.minimumProjectedMoveBps > 0 &&
+        config.signals.lateEntryGuard.bullishGrindOptionConfirmation.minimumProjectedMoveBps <=
+          config.signals.lateEntryGuard.minProjectedMoveBps &&
         config.signals.lateEntryGuard.bearishStrongDownImpulse.followThroughMinSec >= 0 &&
         config.signals.lateEntryGuard.bearishStrongDownImpulse.followThroughMaxSec >=
           config.signals.lateEntryGuard.bearishStrongDownImpulse.followThroughMinSec &&

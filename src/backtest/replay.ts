@@ -8,6 +8,10 @@ import { SecondAggregator } from "../features/secondAggregator.js";
 import { FeatureEngine } from "../features/featureEngine.js";
 import { classifyRegime } from "../strategy/regimeClassifier.js";
 import { SignalEngine } from "../strategy/signalEngine.js";
+import {
+  currentBullishProjectionBps, evaluateLateBullishGrindOptionConfirmation,
+  requiresLateBullishGrindOptionConfirmation,
+} from "../strategy/lateBullishGrindConfirmation.js";
 import { OptionBook } from "../options/optionBook.js";
 import { OptionSelector } from "../options/optionSelector.js";
 import { RiskManager } from "../risk/riskManager.js";
@@ -33,6 +37,13 @@ interface PendingExit {
   reason: string;
 }
 type PendingOrder = PendingEntry | PendingExit;
+
+interface PendingLateBullishGrindConfirmation {
+  signal: TradeSignal;
+  candidate: OptionCandidateEvaluation;
+  armedAt: number;
+  referenceBidPrice: number;
+}
 
 export interface ReplayFunnel {
   validFeatures: number;
@@ -94,6 +105,7 @@ export class ReplayEngine {
   #positionCandidate: OptionCandidateEvaluation | undefined;
   #positionMarks: number[] = [];
   #pending: PendingOrder | undefined;
+  #pendingLateBullishGrindConfirmation: PendingLateBullishGrindConfirmation | undefined;
 
   constructor(options: ReplayOptions = {}) {
     this.#config = options.config ?? defaultConfig;
@@ -202,6 +214,69 @@ export class ReplayEngine {
         continue;
       }
 
+      if (this.#pendingLateBullishGrindConfirmation) {
+        const pendingConfirmation = this.#pendingLateBullishGrindConfirmation;
+        const rawQuote = this.#book.get(pendingConfirmation.candidate.symbol)?.quote;
+        const quote = rawQuote &&
+          bar.timestamp - rawQuote.timestamp <= this.#config.dataQuality.maxOptionQuoteAgeMs
+          ? rawQuote : undefined;
+        const confirmation = evaluateLateBullishGrindOptionConfirmation(
+          this.#config,
+          {
+            armedAt: pendingConfirmation.armedAt,
+            referenceBidPrice: pendingConfirmation.referenceBidPrice,
+          },
+          feature,
+          quote,
+        );
+        this.#audit(bar.timestamp, "late_bullish_grind_confirmation", {
+          signalId: pendingConfirmation.signal.id,
+          decision: confirmation.confirmed ? "CONFIRMED" : confirmation.expired ? "EXPIRED" : "PENDING",
+          armedAt: pendingConfirmation.armedAt,
+          symbol: pendingConfirmation.candidate.symbol,
+          elapsedSec: confirmation.elapsedSec,
+          bidImprovement: Number.isFinite(confirmation.bidImprovement) ? confirmation.bidImprovement : null,
+          projectedMoveBps: confirmation.projectedMoveBps,
+          reasons: confirmation.reasons,
+        });
+        if (confirmation.expired) {
+          this.#pendingLateBullishGrindConfirmation = undefined;
+        } else if (confirmation.confirmed && quote) {
+          const confirmedSignal: TradeSignal = {
+            ...pendingConfirmation.signal,
+            id: `${pendingConfirmation.signal.id}-option-confirmed-${feature.timestamp}`,
+            timestamp: feature.timestamp,
+            regime: regime.regime,
+            projectedMoveBps: currentBullishProjectionBps(this.#config, feature),
+            featureSnapshot: feature,
+            reasons: [
+              ...pendingConfirmation.signal.reasons,
+              `late bullish grind option bid confirmed +${confirmation.bidImprovement.toFixed(3)} after ` +
+                `${confirmation.elapsedSec.toFixed(1)}s`,
+            ],
+          };
+          this.#pendingLateBullishGrindConfirmation = undefined;
+          const {
+            gammaAwareProjectedOptionMove: _staleProjectedOptionMove,
+            ...confirmedCandidate
+          } = pendingConfirmation.candidate;
+          this.#submitEntryCandidate(
+            bar.timestamp,
+            confirmedSignal,
+            {
+              ...confirmedCandidate,
+              mid: (quote.bidPrice + quote.askPrice) / 2,
+              spreadPct: (quote.askPrice - quote.bidPrice) /
+                ((quote.bidPrice + quote.askPrice) / 2),
+            },
+            quote,
+          );
+          continue;
+        } else {
+          continue;
+        }
+      }
+
       const signal = this.#signals.evaluate(feature, regime);
       if (!signal) continue;
       this.#funnel.signals += 1;
@@ -214,31 +289,56 @@ export class ReplayEngine {
       this.#funnel.candidateAvailable += 1;
       this.#funnel.costGatePassed += 1;
       const candidate = selection.selected;
-      const risk = this.#risk.evaluate({
-        timestamp: bar.timestamp,
-        optionMid: candidate.mid!,
-        account: this.#account,
-        hasOpenPosition: false,
-      });
-      this.#audit(bar.timestamp, "risk_decision", { risk });
-      if (!risk.allowed) continue;
-      this.#funnel.riskAllowed += 1;
       const quote = this.#book.get(candidate.symbol)?.quote;
       if (!quote) continue;
-      let state = this.#orders.propose({
-        clientOrderId: `entry-${signal.id}`,
-        symbol: candidate.symbol,
-        side: "buy",
-        quantity: risk.quantity,
-        timestamp: bar.timestamp,
-        quote,
-      });
-      state = this.#orders.submit(state, bar.timestamp);
-      this.#pending = { purpose: "ENTRY", state, signal, candidate, risk };
-      this.#funnel.ordersSubmitted += 1;
-      this.#audit(bar.timestamp, "order_submitted", { purpose: "ENTRY", order: state });
-      this.#tryImmediateFill(bar.timestamp, quote);
+      if (requiresLateBullishGrindOptionConfirmation(this.#config, signal)) {
+        this.#pendingLateBullishGrindConfirmation = {
+          signal,
+          candidate,
+          armedAt: signal.timestamp,
+          referenceBidPrice: quote.bidPrice,
+        };
+        this.#audit(bar.timestamp, "late_bullish_grind_confirmation", {
+          signalId: signal.id,
+          decision: "ARMED",
+          symbol: candidate.symbol,
+          armedAt: signal.timestamp,
+          referenceBidPrice: quote.bidPrice,
+        });
+        continue;
+      }
+      this.#submitEntryCandidate(bar.timestamp, signal, candidate, quote);
     }
+  }
+
+  #submitEntryCandidate(
+    timestamp: number,
+    signal: TradeSignal,
+    candidate: OptionCandidateEvaluation,
+    quote: OptionQuote,
+  ): void {
+    const risk = this.#risk.evaluate({
+      timestamp,
+      optionMid: (quote.bidPrice + quote.askPrice) / 2,
+      account: this.#account,
+      hasOpenPosition: false,
+    });
+    this.#audit(timestamp, "risk_decision", { risk });
+    if (!risk.allowed) return;
+    this.#funnel.riskAllowed += 1;
+    let state = this.#orders.propose({
+      clientOrderId: `entry-${signal.id}`,
+      symbol: candidate.symbol,
+      side: "buy",
+      quantity: risk.quantity,
+      timestamp,
+      quote,
+    });
+    state = this.#orders.submit(state, timestamp);
+    this.#pending = { purpose: "ENTRY", state, signal, candidate, risk };
+    this.#funnel.ordersSubmitted += 1;
+    this.#audit(timestamp, "order_submitted", { purpose: "ENTRY", order: state });
+    this.#tryImmediateFill(timestamp, quote);
   }
 
   #submitExit(timestamp: number, quote: OptionQuote, reason: string): void {

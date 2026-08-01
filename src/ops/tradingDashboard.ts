@@ -686,6 +686,14 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
       const count = numberValue(event.data.evaluatedContracts) ?? 0;
       summary = symbol ? `${symbol} selected from ${count} contracts` : `No option selected from ${count} contracts`;
       reasons = reasonCounts(event.data.rejectionCounts);
+    } else if (event.type === "late_bullish_grind_confirmation") {
+      stage = "ENTRY_EVALUATION";
+      outcome = stringValue(event.data.decision) ?? "PENDING";
+      const elapsedSec = numberValue(event.data.elapsedSec);
+      const bidImprovement = numberValue(event.data.bidImprovement);
+      summary = `${symbol ?? "Option"} bid confirmation` +
+        `${elapsedSec === undefined ? "" : ` · ${elapsedSec.toFixed(1)}s`}` +
+        `${bidImprovement === undefined ? "" : ` · ${bidImprovement >= 0 ? "+" : ""}${bidImprovement.toFixed(3)}`}`;
     } else if (event.type === "risk_decision") {
       stage = "RISK";
       const risk = recordValue(event.data.risk);
@@ -1537,6 +1545,7 @@ function sessionBucket(timestamp: number): string {
 const DECISION_EVENT_TYPES = new Set([
   "live_entry_evaluation",
   "live_signal_selection",
+  "late_bullish_grind_confirmation",
   "risk_decision",
   "entry_blocked",
   "paper_order_submission_result",

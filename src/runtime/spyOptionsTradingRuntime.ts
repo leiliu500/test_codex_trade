@@ -4,7 +4,8 @@ import type { StockStream } from "../alpaca/stockStream.js";
 import type { StockStreamEvent } from "../alpaca/stockStream.js";
 import type { TradingRestClient } from "../alpaca/restClient.js";
 import type {
-  AccountState, FeatureSnapshot, OptionContract, OptionQuote, RegimeDecision, StockQuote,
+  AccountState, FeatureSnapshot, OptionCandidateEvaluation, OptionContract, OptionQuote, RegimeDecision,
+  StockQuote, TradeSignal,
 } from "../types.js";
 import type { HealthState } from "../ops/healthServer.js";
 import type { AuditEvent, AuditRecorder } from "../ops/recorder.js";
@@ -24,6 +25,10 @@ import { isAtOrAfter, marketDate, parseClock, secondsSinceMidnight, zonedDateTim
 import type { DailyRiskState } from "../risk/riskManager.js";
 import { lateEntryGuardAudit, morningEntryGuardAudit } from "../strategy/lateEntryGuard.js";
 import { validateOptionQuote } from "../features/quoteSanitizer.js";
+import {
+  currentBullishProjectionBps, evaluateLateBullishGrindOptionConfirmation,
+  requiresLateBullishGrindOptionConfirmation,
+} from "../strategy/lateBullishGrindConfirmation.js";
 
 export interface SpyOptionsRuntimeClient extends TradingRestClient {
   getLatestSpySipQuote(): Promise<StockQuote>;
@@ -64,6 +69,13 @@ export function optionUniverseRequired(
 const OPEN_MARKET_CLOCK_POLL_MS = 5_000;
 const CLOSED_MARKET_CLOCK_POLL_MS = 30_000;
 export const OPTION_QUOTE_STALL_TIMEOUT_MS = 10_000;
+
+interface PendingLateBullishGrindConfirmation {
+  signal: TradeSignal;
+  candidate: OptionCandidateEvaluation;
+  armedAt: number;
+  referenceBidPrice: number;
+}
 
 /** End-to-end, serialized SPY 0DTE option execution runtime. */
 export class SpyOptionsTradingRuntime {
@@ -111,6 +123,7 @@ export class SpyOptionsTradingRuntime {
   #rejectedOptionQuotes = 0;
   #optionQuoteStalled = false;
   #execution: LiveExecutionSnapshot = { halted: false, lifecycle: "FLAT", safeMode: false };
+  #pendingLateBullishGrindConfirmation: PendingLateBullishGrindConfirmation | undefined;
   #retainedPositionSymbol: string | undefined;
   #lastError: string | undefined;
   #lastClockCheck = -Infinity;
@@ -352,6 +365,9 @@ export class SpyOptionsTradingRuntime {
           return;
         }
 
+        if (this.#pendingLateBullishGrindConfirmation &&
+            await this.#advanceLateBullishGrindConfirmation(feature)) return;
+
         const evaluation = this.#signals.evaluateDetailed(feature, this.#lastRegime);
         const signal = evaluation.signal;
         const researchOnlyAfterCutoff = signal !== undefined &&
@@ -434,39 +450,133 @@ export class SpyOptionsTradingRuntime {
         if (!candidate) return;
         if (!quote) return;
         this.#history?.setPrioritySymbols?.(new Set([candidate.symbol]));
-        let result;
-        try {
-          result = await this.#orders.submitEntry({
-            timestamp: this.#now(),
+        if (requiresLateBullishGrindOptionConfirmation(this.#config, signal)) {
+          this.#pendingLateBullishGrindConfirmation = {
             signal,
             candidate,
-            quote,
-            ...(this.#book.get(candidate.symbol)?.snapshot
-              ? { optionSnapshot: this.#book.get(candidate.symbol)!.snapshot! }
-              : {}),
-            killSwitch: this.#killSwitch,
-          });
-        } finally {
-          this.#execution = this.#orders.snapshot();
-          this.#synchronizeHistoryPriorities();
+            armedAt: signal.timestamp,
+            referenceBidPrice: quote.bidPrice,
+          };
+          const confirmationEvent = {
+            signalId: signal.id,
+            timestamp: signal.timestamp,
+            decision: "ARMED",
+            symbol: candidate.symbol,
+            referenceBidPrice: quote.bidPrice,
+            minSec: this.#config.signals.lateEntryGuard.bullishGrindOptionConfirmation.minSec,
+            maxSec: this.#config.signals.lateEntryGuard.bullishGrindOptionConfirmation.maxSec,
+            minimumBidImprovement:
+              this.#config.signals.lateEntryGuard.bullishGrindOptionConfirmation.minimumBidImprovement,
+          };
+          await this.#auditRuntime(signal.timestamp, "late_bullish_grind_confirmation", confirmationEvent);
+          this.#emit("late_bullish_grind_confirmation", confirmationEvent);
+          return;
         }
-        const submissionEvent = {
-          signalId: signal.id,
-          timestamp: this.#now(),
-          symbol: candidate.symbol,
-          direction: signal.direction,
-          morningEntryGuard: morningEntryGuardAudit(this.#config, signal.timestamp),
-          lateEntryGuard: lateEntryGuardAudit(this.#config, signal.timestamp),
-          submitted: result.submitted,
-          reasons: result.reasons,
-          brokerOrderId: result.brokerOrder?.id ?? null,
-        };
-        await this.#auditRuntime(this.#now(), "paper_order_submission_result", submissionEvent);
-        this.#emit("paper_order_submission_result", submissionEvent);
+        await this.#submitSelectedEntry(signal, candidate, quote);
       });
     } catch (error) {
       this.#recordError(error);
     }
+  }
+
+  async #advanceLateBullishGrindConfirmation(feature: FeatureSnapshot): Promise<boolean> {
+    const pending = this.#pendingLateBullishGrindConfirmation;
+    if (!pending) return false;
+    const decisionTimestamp = this.#now();
+    const rawQuote = this.#book.get(pending.candidate.symbol)?.quote;
+    const quoteValidation = rawQuote
+      ? validateOptionQuote(rawQuote, decisionTimestamp, this.#config.dataQuality)
+      : { usable: false as const, reasons: ["MISSING_QUOTE"] };
+    const quote = quoteValidation.usable ? quoteValidation.value : undefined;
+    const evaluation = evaluateLateBullishGrindOptionConfirmation(
+      this.#config,
+      { armedAt: pending.armedAt, referenceBidPrice: pending.referenceBidPrice },
+      feature,
+      quote,
+    );
+    const confirmationEvent = {
+      signalId: pending.signal.id,
+      timestamp: feature.timestamp,
+      armedAt: pending.armedAt,
+      decisionTimestamp,
+      decision: evaluation.confirmed ? "CONFIRMED" : evaluation.expired ? "EXPIRED" : "PENDING",
+      symbol: pending.candidate.symbol,
+      referenceBidPrice: pending.referenceBidPrice,
+      currentBidPrice: quote?.bidPrice ?? null,
+      elapsedSec: evaluation.elapsedSec,
+      bidImprovement: Number.isFinite(evaluation.bidImprovement) ? evaluation.bidImprovement : null,
+      projectedMoveBps: evaluation.projectedMoveBps,
+      reasons: evaluation.reasons,
+      feature: entryFeatureSummary(feature),
+    };
+    await this.#auditRuntime(feature.timestamp, "late_bullish_grind_confirmation", confirmationEvent);
+    this.#emit("late_bullish_grind_confirmation", confirmationEvent);
+    if (evaluation.expired) {
+      this.#pendingLateBullishGrindConfirmation = undefined;
+      this.#synchronizeHistoryPriorities();
+      return false;
+    }
+    if (!evaluation.confirmed || !quote) return true;
+    const confirmedSignal: TradeSignal = {
+      ...pending.signal,
+      id: `${pending.signal.id}-option-confirmed-${feature.timestamp}`,
+      timestamp: feature.timestamp,
+      regime: this.#lastRegime?.regime ?? pending.signal.regime,
+      projectedMoveBps: currentBullishProjectionBps(this.#config, feature),
+      featureSnapshot: feature,
+      reasons: [
+        ...pending.signal.reasons,
+        `late bullish grind option bid confirmed +${evaluation.bidImprovement.toFixed(3)} after ` +
+          `${evaluation.elapsedSec.toFixed(1)}s`,
+      ],
+    };
+    this.#pendingLateBullishGrindConfirmation = undefined;
+    const {
+      gammaAwareProjectedOptionMove: _staleProjectedOptionMove,
+      ...confirmedCandidate
+    } = pending.candidate;
+    await this.#submitSelectedEntry(confirmedSignal, {
+      ...confirmedCandidate,
+      mid: (quote.bidPrice + quote.askPrice) / 2,
+      spreadPct: (quote.askPrice - quote.bidPrice) / ((quote.bidPrice + quote.askPrice) / 2),
+    }, quote);
+    return true;
+  }
+
+  async #submitSelectedEntry(
+    signal: TradeSignal,
+    candidate: OptionCandidateEvaluation,
+    quote: OptionQuote,
+  ): Promise<void> {
+    let result;
+    try {
+      result = await this.#orders.submitEntry({
+        timestamp: this.#now(),
+        signal,
+        candidate,
+        quote,
+        ...(this.#book.get(candidate.symbol)?.snapshot
+          ? { optionSnapshot: this.#book.get(candidate.symbol)!.snapshot! }
+          : {}),
+        killSwitch: this.#killSwitch,
+      });
+    } finally {
+      this.#execution = this.#orders.snapshot();
+      this.#synchronizeHistoryPriorities();
+    }
+    const submissionEvent = {
+      signalId: signal.id,
+      timestamp: this.#now(),
+      symbol: candidate.symbol,
+      direction: signal.direction,
+      morningEntryGuard: morningEntryGuardAudit(this.#config, signal.timestamp),
+      lateEntryGuard: lateEntryGuardAudit(this.#config, signal.timestamp),
+      submitted: result.submitted,
+      reasons: result.reasons,
+      brokerOrderId: result.brokerOrder?.id ?? null,
+    };
+    await this.#auditRuntime(this.#now(), "paper_order_submission_result", submissionEvent);
+    this.#emit("paper_order_submission_result", submissionEvent);
   }
 
   healthState(): HealthState {
@@ -961,7 +1071,8 @@ export class SpyOptionsTradingRuntime {
   }
 
   #synchronizeHistoryPriorities(): void {
-    const symbol = this.#execution.position?.symbol ?? this.#execution.pending?.order.symbol;
+    const symbol = this.#execution.position?.symbol ?? this.#execution.pending?.order.symbol ??
+      this.#pendingLateBullishGrindConfirmation?.candidate.symbol;
     this.#history?.setPrioritySymbols?.(symbol ? new Set([symbol]) : new Set());
   }
 

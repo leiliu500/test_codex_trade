@@ -69,6 +69,13 @@ test("configuration cannot enable later-dated or overnight option trading", () =
   const invalidLateBearishProfile = structuredClone(defaultConfig);
   invalidLateBearishProfile.signals.lateEntryGuard.bearishStrongDownImpulse.followThroughMinSec = 6;
   assert.throws(() => validateConfig(invalidLateBearishProfile), /Late-entry guard thresholds/);
+  const invalidLateBearishPersistence = structuredClone(defaultConfig);
+  invalidLateBearishPersistence.signals.lateEntryGuard
+    .bearishUnclassifiedImpulseMinMediumToFastRatio = 1.01;
+  assert.throws(() => validateConfig(invalidLateBearishPersistence), /Late-entry guard thresholds/);
+  const invalidLateBullishPersistence = structuredClone(defaultConfig);
+  invalidLateBullishPersistence.signals.lateEntryGuard.bullishGrindMinMediumNormalizedSlope = 0;
+  assert.throws(() => validateConfig(invalidLateBullishPersistence), /Late-entry guard thresholds/);
   const invalidLateSpread = structuredClone(defaultConfig);
   invalidLateSpread.signals.lateEntryGuard.maxOptionSpreadPct =
     defaultConfig.dataQuality.maxOptionSpreadPct + 0.01;
@@ -386,14 +393,27 @@ test("unified trade state uses executable bid P&L and distinguishes recovered fr
   assert.ok(falseMidpoint.executablePnl < 0);
   assert.equal(falseMidpoint.position.tradeState, "OPEN_UNPROTECTED");
 
-  const directWinner = estimator.estimate(direct, {
+  const belowDirectWinner = estimator.estimate(direct, {
     symbol: direct.symbol,
     timestamp: timestamp + 1_000,
-    bidPrice: 2.18,
-    askPrice: 2.20,
+    bidPrice: 2.10,
+    askPrice: 2.12,
     bidSize: 10,
     askSize: 10,
   }, timestamp + 1_000);
+  assert.ok(belowDirectWinner.executablePnl < defaultConfig.risk.directWinnerActivationDollars);
+  assert.notEqual(belowDirectWinner.position.tradeState, "PROTECTED_WINNER");
+
+  const directWinner = estimator.estimate(direct, {
+    symbol: direct.symbol,
+    timestamp: timestamp + 1_000,
+    bidPrice: 2.11,
+    askPrice: 2.13,
+    bidSize: 10,
+    askSize: 10,
+  }, timestamp + 1_000);
+  assert.ok(directWinner.executablePnl >= defaultConfig.risk.directWinnerActivationDollars);
+  assert.ok(directWinner.executablePnl < 12);
   assert.equal(directWinner.position.tradeState, "PROTECTED_WINNER");
   assert.ok(directWinner.position.protectedFloorPnl! >= defaultConfig.risk.minimumProfitFloorDollars);
 

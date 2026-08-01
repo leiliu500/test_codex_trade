@@ -81,6 +81,25 @@ test("dashboard exposes liveness and feed tabs before any entries, orders, or hi
   assert.doesNotThrow(() => new Function(script));
 });
 
+test("dashboard decision timeline keeps each late-grind confirmation monitoring time", () => {
+  const dashboard = historicalDashboard();
+  dashboard.record(event("late_bullish_grind_confirmation", {
+    signalId: "sig-late-grind",
+    decision: "PENDING",
+    symbol,
+    elapsedSec: 3,
+    bidImprovement: 0.02,
+    reasons: ["LATE_ENTRY_BULLISH_GRIND_CONFIRMATION_BID_RESPONSE"],
+  }, 3_000));
+  const decision = dashboard.snapshot().decisions[0];
+  assert.equal(decision?.timestamp, timestamp + 3_000);
+  assert.equal(decision?.stage, "ENTRY_EVALUATION");
+  assert.equal(decision?.outcome, "PENDING");
+  assert.equal(decision?.symbol, symbol);
+  assert.match(decision?.summary ?? "", /3\.0s/);
+  assert.deepEqual(decision?.reasons, ["LATE_ENTRY_BULLISH_GRIND_CONFIRMATION_BID_RESPONSE"]);
+});
+
 test("dashboard starts a new empty display day at 10 PM Pacific without restoring older rows", () => {
   const beforeRollover = Date.parse("2026-07-23T04:59:59Z");
   const rollover = Date.parse("2026-07-23T05:00:00Z");
@@ -571,8 +590,8 @@ test("order cards classify entry quality from the best observed and final P&L", 
 
   assert.equal(classified([-7, 20, 12], 12), "GOOD");
   assert.equal(classified([-6, 16, -6], -6), "GOOD_ENTRY_POOR_EXIT");
-  assert.equal(classified([-6, 12, -6], -6), "GOOD_ENTRY_POOR_EXIT");
-  assert.equal(classified([-6, 11, -6], -6), "MARGINAL");
+  assert.equal(classified([-6, 10, -6], -6), "GOOD_ENTRY_POOR_EXIT");
+  assert.equal(classified([-6, 9, -6], -6), "MARGINAL");
   assert.equal(classified([-7, 0, -21], -21), "MARGINAL");
   assert.equal(classified([-9, -7, -28], -28), "POOR");
   assert.equal(classified([-7], -7, true), "EVALUATING");

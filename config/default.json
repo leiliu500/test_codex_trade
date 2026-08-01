@@ -1,5 +1,5 @@
 {
-  "version": "spy-0dte-entry-confirmation-18-block-losing-continuations",
+  "version": "spy-0dte-entry-confirmation-21-late-grind-option-confirmation",
   "symbol": "SPY",
   "timeZone": "America/New_York",
   "session": {
@@ -88,7 +88,10 @@
       "followThroughMinSec": 5,
       "followThroughMaxSec": 15,
       "followThroughMinimumBps": 0.1,
-      "bearishGrindRequiresFollowThrough": false,
+      "bearishGrindRequiresFollowThrough": true,
+      "bearishUnclassifiedImpulseMinMediumToFastRatio": 0.4,
+      "bullishGrindMinMediumNormalizedSlope": 2.5,
+      "bullishNoisyGrindMinMediumToFastRatio": 1.25,
       "bullishLowNoiseGrind": {
         "enabled": true,
         "maxFastNoiseFloorBps": 1.0,
@@ -98,6 +101,13 @@
         "minSlowNormalizedSlope": 0.4,
         "minSlowR2": 0.6,
         "reentryCooldownSec": 480
+      },
+      "bullishGrindOptionConfirmation": {
+        "enabled": true,
+        "minSec": 2,
+        "maxSec": 10,
+        "minimumBidImprovement": 0.03,
+        "minimumProjectedMoveBps": 0.5
       },
       "bearishUnclassifiedImpulseFollowThroughStart": "13:00:00",
       "bearishStrongDownImpulse": {
@@ -177,7 +187,7 @@
     "softFloorBreachMinimumObservations": 2,
     "softProtectionEmergencyLossDollars": 0,
     "minimumProfitFloorDollars": 5,
-    "directWinnerActivationDollars": 12,
+    "directWinnerActivationDollars": 10,
     "recoveredActivationDollars": 15,
     "meaningfulAdverseExcursionDollars": 5,
     "recoveryDeadlineSec": 300,
