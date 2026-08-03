@@ -43,6 +43,7 @@ export interface HealthState {
   strategyStateReady?: boolean;
   strategyStateStatus?: string;
   strategyStateMarketDate?: string;
+  strategyOpeningRangeEnd?: string;
   restoredFeatureBars?: number;
   strategyRecoveryError?: string;
 }
