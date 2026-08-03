@@ -630,6 +630,7 @@ export class SpyOptionsTradingRuntime {
       strategyStateReady: this.#strategyStateReady,
       strategyStateStatus: this.#strategyStateStatus,
       ...(this.#strategyStateMarketDate ? { strategyStateMarketDate: this.#strategyStateMarketDate } : {}),
+      strategyOpeningRangeEnd: this.#config.session.openingRangeEnd,
       restoredStockEvents: this.#restoredStockEvents,
       restoredFeatureBars: this.#restoredFeatureBars,
       ...(this.#strategyRecoveryError ? { strategyRecoveryError: this.#strategyRecoveryError } : {}),

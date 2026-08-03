@@ -894,6 +894,7 @@ test("paper runtime fails closed when current-session SIP recovery is unavailabl
   await runtime.start();
   assert.equal(runtime.healthState().strategyStateReady, false);
   assert.equal(runtime.healthState().strategyStateStatus, "HISTORY_UNAVAILABLE");
+  assert.equal(runtime.healthState().strategyOpeningRangeEnd, defaultConfig.session.openingRangeEnd);
   assert.equal(runtime.healthState().ready, false);
   await optionStream.quote({
     symbol: callSymbol, timestamp: now, bidPrice: 1.99, askPrice: 2.01, bidSize: 100, askSize: 100,

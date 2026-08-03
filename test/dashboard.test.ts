@@ -74,8 +74,11 @@ test("dashboard exposes liveness and feed tabs before any entries, orders, or hi
   assert.match(html, /h\.lastOptionQuoteAgeMs/);
   assert.match(html, /h\.optionQuoteStalled/);
   assert.match(html, /h\.stockWebsocketConnected/);
-  assert.match(html, /SIP restored at startup/);
-  assert.match(html, /live SIP events/);
+  assert.match(html, /strategyBuilding\?'BUILDING'/);
+  assert.match(html, /h\.strategyOpeningRangeEnd/);
+  assert.match(html, /h\.completedBars/);
+  assert.match(html, /bars restored at startup/);
+  assert.match(html, /live bars/);
   const script = html.match(/<script>([\s\S]*)<\/script>/)?.[1];
   assert.ok(script);
   assert.doesNotThrow(() => new Function(script));
