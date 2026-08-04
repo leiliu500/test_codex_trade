@@ -52,7 +52,12 @@ test("dashboard exposes liveness and feed tabs before any entries, orders, or hi
   assert.match(html, /Profit floor/);
   assert.match(html, /Recovery/);
   assert.match(html, /Continuation LCB/);
-  assert.match(html, /material changes/);
+  assert.match(html, /durable updates/);
+  assert.match(html, /controller evaluations/);
+  assert.match(html, /changed-P&amp;L observations|changed-P&L observations/);
+  assert.match(html, /manager decision phases/);
+  assert.match(html, /MODELED ONLY · NOT EXIT ELIGIBLE/);
+  assert.match(html, /Controller evaluation/);
   assert.match(html, /fractionalSecondDigits:3/);
   assert.match(html, /Entry time \(ET\)/);
   assert.match(html, /Last monitored \(ET\)/);
@@ -396,6 +401,7 @@ test("order cards expose and persist unified order-management state changes", as
       expectedChangeDollars: 9.5,
       lcbDollars: 6.5,
       ivCrushDetected: false,
+      providerGreeksAvailable: false,
     },
   }, 100));
 
@@ -407,10 +413,12 @@ test("order cards expose and persist unified order-management state changes", as
   assert.equal(card.protectedFloorPnl, 9);
   assert.equal(card.recoveryProbability, 0.78);
   assert.equal(card.optionContinuation?.thetaDollars, -0.5);
+  assert.equal(card.optionContinuation?.providerGreeksAvailable, false);
   assert.ok(card.updates.some((update) =>
     update.tradeState === "PROTECTED_RECOVERED" &&
     update.protectedFloorPnl === 9 &&
-    update.continuationLcbDollars === 6.5));
+    update.continuationLcbDollars === 6.5 &&
+    update.source === "CONTROLLER"));
 
   await dashboard.record(event("order_management_state", {
     symbol,

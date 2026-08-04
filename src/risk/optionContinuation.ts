@@ -14,6 +14,8 @@ export interface OptionContinuationEstimate {
   expectedChangeDollars: number;
   lcbDollars: number;
   ivCrushDetected: boolean;
+  /** Whether fresh provider Greeks make this estimate eligible to arm an exit. */
+  providerGreeksAvailable: boolean;
 }
 
 export interface OptionContinuationResult {
@@ -137,6 +139,7 @@ export function estimateOptionContinuation(
     expectedChangeDollars,
     lcbDollars,
     ivCrushDetected,
+    providerGreeksAvailable: hasProviderGreeks,
   };
 
   position.optionContinuation = estimate;

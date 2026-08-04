@@ -27,6 +27,8 @@ export interface DashboardOptionContinuation {
   expectedChangeDollars?: number;
   lcbDollars?: number;
   ivCrushDetected?: boolean;
+  /** False when the estimate is modeled-only and cannot arm the Greeks exit. */
+  providerGreeksAvailable?: boolean;
 }
 
 export interface DashboardOrderManagement {
@@ -53,7 +55,7 @@ export interface DashboardOrderDynamicsUpdate extends DashboardOrderManagement {
   timestamp: number;
   stage: DashboardOrderCardStage;
   status: string;
-  source?: "STATUS" | "PNL";
+  source?: "STATUS" | "PNL" | "CONTROLLER";
   remainingQuantity: number;
   realizedPnl: number;
   currentBid?: number;
@@ -449,7 +451,8 @@ function sameOptionContinuation(
     sameDisplayedNumber(left.uncertaintyDollars, right.uncertaintyDollars, 100) &&
     sameDisplayedNumber(left.expectedChangeDollars, right.expectedChangeDollars, 100) &&
     sameDisplayedNumber(left.lcbDollars, right.lcbDollars, 100) &&
-    left.ivCrushDetected === right.ivCrushDetected;
+    left.ivCrushDetected === right.ivCrushDetected &&
+    left.providerGreeksAvailable === right.providerGreeksAvailable;
 }
 
 function sameDisplayedNumber(

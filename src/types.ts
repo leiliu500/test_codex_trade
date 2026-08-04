@@ -298,6 +298,8 @@ export interface PositionState {
     expectedChangeDollars: number;
     lcbDollars: number;
     ivCrushDetected: boolean;
+    /** Modeled estimates remain diagnostic until fresh provider Greeks are present. */
+    providerGreeksAvailable: boolean;
   };
 }
 
