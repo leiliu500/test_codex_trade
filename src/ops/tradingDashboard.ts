@@ -457,7 +457,11 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
       this.#lastExecutionError = stringValue(event.data.reason) ?? "Execution halted";
     }
     if (isDecisionEvent(event.type)) this.#recordDecision(event);
-    const completedCards = this.#refreshProjectedOrderCards(event.timestamp);
+    const completedCards = this.#refreshProjectedOrderCards(
+      event.timestamp,
+      undefined,
+      event.type === "order_management_state" ? "CONTROLLER" : "STATUS",
+    );
     if (completedCards.length > 0 && this.#orderCardPersistence) {
       return Promise.all(completedCards.map((card) => this.#orderCardPersistence!.saveOrderCard(cloneOrderCard(card))))
         .then(() => { this.#orderCardPersistenceHealthy = true; })
@@ -1742,6 +1746,9 @@ function orderManagementFields(
     ...(typeof option.ivCrushDetected === "boolean"
       ? { ivCrushDetected: option.ivCrushDetected }
       : {}),
+    ...(typeof option.providerGreeksAvailable === "boolean"
+      ? { providerGreeksAvailable: option.providerGreeksAvailable }
+      : {}),
   };
   const triggers = stringArray(value.triggers ?? value.exitTriggers);
   const decision = stringValue(value.decision ?? value.managementDecision);
@@ -1977,7 +1984,7 @@ field('Observations',(x.pnlObservationCount??0)+' · '+(x.zeroCrossings??0)+' cr
 const managementDetails=[];
 if(x.managementReason)managementDetails.push('Reason: '+x.managementReason.replaceAll('_',' '));
 if((x.exitTriggers||[]).length)managementDetails.push('Triggers: '+x.exitTriggers.map(value=>value.replaceAll('_',' ')).join(' · '));
-if(x.optionContinuation){const o=x.optionContinuation;managementDetails.push('Greeks $: Δ '+optionalMoney(o.deltaDollars)+' · Γ '+optionalMoney(o.gammaDollars)+' · Vega '+optionalMoney(o.vegaDollars)+' · Theta '+optionalMoney(o.thetaDollars)+' · cost '+optionalMoney(o.holdingCostDollars)+' · uncertainty '+optionalMoney(o.uncertaintyDollars)+(o.ivCrushDetected?' · IV CRUSH':''))}
+if(x.optionContinuation){const o=x.optionContinuation,greeksStatus=o.providerGreeksAvailable===false?' · MODELED ONLY · NOT EXIT ELIGIBLE':o.providerGreeksAvailable===true?' · PROVIDER GREEKS':'';managementDetails.push('Greeks $: Δ '+optionalMoney(o.deltaDollars)+' · Γ '+optionalMoney(o.gammaDollars)+' · Vega '+optionalMoney(o.vegaDollars)+' · Theta '+optionalMoney(o.thetaDollars)+' · cost '+optionalMoney(o.holdingCostDollars)+' · uncertainty '+optionalMoney(o.uncertaintyDollars)+(o.ivCrushDetected?' · IV CRUSH':'')+greeksStatus)}
 management.append(managementHead,managementGrid);
 if(managementDetails.length)management.append(node('div','management-detail',managementDetails.join(' | ')));
 const fields=node('div','live-fields');
@@ -1986,10 +1993,10 @@ fields.append(field('Entry time (ET)',orderFullTime(x.entryTimestamp)),field('La
 if(!x.active)fields.append(field('Exit time (ET)',orderFullTime(x.exitTimestamp)));
 card.append(head,quality,management,fields);
 if(x.workingOrder){const order=x.workingOrder,strip=node('div','order-strip'),row=node('div','order-strip-row'),left=node('span','',order.purpose+' '+order.status+' · '+order.filledQuantity+'/'+order.requestedQuantity+' filled'),right=node('span','',money(order.limitPrice)+' limit · '+order.replacements+' replaces'),details=[],triggerText=(order.triggers||x.exitTriggers||[]).map(value=>value.replaceAll('_',' ')).join(' · ');row.append(left,right);if(order.urgency!==undefined)details.push('urgency '+percent(100*order.urgency,0));if(order.actionTtlMs!==undefined)details.push('TTL '+order.actionTtlMs+' ms');if(order.priceCollar!==undefined)details.push('collar '+money(order.priceCollar));if(order.attempt!==undefined)details.push('attempt '+order.attempt);if(order.exitIntentId)details.push('intent '+order.exitIntentId);strip.append(row);if(details.length)strip.append(node('div','order-strip-detail',details.join(' · ')));if(triggerText)strip.append(node('div','order-strip-detail','Exit triggers · '+triggerText));card.append(strip)}
-const managementUpdates=updates.filter(update=>update.lifecycle||update.tradeState||update.managementDecision).length,dynamics=node('div','dynamics'),title=node('div','dynamics-title','Timestamped durable timeline · '+updates.length+' monitored material changes · '+managementUpdates+' manager states'),columns=node('div','dynamics-columns'),list=node('div','dynamics-list');
+const explicitControllerEvaluations=updates.filter(update=>update.source==='CONTROLLER').length,legacyControllerEvaluations=explicitControllerEvaluations?0:new Set(updates.filter(update=>update.source==='STATUS'&&update.managementDecision&&update.lifecycle!=='CLOSED'&&update.optionContinuation).map(update=>update.timestamp)).size,controllerEvaluations=explicitControllerEvaluations||legacyControllerEvaluations,pnlObservations=updates.reduce((maximum,update)=>Number.isFinite(update.pnlObservationCount)?Math.max(maximum,update.pnlObservationCount):maximum,0),managerPhases=updates.reduce((summary,update)=>{if(!update.managementDecision)return summary;const key=JSON.stringify([update.tradeState,update.managementDecision,update.managementReason,update.exitTriggers||[]]);if(key!==summary.key){summary.count+=1;summary.key=key}return summary},{count:0,key:''}).count,summaryParts=[updates.length+' durable updates'];if(controllerEvaluations)summaryParts.push(controllerEvaluations+' controller evaluations');if(pnlObservations)summaryParts.push(pnlObservations+' changed-P&L observations');if(managerPhases)summaryParts.push(managerPhases+' manager decision phases');const dynamics=node('div','dynamics'),title=node('div','dynamics-title','Timestamped durable timeline · '+summaryParts.join(' · ')),columns=node('div','dynamics-columns'),list=node('div','dynamics-list');
 columns.append(node('span','','Event time (ET)'),node('span','','Monitored change'),node('span','','P&L'),node('span','dynamics-change','Change'));
 const timeline=updates.map((update,index)=>({update,previous:updates[index-1]})).reverse();
-for(const item of timeline){const update=item.update,total=update.totalPnl===undefined?update.unrealizedPnl:update.totalPnl,change=update.pnlChange,row=node('div','dynamics-row'),at=monitoredTimeNode(update.timestamp),sourceLabel=update.source==='PNL'?'P&L observation':'Status update',stateParts=[sourceLabel,update.tradeState||update.lifecycle||update.stage,update.managementDecision||update.status];if(update.managementReason)stateParts.push(update.managementReason);const state=node('span','dynamics-state'),statePrimary=node('span','dynamics-state-primary',stateParts.map(value=>String(value).replaceAll('_',' ')).join(' · ')),stateChange=node('span','dynamics-state-change',monitorChanges(update,item.previous)),value=node('span','dynamics-pnl '+(total>0?'positive':total<0?'negative':''),total===undefined?(update.executablePnl===undefined?'—':money(update.executablePnl)):money(total)),delta=node('span','dynamics-change '+(change>0?'positive':change<0?'negative':''),change===undefined?'—':(change>0?'+':'')+money(change));state.append(statePrimary,stateChange);row.append(at,state,value,delta);list.append(row)}
+for(const item of timeline){const update=item.update,total=update.totalPnl===undefined?update.unrealizedPnl:update.totalPnl,change=update.pnlChange,row=node('div','dynamics-row'),at=monitoredTimeNode(update.timestamp),sourceLabel=update.source==='PNL'?'P&L observation':update.source==='CONTROLLER'?'Controller evaluation':'Status update',stateParts=[sourceLabel,update.tradeState||update.lifecycle||update.stage,update.managementDecision||update.status];if(update.managementReason)stateParts.push(update.managementReason);const state=node('span','dynamics-state'),statePrimary=node('span','dynamics-state-primary',stateParts.map(value=>String(value).replaceAll('_',' ')).join(' · ')),stateChange=node('span','dynamics-state-change',monitorChanges(update,item.previous)),value=node('span','dynamics-pnl '+(total>0?'positive':total<0?'negative':''),total===undefined?(update.executablePnl===undefined?'—':money(update.executablePnl)):money(total)),delta=node('span','dynamics-change '+(change>0?'positive':change<0?'negative':''),change===undefined?'—':(change>0?'+':'')+money(change));state.append(statePrimary,stateChange);row.append(at,state,value,delta);list.append(row)}
 if(updates.length===0)list.append(node('div','muted','Waiting for the first P&L, controller, or broker-state update.'));
 dynamics.append(title,columns,list);card.append(dynamics);return card});
 root.replaceChildren(...cards)

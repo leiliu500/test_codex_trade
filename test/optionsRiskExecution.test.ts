@@ -924,6 +924,10 @@ test("Greeks continuation exits IV crush and theta drag despite a still-valid SP
   });
   assert.equal(decision.exit, false);
   assert.equal(decision.updatedPosition.optionContinuation?.ivCrushDetected, true);
+  assert.equal(
+    decision.updatedPosition.optionContinuation?.providerGreeksAvailable,
+    true,
+  );
   assert.ok(decision.continuationLcbDollars! < 0);
 
   position = decision.updatedPosition;
@@ -1071,6 +1075,10 @@ test("continuation metrics use deterministic modeled Greeks when snapshots conta
   assert.ok(Number.isFinite(decision.updatedPosition.optionContinuation!.gammaDollars));
   assert.ok(Number.isFinite(decision.updatedPosition.optionContinuation!.thetaDollars));
   assert.ok(Number.isFinite(decision.updatedPosition.optionContinuation!.vegaDollars));
+  assert.equal(
+    decision.updatedPosition.optionContinuation!.providerGreeksAvailable,
+    false,
+  );
 });
 
 test("protected trades exit on adverse SPY reversal CUSUM before the hard floor", () => {
