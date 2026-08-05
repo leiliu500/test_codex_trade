@@ -26,6 +26,7 @@ npm run demo -- /tmp/spy-demo.jsonl
 npm run backtest -- /tmp/spy-demo.jsonl
 npm run test:historical -- 2026-07-21 iex
 npm run verify:feature-regression -- 2026-07-22 2026-07-31
+npm run parity:live -- 2026-08-05 1785941487472
 ```
 
 Configuration lives in [`config/default.json`](config/default.json). Calibration profiles must contain only sessions strictly before the replayed session. The historical signal test reports a `guardComparison` block that evaluates immediate entry, bullish-impulse confirmation, all-impulse confirmation, all-entry confirmation, and the static-projection-only baseline on the same downloaded tape; its forward returns are research labels and never enter the causal signal decision. The feature-regression command reads preserved PostgreSQL feature/OPRA history without modifying it and A/B checks continuation-dependent signals through the real option selector. Active morning and late state is recorded under `morningEntryGuard` and `lateEntryGuard` in live evaluation, signal-selection, and paper-submission audit payloads; failures use explicit `MORNING_ENTRY_*` and `LATE_ENTRY_*` reasons. `live_entry_evaluation.data.morningEntryBaseline` and `.lateEntryBaseline` expose the same non-executable evaluator with both active time guards disabled, preserving baseline candidates needed to measure guard impact. Confirmation-scope research remains available in `live_entry_evaluation.data.shadowEvaluations`.
@@ -70,6 +71,14 @@ PostgreSQL persists two indexed histories in the named `spy-options-postgres` vo
 
 - `market_events`: raw SPY SIP quotes/trades, subscribed OPRA option quotes, option contracts/snapshots, and generated feature snapshots. High-rate records are inserted in batches so quote handling is not blocked by one SQL round trip per event.
 - `audit_events`: signals, selection results, risk decisions, order requests/states/replacements, fills, exits, reconciliation, and execution halts. Critical execution events are inserted durably before processing continues.
+
+Audit broker-backed order management without reselecting the entry or assuming an immediate fill:
+
+```bash
+npm run parity:live -- YYYY-MM-DD [ENTRY_TIMESTAMP_MS] [CONFIG_JSON]
+```
+
+The parity report starts from the broker-confirmed contract and entry fill, evaluates the exit controller on the retained live feature stream, the last accepted active quote in each OPRA callback batch, and 250 ms timer ticks, then compares the modeled trigger with the live exit request. It reports decision executable P&L, submitted-limit P&L, the last quote bid before the broker fill, and realized broker-fill P&L separately. Runtime startup persists the full effective configuration, so future reports automatically use the version that actually traded; older supported versions use immutable files in `config/history`, and the command refuses an unavailable version unless its exact JSON is provided.
 
 Set a strong `POSTGRES_PASSWORD` in `.env` before non-local deployment. Raw OPRA history can be large; monitor the Docker volume and back it up according to your retention requirements.
 

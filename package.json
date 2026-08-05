@@ -23,6 +23,7 @@
     "demo": "tsx src/cli/generateDemoReplay.ts",
     "test:historical": "tsx src/cli/historicalSignalTest.ts",
     "verify:feature-regression": "tsx src/cli/historicalFeatureRegression.ts",
+    "parity:live": "tsx src/cli/liveTradeParity.ts",
     "export:history": "tsx src/cli/exportPostgresReplay.ts"
   },
   "engines": {

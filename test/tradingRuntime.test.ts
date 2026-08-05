@@ -453,6 +453,9 @@ test("end-to-end paper runtime arms SIP/OPRA and routes an eligible signal to a 
     riskRecovery?.data.entryConfirmationMode,
     immediateRuntimeConfig.signals.entryConfirmationMode,
   );
+  const configSnapshot = recorder.events.find((event) => event.type === "runtime_config_snapshot");
+  assert.deepEqual(configSnapshot?.data.config, immediateRuntimeConfig);
+  assert.equal(configSnapshot?.data.executionTickMs, 60_000);
   await runtime.close();
   assert.deepEqual(history.priorityChanges.at(-1), []);
 });

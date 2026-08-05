@@ -237,6 +237,12 @@ export class SpyOptionsTradingRuntime {
         this.#strategyStateMarketDate = marketDate(clock.timestamp, this.#config.timeZone);
       }
       this.#execution = await this.#orders.initialize(clock.timestamp);
+      await this.#auditRuntime(clock.timestamp, "runtime_config_snapshot", {
+        config: this.#config,
+        executionMode: this.#executionMode,
+        executionEnabled: this.#executionEnabled,
+        executionTickMs: this.#executionTickMs,
+      });
       await this.#auditRuntime(clock.timestamp, "daily_risk_state_recovery", {
         marketDate: this.#restoredRuntimeState.risk.marketDate,
         restoredEntries: this.#restoredRuntimeState.risk.entries,
