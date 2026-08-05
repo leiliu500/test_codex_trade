@@ -19,6 +19,10 @@ test("configuration cannot enable later-dated or overnight option trading", () =
   const afterClose = structuredClone(defaultConfig);
   afterClose.session.forceExit = "16:00:00";
   assert.throws(() => validateConfig(afterClose), /forceExit < 16:00/);
+  const invalidLiquidityFallback = structuredClone(defaultConfig);
+  invalidLiquidityFallback.options.minDailyVolumeForOpenInterestFallback =
+    invalidLiquidityFallback.options.minDailyVolume - 1;
+  assert.throws(() => validateConfig(invalidLiquidityFallback), /Option liquidity thresholds/);
   const invalidConfirmation = structuredClone(defaultConfig);
   invalidConfirmation.signals.followThroughMinSec = 16;
   invalidConfirmation.signals.followThroughMaxSec = 15;

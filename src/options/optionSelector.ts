@@ -69,8 +69,15 @@ export class OptionSelector {
         spreadPct > staticEntryGuard.maxOptionSpreadPct) {
       rejectionReasons.push(`${staticEntryGuard.reasonPrefix}OPTION_SPREAD_TOO_WIDE`);
     }
-    if ((entry?.snapshot?.dailyVolume ?? -Infinity) < this.#config.options.minDailyVolume) rejectionReasons.push("INSUFFICIENT_DAILY_VOLUME");
-    if ((entry?.snapshot?.openInterest ?? -Infinity) < this.#config.options.minOpenInterest) rejectionReasons.push("INSUFFICIENT_OPEN_INTEREST");
+    const dailyVolume = entry?.snapshot?.dailyVolume ?? -Infinity;
+    const openInterest = entry?.snapshot?.openInterest ?? -Infinity;
+    if (dailyVolume < this.#config.options.minDailyVolume) {
+      rejectionReasons.push("INSUFFICIENT_DAILY_VOLUME");
+    }
+    if (openInterest < this.#config.options.minOpenInterest &&
+        dailyVolume < this.#config.options.minDailyVolumeForOpenInterestFallback) {
+      rejectionReasons.push("INSUFFICIENT_OPEN_INTEREST");
+    }
 
     let iv = entry?.snapshot?.impliedVolatility;
     const expiry = zonedDateTimeToEpoch(contract.expirationDate, "16:00:00", this.#config.timeZone);

@@ -150,6 +150,7 @@ export interface EngineConfig {
     maxOptionMid: number;
     minDailyVolume: number;
     minOpenInterest: number;
+    minDailyVolumeForOpenInterestFallback: number;
     subscriptionCandidatesPerSide: number;
     chainRefreshSec: number;
     riskFreeRate: number;
@@ -271,6 +272,12 @@ export function validateConfig(config: EngineConfig): void {
   }
   if (config.options.expirationDaysMin !== 0 || config.options.expirationDaysMax !== 0) {
     throw new Error("This engine is hard-limited to SPY options expiring on the current market date (0DTE)");
+  }
+  if (!(Number.isFinite(config.options.minDailyVolume) && config.options.minDailyVolume >= 0 &&
+        Number.isFinite(config.options.minOpenInterest) && config.options.minOpenInterest >= 0 &&
+        Number.isFinite(config.options.minDailyVolumeForOpenInterestFallback) &&
+        config.options.minDailyVolumeForOpenInterestFallback >= config.options.minDailyVolume)) {
+    throw new Error("Option liquidity thresholds are invalid");
   }
   const entryStart = parseClock(config.session.entryStart);
   const lateBullishImpulseStart = parseClock(config.signals.lateBullishImpulseStart);

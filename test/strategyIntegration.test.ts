@@ -943,6 +943,41 @@ test("option selector rejects wide cost and ranks an eligible liquid contract", 
   assert.ok(new OptionSelector(defaultConfig).evaluate(laterDated, undefined, signal).rejectionReasons.includes("NOT_SAME_DAY_EXPIRATION"));
 });
 
+test("option selector accepts high same-day volume as a fallback for low open interest", () => {
+  const f = feature();
+  const signal = new SignalEngine(immediateSignalConfig).evaluate(f, classifyRegime(f, defaultConfig.regimes))!;
+  const contract: OptionContract = {
+    symbol: "SPY260722C00501000", underlying: "SPY", expirationDate: "2026-07-22",
+    strike: 501, type: "call", active: true, tradable: true,
+  };
+  const book = new OptionBook();
+  book.upsertContract(contract);
+  book.updateQuote({
+    symbol: contract.symbol, timestamp: signal.timestamp,
+    bidPrice: 1.995, askPrice: 2.005, bidSize: 100, askSize: 100,
+  });
+  book.updateSnapshot({
+    symbol: contract.symbol, timestamp: signal.timestamp,
+    impliedVolatility: 0.22, greeks: { delta: 0.52, gamma: 0.02 },
+    dailyVolume: defaultConfig.options.minDailyVolumeForOpenInterestFallback,
+    openInterest: 0,
+  });
+
+  const selector = new OptionSelector(defaultConfig);
+  const highVolume = selector.evaluate(contract, book.get(contract.symbol), signal);
+  assert.equal(highVolume.eligible, true);
+  assert.ok(!highVolume.rejectionReasons.includes("INSUFFICIENT_OPEN_INTEREST"));
+
+  book.updateSnapshot({
+    symbol: contract.symbol, timestamp: signal.timestamp + 1,
+    dailyVolume: defaultConfig.options.minDailyVolumeForOpenInterestFallback - 1,
+    openInterest: 0,
+  });
+  const lowVolume = selector.evaluate(contract, book.get(contract.symbol), signal);
+  assert.equal(lowVolume.eligible, false);
+  assert.ok(lowVolume.rejectionReasons.includes("INSUFFICIENT_OPEN_INTEREST"));
+});
+
 test("morning option selection applies static gates after entry confirmation", () => {
   const morning = feature();
   const signal = new SignalEngine(immediateSignalConfig).evaluate(
