@@ -36,6 +36,10 @@ test("configuration cannot enable later-dated or overnight option trading", () =
   const invalidOppositeCooldown = structuredClone(defaultConfig);
   invalidOppositeCooldown.signals.oppositeDirectionCooldownSec = -1;
   assert.throws(() => validateConfig(invalidOppositeCooldown), /Signal cooldowns/);
+  const invalidProtectedExitReentryWindow = structuredClone(defaultConfig);
+  invalidProtectedExitReentryWindow.signals.protectedExitReentry.windowSec =
+    invalidProtectedExitReentryWindow.signals.sameDirectionCooldownSec + 1;
+  assert.throws(() => validateConfig(invalidProtectedExitReentryWindow), /Signal cooldowns/);
   const invalidScope = structuredClone(defaultConfig);
   invalidScope.signals.followThroughScope = "INVALID" as typeof invalidScope.signals.followThroughScope;
   assert.throws(() => validateConfig(invalidScope), /Follow-through scope/);
@@ -136,6 +140,12 @@ test("configuration cannot enable later-dated or overnight option trading", () =
   const invalidSoftEmergencyLoss = structuredClone(defaultConfig);
   invalidSoftEmergencyLoss.risk.softProtectionEmergencyLossDollars = -1;
   assert.throws(() => validateConfig(invalidSoftEmergencyLoss), /stopping-controller/);
+  const invalidOppositeRegimeGrace = structuredClone(defaultConfig);
+  invalidOppositeRegimeGrace.risk.oppositeRegimeGraceSec = -1;
+  assert.throws(() => validateConfig(invalidOppositeRegimeGrace), /stopping-controller/);
+  const invalidOppositeRegimeObservations = structuredClone(defaultConfig);
+  invalidOppositeRegimeObservations.risk.oppositeRegimeMinimumObservations = 1;
+  assert.throws(() => validateConfig(invalidOppositeRegimeObservations), /stopping-controller/);
 });
 
 test("Black-Scholes values/Greeks and IV bisection are internally consistent", () => {
@@ -347,12 +357,61 @@ test("exit manager distinguishes a fresh invalid quote from genuinely stale data
   assert.equal(stale.reason, "STALE_DATA");
 });
 
-test("opposite regimes and 8-second trend invalidation exit", () => {
+test("opposite regimes require distinct persistent evidence and reset after alignment", () => {
+  const manager = new ExitManager(defaultConfig);
+  const entry = zonedDateTimeToEpoch("2026-07-22", "11:00:00");
+  let position = unifiedPosition(entry);
+  const down: RegimeDecision = { regime: "STRONG_DOWN", confidence: 1, reasons: [] };
+  const up: RegimeDecision = { regime: "STRONG_UP", confidence: 1, reasons: [] };
+  const featureAt = (timestamp: number) => ({
+    timestamp,
+    medium: { normalizedSlope: 1 },
+    price: 501,
+    vwap: { sessionVwap: 500 },
+  }) as unknown as FeatureSnapshot;
+
+  let decision = manager.evaluate({
+    ...exitContext(position, entry + 1_000, 2),
+    regime: down,
+    feature: featureAt(entry + 1_000),
+  });
+  assert.equal(decision.exit, false);
+  assert.equal(decision.updatedPosition.oppositeRegimeObservationCount, 1);
+  position = decision.updatedPosition;
+
+  decision = manager.evaluate({
+    ...exitContext(position, entry + 3_500, 2),
+    regime: down,
+    feature: featureAt(entry + 1_000),
+  });
+  assert.equal(decision.exit, false);
+  assert.equal(decision.updatedPosition.oppositeRegimeObservationCount, 1);
+  position = decision.updatedPosition;
+
+  decision = manager.evaluate({
+    ...exitContext(position, entry + 4_000, 2),
+    regime: up,
+    feature: featureAt(entry + 4_000),
+  });
+  assert.equal(decision.exit, false);
+  assert.equal(decision.updatedPosition.oppositeRegimeSince, undefined);
+  position = decision.updatedPosition;
+
+  for (const offsetMs of [5_000, 6_000, 7_000]) {
+    decision = manager.evaluate({
+      ...exitContext(position, entry + offsetMs, 2),
+      regime: down,
+      feature: featureAt(entry + offsetMs),
+    });
+    position = decision.updatedPosition;
+  }
+  assert.equal(decision.reason, "OPPOSITE_REGIME");
+});
+
+test("medium-structure invalidation retains its independent 8-second grace", () => {
   const manager = new ExitManager(defaultConfig);
   const entry = zonedDateTimeToEpoch("2026-07-22", "11:00:00");
   const position = unifiedPosition(entry);
-  const down: RegimeDecision = { regime: "STRONG_DOWN", confidence: 1, reasons: [] };
-  assert.equal(manager.evaluate({ ...exitContext(position, entry + 1000, 2), regime: down }).reason, "OPPOSITE_REGIME");
   const feature = { medium: { normalizedSlope: -1 }, price: 499, vwap: { sessionVwap: 500 } } as unknown as FeatureSnapshot;
   const first = manager.evaluate({ ...exitContext(position, entry + 1000, 2), feature });
   assert.equal(first.exit, false);

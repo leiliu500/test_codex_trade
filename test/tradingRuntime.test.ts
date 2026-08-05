@@ -566,6 +566,28 @@ test("restart restoration deduplicates partial entry fills and preserves the dai
   assert.ok(decision.reasons.includes("MAX_DAILY_ENTRIES_REACHED"));
 });
 
+test("restart restoration preserves the latest profitable protective exit for guarded re-entry", () => {
+  const events: AuditEvent[] = [
+    {
+      timestamp: now - 30_000, marketDate: date, type: "entry_fill", configVersion: "before",
+      data: {
+        signalId: "bearish-entry",
+        position: { symbol: callSymbol, direction: "BEARISH", entryTimestamp: now - 30_000 },
+      },
+    },
+    {
+      timestamp: now - 12_000, marketDate: date, type: "exit_fill", configVersion: "before",
+      data: {
+        direction: "BEARISH",
+        reason: "OPPOSITE_REGIME",
+        realizedPnl: 4,
+      },
+    },
+  ];
+  const restored = restoreRuntimeState(events, now, defaultConfig.timeZone);
+  assert.equal(restored.signal.lastProtectedExits?.BEARISH, now - 12_000);
+});
+
 test("restart preserves the high daily safety limit after six unique fills", async () => {
   const restoredAuditEvents: AuditEvent[] = Array.from({ length: 6 }, (_, index) => ({
     timestamp: now - (index + 1) * 1_000,

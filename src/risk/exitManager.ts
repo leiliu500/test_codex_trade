@@ -124,7 +124,35 @@ export class ExitManager {
 
     const oppositeRegime = context.regime &&
       isOppositeRegime(position.direction, context.regime.regime);
-    if (oppositeRegime) trigger("STRUCTURAL_INVALIDATION");
+    if (oppositeRegime) {
+      const evidenceTimestamp = context.feature?.timestamp ?? context.timestamp;
+      if (position.oppositeRegimeSince === undefined) {
+        position.oppositeRegimeSince = evidenceTimestamp;
+        position.oppositeRegimeObservationCount = 1;
+        position.lastOppositeRegimeFeatureTimestamp = evidenceTimestamp;
+      } else if (
+        position.lastOppositeRegimeFeatureTimestamp === undefined ||
+        evidenceTimestamp > position.lastOppositeRegimeFeatureTimestamp
+      ) {
+        position.oppositeRegimeObservationCount =
+          (position.oppositeRegimeObservationCount ?? 0) + 1;
+        position.lastOppositeRegimeFeatureTimestamp = evidenceTimestamp;
+      }
+      const oppositeRegimeSince = position.oppositeRegimeSince;
+      const oppositeRegimeObservations = position.oppositeRegimeObservationCount ?? 0;
+      if (
+        context.timestamp - oppositeRegimeSince >=
+          this.#config.risk.oppositeRegimeGraceSec * 1000 &&
+        oppositeRegimeObservations >=
+          this.#config.risk.oppositeRegimeMinimumObservations
+      ) {
+        trigger("STRUCTURAL_INVALIDATION");
+      }
+    } else if (context.regime) {
+      delete position.oppositeRegimeSince;
+      delete position.oppositeRegimeObservationCount;
+      delete position.lastOppositeRegimeFeatureTimestamp;
+    }
 
     if (context.feature) {
       const directionSign = position.direction === "BULLISH" ? 1 : -1;

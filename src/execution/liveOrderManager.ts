@@ -114,9 +114,18 @@ export interface LiveOrderManagerOptions {
   config: EngineConfig;
   client: TradingRestClient;
   recorder?: AuditRecorder;
+  onCompletedExit?: (exit: CompletedLiveExit) => void;
   restoredPosition?: PositionState;
   knownClientOrderIds?: ReadonlySet<string>;
   restoredRiskState?: DailyRiskState;
+}
+
+export interface CompletedLiveExit {
+  timestamp: number;
+  entryTimestamp: number;
+  direction: TradeSignal["direction"];
+  reason: ExitReason;
+  realizedPnl: number;
 }
 
 const ACTIVE_BROKER_STATUSES = new Set([
@@ -136,6 +145,7 @@ export class LiveOrderManager {
   readonly #risk: RiskManager;
   readonly #exits: ExitManager;
   readonly #knownClientOrderIds: Set<string>;
+  readonly #onCompletedExit: ((exit: CompletedLiveExit) => void) | undefined;
   #position: PositionState | undefined;
   #pending: PendingBrokerExecution | undefined;
   #exitIntent: LogicalExitIntent | undefined;
@@ -154,6 +164,7 @@ export class LiveOrderManager {
     this.#orders = new OrderExecutor(options.config);
     this.#risk = new RiskManager(options.config);
     this.#exits = new ExitManager(options.config);
+    this.#onCompletedExit = options.onCompletedExit;
     if (options.restoredRiskState) {
       this.#risk.restoreState(options.restoredRiskState);
     }
@@ -439,6 +450,15 @@ export class LiveOrderManager {
       reversalCusum: decision.updatedPosition.reversalCusum,
       zeroCrossings: decision.updatedPosition.zeroCrossings,
       pnlObservationCount: decision.updatedPosition.pnlObservationCount,
+      ...(decision.updatedPosition.oppositeRegimeSince !== undefined
+        ? { oppositeRegimeSince: decision.updatedPosition.oppositeRegimeSince }
+        : {}),
+      ...(decision.updatedPosition.oppositeRegimeObservationCount !== undefined
+        ? {
+            oppositeRegimeObservationCount:
+              decision.updatedPosition.oppositeRegimeObservationCount,
+          }
+        : {}),
       ...(decision.updatedPosition.optionContinuation
         ? { optionContinuation: { ...decision.updatedPosition.optionContinuation } }
         : {}),
@@ -466,6 +486,9 @@ export class LiveOrderManager {
       reversalCusum: managementState.reversalCusum,
       zeroCrossings: managementState.zeroCrossings,
       pnlObservationCount: managementState.pnlObservationCount,
+      oppositeRegimeSince: managementState.oppositeRegimeSince ?? null,
+      oppositeRegimeObservationCount:
+        managementState.oppositeRegimeObservationCount ?? null,
       optionContinuation: managementState.optionContinuation ?? null,
     });
     if (materialChange) {
@@ -651,6 +674,13 @@ export class LiveOrderManager {
           remainingQuantity: this.#position.quantity,
         });
         if (this.#position.quantity === 0) {
+          this.#onCompletedExit?.({
+            timestamp,
+            entryTimestamp: exitingPosition.entryTimestamp,
+            direction: exitingPosition.direction,
+            reason: pending.exitReason ?? "BROKER_OR_POSITION_RISK",
+            realizedPnl,
+          });
           this.#position = undefined;
           this.#lastAuditedManagementState = undefined;
           this.#exitIntent = undefined;
@@ -1027,6 +1057,27 @@ function validatedUnifiedPosition(position: PositionState): PositionState {
       ((position.softFloorBreachStartedAt === undefined) !==
        (position.softFloorBreachCandidateObservationCount === undefined))) {
     throw new Error("Restored position contains an invalid soft-protection state");
+  }
+  const oppositeRegimeState = [
+    position.oppositeRegimeSince,
+    position.oppositeRegimeObservationCount,
+    position.lastOppositeRegimeFeatureTimestamp,
+  ];
+  const hasAnyOppositeRegimeState = oppositeRegimeState.some(
+    (value) => value !== undefined,
+  );
+  const hasCompleteOppositeRegimeState = oppositeRegimeState.every(
+    (value) => value !== undefined,
+  );
+  if (hasAnyOppositeRegimeState && (
+    !hasCompleteOppositeRegimeState ||
+    !Number.isFinite(position.oppositeRegimeSince) ||
+    !(Number.isInteger(position.oppositeRegimeObservationCount) &&
+      position.oppositeRegimeObservationCount! >= 1) ||
+    !Number.isFinite(position.lastOppositeRegimeFeatureTimestamp) ||
+    position.lastOppositeRegimeFeatureTimestamp! < position.oppositeRegimeSince!
+  )) {
+    throw new Error("Restored position contains an invalid opposite-regime confirmation state");
   }
   return { ...position };
 }

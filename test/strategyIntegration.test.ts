@@ -831,6 +831,59 @@ test("global gates block stale data, whipsaw, time violations, and fill-based di
   );
 });
 
+test("a profitable protective exit permits one strong-regime re-entry inside the guarded window", () => {
+  const config = structuredClone(immediateSignalConfig);
+  const base = feature(-1);
+  const direction = "BEARISH" as const;
+  const strongDown: RegimeDecision = { regime: "STRONG_DOWN", confidence: 1, reasons: [] };
+  const unclassified: RegimeDecision = { regime: "UNCLASSIFIED", confidence: 0, reasons: [] };
+  const entryTimestamp = base.timestamp - 30_000;
+  const exitTimestamp = base.timestamp - config.signals.protectedExitReentry.cooldownSec * 1_000;
+  const engine = new SignalEngine(config);
+  engine.recordEntry(direction, entryTimestamp);
+  engine.recordCompletedExit(direction, exitTimestamp, "OPPOSITE_REGIME", 4);
+
+  const weakRegime = engine.evaluateDetailed(base, unclassified);
+  assert.equal(weakRegime.signal, undefined);
+  assert.ok(weakRegime.directions.find((item) => item.direction === direction)?.reasons
+    .includes("SAME_DIRECTION_COOLDOWN"));
+
+  const reentry = engine.evaluateDetailed(base, strongDown);
+  assert.equal(reentry.signal?.direction, direction);
+  assert.ok(reentry.signal?.reasons.some((reason) => reason.includes("profitable protective exit")));
+
+  engine.recordEntry(direction, base.timestamp);
+  const consumed = engine.evaluateDetailed(
+    { ...base, timestamp: base.timestamp + 6_000 },
+    strongDown,
+  );
+  assert.equal(consumed.signal, undefined);
+  assert.ok(consumed.directions.find((item) => item.direction === direction)?.reasons
+    .includes("SAME_DIRECTION_COOLDOWN"));
+
+  const expiredEngine = new SignalEngine(config);
+  expiredEngine.restoreState({
+    lastEntries: { [direction]: entryTimestamp },
+    lastProtectedExits: {
+      [direction]: base.timestamp - (config.signals.protectedExitReentry.windowSec + 1) * 1_000,
+    },
+  });
+  const expired = expiredEngine.evaluateDetailed(base, strongDown);
+  assert.equal(expired.signal, undefined);
+  assert.ok(expired.directions.find((item) => item.direction === direction)?.reasons
+    .includes("SAME_DIRECTION_COOLDOWN"));
+
+  for (const [reason, pnl] of [["REVERSAL_CUSUM", 4], ["OPPOSITE_REGIME", -1]] as const) {
+    const ineligibleEngine = new SignalEngine(config);
+    ineligibleEngine.recordEntry(direction, entryTimestamp);
+    ineligibleEngine.recordCompletedExit(direction, exitTimestamp, reason, pnl);
+    const ineligible = ineligibleEngine.evaluateDetailed(base, strongDown);
+    assert.equal(ineligible.signal, undefined);
+    assert.ok(ineligible.directions.find((item) => item.direction === direction)?.reasons
+      .includes("SAME_DIRECTION_COOLDOWN"));
+  }
+});
+
 test("opening range cannot become complete from a late-started partial session", () => {
   const tracker = new OpeningRangeTracker(defaultConfig);
   tracker.update(zonedDateTimeToEpoch("2026-07-22", "10:06:53"), 501);

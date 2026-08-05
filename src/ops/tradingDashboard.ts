@@ -1801,6 +1801,15 @@ function orderManagementFields(
     ...(numberValue(value.pnlObservationCount) !== undefined
       ? { pnlObservationCount: numberValue(value.pnlObservationCount)! }
       : {}),
+    ...(numberValue(value.oppositeRegimeSince) !== undefined
+      ? { oppositeRegimeSince: numberValue(value.oppositeRegimeSince)! }
+      : {}),
+    ...(numberValue(value.oppositeRegimeObservationCount) !== undefined
+      ? {
+          oppositeRegimeObservationCount:
+            numberValue(value.oppositeRegimeObservationCount)!,
+        }
+      : {}),
     ...(Object.keys(optionContinuation).length > 0 ? { optionContinuation } : {}),
   };
 }
@@ -1840,6 +1849,12 @@ function copyOrderManagement(
     ...(value.zeroCrossings !== undefined ? { zeroCrossings: value.zeroCrossings } : {}),
     ...(value.pnlObservationCount !== undefined
       ? { pnlObservationCount: value.pnlObservationCount }
+      : {}),
+    ...(value.oppositeRegimeSince !== undefined
+      ? { oppositeRegimeSince: value.oppositeRegimeSince }
+      : {}),
+    ...(value.oppositeRegimeObservationCount !== undefined
+      ? { oppositeRegimeObservationCount: value.oppositeRegimeObservationCount }
       : {}),
     ...(value.optionContinuation
       ? { optionContinuation: { ...value.optionContinuation } }

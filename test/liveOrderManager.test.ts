@@ -10,6 +10,7 @@ import type {
 } from "../src/types.js";
 import { LiveOrderManager } from "../src/execution/liveOrderManager.js";
 import { MemoryRecorder } from "../src/ops/recorder.js";
+import { RiskManager } from "../src/risk/riskManager.js";
 import { zonedDateTimeToEpoch } from "../src/utils/time.js";
 
 const date = "2026-07-22";
@@ -196,7 +197,12 @@ test("live manager submits an option entry, reconciles partial fill, cancels rem
 
 test("trailing protection locks a configured profit floor after activation", async () => {
   const client = new FakeTradingClient();
-  const manager = new LiveOrderManager({ config: defaultConfig, client });
+  const completedExits: Array<{ reason: string; realizedPnl: number; direction: string }> = [];
+  const manager = new LiveOrderManager({
+    config: defaultConfig,
+    client,
+    onCompletedExit: (exit) => completedExits.push(exit),
+  });
   await manager.initialize(start);
   const submitted = await manager.submitEntry({ timestamp: start, signal: signal(), candidate: candidate(), quote: optionQuote(start) });
   client.fill(submitted.brokerOrder!.id, submitted.risk!.quantity, 2, "filled");
@@ -211,6 +217,17 @@ test("trailing protection locks a configured profit floor after activation", asy
   assert.equal(state.pending?.purpose, "EXIT");
   assert.equal(state.pending?.exitReason, "PROFIT_FLOOR_EXIT");
   assert.equal(state.pending?.order.marketable, true);
+
+  client.fill(state.pending!.brokerOrderId, 1, 2.02, "filled");
+  state = await manager.tick({ timestamp: start + 1_000, optionQuote: optionQuote(start + 1_000, 2.01, 2.03) });
+  assert.equal(state.position, undefined);
+  assert.deepEqual(completedExits, [{
+    timestamp: start + 1_000,
+    entryTimestamp: start + 400,
+    direction: "BULLISH",
+    reason: "PROFIT_FLOOR_EXIT",
+    realizedPnl: 2.0000000000000018,
+  }]);
 });
 
 test("unchanged quote-batch evaluations do not flood durable management history", async () => {
@@ -385,6 +402,22 @@ test("incomplete restored management state is rejected instead of synthesized", 
   assert.throws(
     () => new LiveOrderManager({ config: defaultConfig, client, restoredPosition: incomplete }),
     /complete unified order-management state/,
+  );
+
+  const invalidOppositeRegimeState = {
+    ...new RiskManager(defaultConfig).createFilledPosition(
+      symbol, "BULLISH", 1, 2, start, 500,
+    ),
+    oppositeRegimeSince: start + 1_000,
+    oppositeRegimeObservationCount: 1,
+  };
+  assert.throws(
+    () => new LiveOrderManager({
+      config: defaultConfig,
+      client,
+      restoredPosition: invalidOppositeRegimeState,
+    }),
+    /invalid opposite-regime confirmation state/,
   );
 });
 
