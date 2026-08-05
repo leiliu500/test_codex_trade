@@ -460,6 +460,172 @@ test("end-to-end paper runtime arms SIP/OPRA and routes an eligible signal to a 
   assert.deepEqual(history.priorityChanges.at(-1), []);
 });
 
+test("transient option spread rejection retries from OPRA and submits only after signal revalidation", async () => {
+  let decisionTime = now;
+  const config = structuredClone(immediateRuntimeConfig);
+  config.execution.optionSelectionRetryMs = 1_000;
+  const client = new FakeRuntimeClient();
+  client.clock.timestamp = decisionTime;
+  const optionStream = new FakeOptionStream();
+  const recorder = new MemoryRecorder();
+  const runtime = new SpyOptionsTradingRuntime({
+    config,
+    client,
+    stockStream: new FakeStockStream(),
+    optionStream,
+    executionEnabled: true,
+    executionMode: "paper",
+    now: () => decisionTime,
+    executionTickMs: 60_000,
+    recorder,
+  });
+  await runtime.start();
+  await optionStream.quote({
+    symbol: callSymbol, timestamp: decisionTime,
+    bidPrice: 1.99, askPrice: 2.01, bidSize: 100, askSize: 100,
+  });
+  await runtime.ingestFeature({ ...bullishFeature(), timestamp: decisionTime });
+
+  const armed = recorder.events.find((event) => event.type === "live_signal_selection");
+  assert.equal(armed?.data.selectionStatus, "RETRYING");
+  assert.equal(armed?.data.candidate, null);
+  assert.equal((armed?.data.closestCandidate as Record<string, unknown>).symbol, callSymbol);
+  assert.deepEqual(armed?.data.selectionReasons, ["MORNING_ENTRY_OPTION_SPREAD_TOO_WIDE"]);
+  assert.equal(client.requests.length, 0);
+
+  decisionTime += 100;
+  client.clock.timestamp = decisionTime;
+  await optionStream.quote({
+    symbol: callSymbol, timestamp: decisionTime,
+    bidPrice: 1.995, askPrice: 2.005, bidSize: 100, askSize: 100,
+  });
+
+  assert.equal(client.requests.length, 1);
+  const selections = recorder.events.filter((event) => event.type === "live_signal_selection");
+  assert.equal(selections.length, 2);
+  assert.equal(selections[1]?.data.signalId, selections[0]?.data.signalId);
+  assert.equal(selections[1]?.data.selectionStatus, "SELECTED");
+  assert.equal(selections[1]?.data.retryOutcome, "SELECTED_AFTER_RETRY");
+  assert.equal(selections[1]?.data.retryWaitMs, 100);
+  assert.equal(selections[1]?.data.candidate, callSymbol);
+  await runtime.close();
+});
+
+test("option selection does not retry a structural midpoint rejection", async () => {
+  const config = structuredClone(immediateRuntimeConfig);
+  config.execution.optionSelectionRetryMs = 1_000;
+  const client = new FakeRuntimeClient();
+  const optionStream = new FakeOptionStream();
+  const recorder = new MemoryRecorder();
+  const runtime = new SpyOptionsTradingRuntime({
+    config,
+    client,
+    stockStream: new FakeStockStream(),
+    optionStream,
+    executionEnabled: true,
+    executionMode: "paper",
+    now: () => now,
+    executionTickMs: 60_000,
+    recorder,
+  });
+  await runtime.start();
+  await optionStream.quote({
+    symbol: callSymbol, timestamp: now,
+    bidPrice: 13, askPrice: 13.01, bidSize: 100, askSize: 100,
+  });
+  await runtime.ingestFeature(bullishFeature());
+
+  const selection = recorder.events.find((event) => event.type === "live_signal_selection");
+  assert.equal(selection?.data.selectionStatus, "NO_ELIGIBLE_OPTION");
+  assert.equal(selection?.data.retryOutcome, "STRUCTURAL_REJECTION");
+  assert.ok((selection?.data.selectionReasons as string[]).includes("MIDPOINT_OUTSIDE_RANGE"));
+  assert.equal(client.requests.length, 0);
+  await runtime.close();
+});
+
+test("option selection retry expires before a later tight quote can submit", async () => {
+  let decisionTime = now;
+  const config = structuredClone(immediateRuntimeConfig);
+  config.execution.optionSelectionRetryMs = 1_000;
+  const client = new FakeRuntimeClient();
+  client.clock.timestamp = decisionTime;
+  const optionStream = new FakeOptionStream();
+  const recorder = new MemoryRecorder();
+  const runtime = new SpyOptionsTradingRuntime({
+    config,
+    client,
+    stockStream: new FakeStockStream(),
+    optionStream,
+    executionEnabled: true,
+    executionMode: "paper",
+    now: () => decisionTime,
+    executionTickMs: 60_000,
+    recorder,
+  });
+  await runtime.start();
+  await optionStream.quote({
+    symbol: callSymbol, timestamp: decisionTime,
+    bidPrice: 1.99, askPrice: 2.01, bidSize: 100, askSize: 100,
+  });
+  await runtime.ingestFeature({ ...bullishFeature(), timestamp: decisionTime });
+
+  decisionTime += 1_000;
+  client.clock.timestamp = decisionTime;
+  await optionStream.quote({
+    symbol: callSymbol, timestamp: decisionTime,
+    bidPrice: 1.995, askPrice: 2.005, bidSize: 100, askSize: 100,
+  });
+
+  assert.equal(client.requests.length, 0);
+  const finalSelection = recorder.events.filter((event) =>
+    event.type === "live_signal_selection").at(-1);
+  assert.equal(finalSelection?.data.selectionStatus, "NO_ELIGIBLE_OPTION");
+  assert.equal(finalSelection?.data.retryOutcome, "EXPIRED");
+  await runtime.close();
+});
+
+test("option selection retry cancels when the original signal structure invalidates", async () => {
+  let decisionTime = now;
+  const config = structuredClone(immediateRuntimeConfig);
+  config.execution.optionSelectionRetryMs = 1_000;
+  const client = new FakeRuntimeClient();
+  client.clock.timestamp = decisionTime;
+  const optionStream = new FakeOptionStream();
+  const recorder = new MemoryRecorder();
+  const runtime = new SpyOptionsTradingRuntime({
+    config,
+    client,
+    stockStream: new FakeStockStream(),
+    optionStream,
+    executionEnabled: true,
+    executionMode: "paper",
+    now: () => decisionTime,
+    executionTickMs: 60_000,
+    recorder,
+  });
+  await runtime.start();
+  await optionStream.quote({
+    symbol: callSymbol, timestamp: decisionTime,
+    bidPrice: 1.99, askPrice: 2.01, bidSize: 100, askSize: 100,
+  });
+  await runtime.ingestFeature({ ...bullishFeature(), timestamp: decisionTime });
+
+  decisionTime += 500;
+  client.clock.timestamp = decisionTime;
+  const invalidated = bullishFeature();
+  invalidated.timestamp = decisionTime;
+  invalidated.medium = { ...invalidated.medium, normalizedSlope: -0.6 };
+  await runtime.ingestFeature(invalidated);
+
+  assert.equal(client.requests.length, 0);
+  const finalSelection = recorder.events.filter((event) =>
+    event.type === "live_signal_selection").at(-1);
+  assert.equal(finalSelection?.data.selectionStatus, "NO_ELIGIBLE_OPTION");
+  assert.equal(finalSelection?.data.retryOutcome, "SIGNAL_INVALIDATED");
+  assert.ok((finalSelection?.data.selectionReasons as string[]).includes("MEDIUM_SLOPE_MISALIGNED"));
+  await runtime.close();
+});
+
 test("slow option-universe refresh does not block causal SIP feature evaluation", async () => {
   let decisionTime = now;
   const client = new FakeRuntimeClient();

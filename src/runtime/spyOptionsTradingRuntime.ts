@@ -14,7 +14,9 @@ import { MemoryRecorder } from "../ops/recorder.js";
 import { SerializedDecisionQueue } from "../execution/tradingEngine.js";
 import { LiveOrderManager, type LiveExecutionSnapshot } from "../execution/liveOrderManager.js";
 import { OptionBook } from "../options/optionBook.js";
-import { OptionSelector } from "../options/optionSelector.js";
+import {
+  OptionSelector, relevantOptionEvaluations, retryableOptionEvaluations, type SelectionResult,
+} from "../options/optionSelector.js";
 import { OptionUniverseManager } from "../options/optionUniverse.js";
 import {
   isProtectedProfitExit, SignalEngine, type RestoredSignalState, type SignalEvaluation,
@@ -77,6 +79,14 @@ interface PendingLateBullishGrindConfirmation {
   referenceBidPrice: number;
 }
 
+interface PendingOptionSelection {
+  signal: TradeSignal;
+  armedAt: number;
+  expiresAt: number;
+  attempts: number;
+  lastSelection: SelectionResult;
+}
+
 /** End-to-end, serialized SPY 0DTE option execution runtime. */
 export class SpyOptionsTradingRuntime {
   readonly #config: EngineConfig;
@@ -123,6 +133,7 @@ export class SpyOptionsTradingRuntime {
   #rejectedOptionQuotes = 0;
   #optionQuoteStalled = false;
   #execution: LiveExecutionSnapshot = { halted: false, lifecycle: "FLAT", safeMode: false };
+  #pendingOptionSelection: PendingOptionSelection | undefined;
   #pendingLateBullishGrindConfirmation: PendingLateBullishGrindConfirmation | undefined;
   #retainedPositionSymbol: string | undefined;
   #lastError: string | undefined;
@@ -382,6 +393,9 @@ export class SpyOptionsTradingRuntime {
           return;
         }
 
+        if (this.#pendingOptionSelection &&
+            await this.#advancePendingOptionSelection(this.#now(), feature)) return;
+
         if (this.#pendingLateBullishGrindConfirmation &&
             await this.#advanceLateBullishGrindConfirmation(feature)) return;
 
@@ -415,85 +429,267 @@ export class SpyOptionsTradingRuntime {
           feature: entryFeatureSummary(feature),
         });
         if (!signal || researchOnlyAfterCutoff) return;
-        const subscribedContracts = this.#contracts.filter((contract) => this.#subscribedSymbols.has(contract.symbol));
-        const decisionTimestamp = this.#now();
-        const selection = this.#selector.select(signal, subscribedContracts, this.#book, decisionTimestamp);
-        const candidate = selection.selected;
-        const quote = candidate ? this.#book.get(candidate.symbol)?.quote : undefined;
-        const signalEvent = {
-          signalId: signal.id,
-          timestamp: signal.timestamp,
-          decisionTimestamp,
-          direction: signal.direction,
-          kind: signal.kind,
-          regime: signal.regime,
-          projectedMoveBps: signal.projectedMoveBps,
-          morningEntryGuard: morningEntryGuardAudit(this.#config, signal.timestamp),
-          lateEntryGuard: lateEntryGuardAudit(this.#config, signal.timestamp),
-          candidate: candidate?.symbol ?? null,
-          candidateMetrics: candidate ? {
-            score: candidate.score,
-            delta: candidate.delta,
-            gamma: candidate.gamma,
-            impliedVolatility: candidate.impliedVolatility,
-            mid: candidate.mid,
-            spreadPct: candidate.spreadPct,
-            equivalentUnderlyingCostBps: candidate.equivalentUnderlyingCostBps,
-            requiredMoveBps: candidate.requiredMoveBps,
-            costMarginBps: candidate.costMarginBps,
-          } : null,
-          candidateQuote: quote ? {
-            timestamp: quote.timestamp,
-            bidPrice: quote.bidPrice,
-            askPrice: quote.askPrice,
-          } : null,
-          evaluatedContracts: selection.evaluations.length,
-          rejectionCounts: selection.rejectionCounts,
-          topCandidates: [...selection.evaluations]
-            .sort((a, b) => (b.score ?? -Infinity) - (a.score ?? -Infinity))
-            .slice(0, 8)
-            .map((evaluation) => ({
-              symbol: evaluation.symbol,
-              eligible: evaluation.eligible,
-              ...(evaluation.score !== undefined ? { score: evaluation.score } : {}),
-              ...(evaluation.delta !== undefined ? { delta: evaluation.delta } : {}),
-              ...(evaluation.spreadPct !== undefined ? { spreadPct: evaluation.spreadPct } : {}),
-              ...(evaluation.costMarginBps !== undefined ? { costMarginBps: evaluation.costMarginBps } : {}),
-              rejectionReasons: evaluation.rejectionReasons,
-            })),
-        };
-        await this.#auditRuntime(signal.timestamp, "live_signal_selection", signalEvent);
-        this.#emit("live_signal_selection", signalEvent);
-        if (!candidate) return;
-        if (!quote) return;
-        this.#history?.setPrioritySymbols?.(new Set([candidate.symbol]));
-        if (requiresLateBullishGrindOptionConfirmation(this.#config, signal)) {
-          this.#pendingLateBullishGrindConfirmation = {
-            signal,
-            candidate,
-            armedAt: signal.timestamp,
-            referenceBidPrice: quote.bidPrice,
-          };
-          const confirmationEvent = {
-            signalId: signal.id,
-            timestamp: signal.timestamp,
-            decision: "ARMED",
-            symbol: candidate.symbol,
-            referenceBidPrice: quote.bidPrice,
-            minSec: this.#config.signals.lateEntryGuard.bullishGrindOptionConfirmation.minSec,
-            maxSec: this.#config.signals.lateEntryGuard.bullishGrindOptionConfirmation.maxSec,
-            minimumBidImprovement:
-              this.#config.signals.lateEntryGuard.bullishGrindOptionConfirmation.minimumBidImprovement,
-          };
-          await this.#auditRuntime(signal.timestamp, "late_bullish_grind_confirmation", confirmationEvent);
-          this.#emit("late_bullish_grind_confirmation", confirmationEvent);
-          return;
-        }
-        await this.#submitSelectedEntry(signal, candidate, quote);
+        await this.#beginOptionSelection(signal);
       });
     } catch (error) {
       this.#recordError(error);
     }
+  }
+
+  async #beginOptionSelection(signal: TradeSignal): Promise<void> {
+    const decisionTimestamp = this.#now();
+    const selection = this.#selectOptions(signal, decisionTimestamp);
+    const candidate = selection.selected;
+    const quote = candidate ? this.#book.get(candidate.symbol)?.quote : undefined;
+    if (candidate && quote) {
+      await this.#recordOptionSelection(signal, signal, selection, decisionTimestamp, "SELECTED", {
+        selectionAttempt: 1,
+        retryWaitMs: 0,
+      });
+      await this.#handleSelectedCandidate(signal, candidate, quote, decisionTimestamp);
+      return;
+    }
+
+    const retryable = retryableOptionEvaluations(signal, selection, this.#config);
+    if (this.#config.execution.optionSelectionRetryMs > 0 && retryable.length > 0) {
+      this.#pendingOptionSelection = {
+        signal,
+        armedAt: decisionTimestamp,
+        expiresAt: Math.min(
+          signal.timestamp + this.#config.execution.entrySignalTtlMs,
+          decisionTimestamp + this.#config.execution.optionSelectionRetryMs,
+        ),
+        attempts: 1,
+        lastSelection: selection,
+      };
+      await this.#recordOptionSelection(signal, signal, selection, decisionTimestamp, "RETRYING", {
+        selectionAttempt: 1,
+        retryWaitMs: 0,
+        retryDeadline: this.#pendingOptionSelection.expiresAt,
+        retryableCandidates: retryable.map((evaluation) => evaluation.symbol),
+      });
+      this.#synchronizeHistoryPriorities();
+      return;
+    }
+
+    await this.#recordOptionSelection(signal, signal, selection, decisionTimestamp, "NO_ELIGIBLE_OPTION", {
+      selectionAttempt: 1,
+      retryWaitMs: 0,
+      retryOutcome: retryable.length > 0 ? "RETRY_DISABLED" : "STRUCTURAL_REJECTION",
+    });
+  }
+
+  async #advancePendingOptionSelection(
+    decisionTimestamp: number,
+    feature = this.#lastFeature,
+  ): Promise<boolean> {
+    const pending = this.#pendingOptionSelection;
+    if (!pending) return false;
+    if (decisionTimestamp >= pending.expiresAt) {
+      this.#pendingOptionSelection = undefined;
+      await this.#recordOptionSelection(
+        pending.signal,
+        pending.signal,
+        pending.lastSelection,
+        decisionTimestamp,
+        "NO_ELIGIBLE_OPTION",
+        {
+          selectionAttempt: pending.attempts,
+          retryWaitMs: Math.max(0, decisionTimestamp - pending.armedAt),
+          retryOutcome: "EXPIRED",
+        },
+      );
+      this.#synchronizeHistoryPriorities();
+      return false;
+    }
+
+    const runtimeBlocks = this.#entryRuntimeBlockReasons(decisionTimestamp);
+    if (runtimeBlocks.length > 0) {
+      this.#pendingOptionSelection = undefined;
+      await this.#recordOptionSelection(
+        pending.signal,
+        pending.signal,
+        pending.lastSelection,
+        decisionTimestamp,
+        "NO_ELIGIBLE_OPTION",
+        {
+          selectionAttempt: pending.attempts,
+          retryWaitMs: Math.max(0, decisionTimestamp - pending.armedAt),
+          retryOutcome: "RUNTIME_BLOCKED",
+          selectionReasons: runtimeBlocks,
+        },
+      );
+      this.#synchronizeHistoryPriorities();
+      return false;
+    }
+
+    if (!feature || !this.#lastRegime) return true;
+    const revalidation = this.#signals.revalidateForEntry(pending.signal, feature, this.#lastRegime);
+    if (!revalidation.valid || !revalidation.signal) {
+      this.#pendingOptionSelection = undefined;
+      await this.#recordOptionSelection(
+        pending.signal,
+        pending.signal,
+        pending.lastSelection,
+        decisionTimestamp,
+        "NO_ELIGIBLE_OPTION",
+        {
+          selectionAttempt: pending.attempts,
+          retryWaitMs: Math.max(0, decisionTimestamp - pending.armedAt),
+          retryOutcome: "SIGNAL_INVALIDATED",
+          selectionReasons: revalidation.reasons,
+        },
+      );
+      this.#synchronizeHistoryPriorities();
+      return false;
+    }
+
+    pending.attempts += 1;
+    const selection = this.#selectOptions(revalidation.signal, decisionTimestamp);
+    pending.lastSelection = selection;
+    const candidate = selection.selected;
+    const quote = candidate ? this.#book.get(candidate.symbol)?.quote : undefined;
+    if (candidate && quote) {
+      this.#pendingOptionSelection = undefined;
+      await this.#recordOptionSelection(
+        pending.signal,
+        revalidation.signal,
+        selection,
+        decisionTimestamp,
+        "SELECTED",
+        {
+          selectionAttempt: pending.attempts,
+          retryWaitMs: Math.max(0, decisionTimestamp - pending.armedAt),
+          retryOutcome: "SELECTED_AFTER_RETRY",
+        },
+      );
+      await this.#handleSelectedCandidate(revalidation.signal, candidate, quote, decisionTimestamp);
+      return true;
+    }
+
+    const retryable = retryableOptionEvaluations(revalidation.signal, selection, this.#config);
+    if (retryable.length > 0) {
+      this.#synchronizeHistoryPriorities();
+      return true;
+    }
+
+    this.#pendingOptionSelection = undefined;
+    await this.#recordOptionSelection(
+      pending.signal,
+      revalidation.signal,
+      selection,
+      decisionTimestamp,
+      "NO_ELIGIBLE_OPTION",
+      {
+        selectionAttempt: pending.attempts,
+        retryWaitMs: Math.max(0, decisionTimestamp - pending.armedAt),
+        retryOutcome: "STRUCTURAL_REJECTION",
+      },
+    );
+    this.#synchronizeHistoryPriorities();
+    return false;
+  }
+
+  #selectOptions(signal: TradeSignal, decisionTimestamp: number): SelectionResult {
+    const subscribedContracts = this.#contracts.filter((contract) =>
+      this.#subscribedSymbols.has(contract.symbol));
+    return this.#selector.select(signal, subscribedContracts, this.#book, decisionTimestamp);
+  }
+
+  async #recordOptionSelection(
+    identitySignal: TradeSignal,
+    evaluatedSignal: TradeSignal,
+    selection: SelectionResult,
+    decisionTimestamp: number,
+    selectionStatus: "SELECTED" | "RETRYING" | "NO_ELIGIBLE_OPTION",
+    retry: {
+      selectionAttempt: number;
+      retryWaitMs: number;
+      retryDeadline?: number;
+      retryOutcome?: string;
+      retryableCandidates?: string[];
+      selectionReasons?: string[];
+    },
+  ): Promise<void> {
+    const candidate = selection.selected;
+    const quote = candidate ? this.#book.get(candidate.symbol)?.quote : undefined;
+    const relevant = relevantOptionEvaluations(evaluatedSignal, selection, this.#config);
+    const closest = relevant[0];
+    const selectionReasons = retry.selectionReasons ?? closest?.rejectionReasons ?? [];
+    const signalEvent = {
+      signalId: identitySignal.id,
+      timestamp: identitySignal.timestamp,
+      decisionTimestamp,
+      direction: identitySignal.direction,
+      kind: identitySignal.kind,
+      regime: evaluatedSignal.regime,
+      projectedMoveBps: evaluatedSignal.projectedMoveBps,
+      selectionStatus,
+      selectionAttempt: retry.selectionAttempt,
+      retryWaitMs: retry.retryWaitMs,
+      ...(retry.retryDeadline !== undefined ? { retryDeadline: retry.retryDeadline } : {}),
+      ...(retry.retryOutcome ? { retryOutcome: retry.retryOutcome } : {}),
+      ...(retry.retryableCandidates ? { retryableCandidates: retry.retryableCandidates } : {}),
+      selectionReasons,
+      morningEntryGuard: morningEntryGuardAudit(this.#config, identitySignal.timestamp),
+      lateEntryGuard: lateEntryGuardAudit(this.#config, identitySignal.timestamp),
+      candidate: candidate?.symbol ?? null,
+      candidateMetrics: candidate ? optionCandidateMetrics(candidate) : null,
+      candidateQuote: quote ? {
+        timestamp: quote.timestamp,
+        bidPrice: quote.bidPrice,
+        askPrice: quote.askPrice,
+      } : null,
+      closestCandidate: closest ? {
+        symbol: closest.symbol,
+        ...optionCandidateMetrics(closest),
+        rejectionReasons: closest.rejectionReasons,
+      } : null,
+      evaluatedContracts: selection.evaluations.length,
+      relevantContracts: relevant.length,
+      rejectionCounts: selection.rejectionCounts,
+      topCandidates: relevant.slice(0, 8).map((evaluation) => ({
+        symbol: evaluation.symbol,
+        eligible: evaluation.eligible,
+        ...optionCandidateMetrics(evaluation),
+        rejectionReasons: evaluation.rejectionReasons,
+      })),
+    };
+    await this.#auditRuntime(identitySignal.timestamp, "live_signal_selection", signalEvent);
+    this.#emit("live_signal_selection", signalEvent);
+  }
+
+  async #handleSelectedCandidate(
+    signal: TradeSignal,
+    candidate: OptionCandidateEvaluation,
+    quote: OptionQuote,
+    selectedAt: number,
+  ): Promise<void> {
+    this.#history?.setPrioritySymbols?.(new Set([candidate.symbol]));
+    if (requiresLateBullishGrindOptionConfirmation(this.#config, signal)) {
+      this.#pendingLateBullishGrindConfirmation = {
+        signal,
+        candidate,
+        armedAt: selectedAt,
+        referenceBidPrice: quote.bidPrice,
+      };
+      const confirmationEvent = {
+        signalId: signal.id,
+        timestamp: signal.timestamp,
+        armedAt: selectedAt,
+        decision: "ARMED",
+        symbol: candidate.symbol,
+        referenceBidPrice: quote.bidPrice,
+        minSec: this.#config.signals.lateEntryGuard.bullishGrindOptionConfirmation.minSec,
+        maxSec: this.#config.signals.lateEntryGuard.bullishGrindOptionConfirmation.maxSec,
+        minimumBidImprovement:
+          this.#config.signals.lateEntryGuard.bullishGrindOptionConfirmation.minimumBidImprovement,
+      };
+      await this.#auditRuntime(signal.timestamp, "late_bullish_grind_confirmation", confirmationEvent);
+      this.#emit("late_bullish_grind_confirmation", confirmationEvent);
+      return;
+    }
+    await this.#submitSelectedEntry(signal, candidate, quote);
   }
 
   async #advanceLateBullishGrindConfirmation(feature: FeatureSnapshot): Promise<boolean> {
@@ -824,6 +1020,9 @@ export class SpyOptionsTradingRuntime {
             latestActiveQuote = quote;
           }
         }
+        if (this.#pendingOptionSelection) {
+          await this.#advancePendingOptionSelection(decisionTimestamp);
+        }
         if (latestActiveQuote) {
           await this.#tickExecution(decisionTimestamp, latestActiveQuote);
         }
@@ -899,6 +1098,9 @@ export class SpyOptionsTradingRuntime {
       await this.#refreshMarketSession(timestamp);
       if (!this.#marketDataIdle && this.#marketOpen) {
         await this.#checkOptionQuoteLiveness(timestamp);
+        if (this.#pendingOptionSelection) {
+          await this.#advancePendingOptionSelection(timestamp);
+        }
         await this.#tickExecution(timestamp);
       }
     })
@@ -1090,7 +1292,14 @@ export class SpyOptionsTradingRuntime {
 
   #synchronizeHistoryPriorities(): void {
     const symbol = this.#execution.position?.symbol ?? this.#execution.pending?.order.symbol ??
-      this.#pendingLateBullishGrindConfirmation?.candidate.symbol;
+      this.#pendingLateBullishGrindConfirmation?.candidate.symbol ??
+      (this.#pendingOptionSelection
+        ? relevantOptionEvaluations(
+            this.#pendingOptionSelection.signal,
+            this.#pendingOptionSelection.lastSelection,
+            this.#config,
+          )[0]?.symbol
+        : undefined);
     this.#history?.setPrioritySymbols?.(symbol ? new Set([symbol]) : new Set());
   }
 
@@ -1196,6 +1405,24 @@ function entryFeatureSummary(feature: FeatureSnapshot): Record<string, unknown> 
     nearOpeningHigh: feature.openingRange.nearHigh,
     nearOpeningLow: feature.openingRange.nearLow,
     thresholds: feature.thresholds,
+  };
+}
+
+function optionCandidateMetrics(candidate: OptionCandidateEvaluation): Record<string, number> {
+  return {
+    ...(candidate.score !== undefined ? { score: candidate.score } : {}),
+    ...(candidate.delta !== undefined ? { delta: candidate.delta } : {}),
+    ...(candidate.gamma !== undefined ? { gamma: candidate.gamma } : {}),
+    ...(candidate.impliedVolatility !== undefined
+      ? { impliedVolatility: candidate.impliedVolatility }
+      : {}),
+    ...(candidate.mid !== undefined ? { mid: candidate.mid } : {}),
+    ...(candidate.spreadPct !== undefined ? { spreadPct: candidate.spreadPct } : {}),
+    ...(candidate.equivalentUnderlyingCostBps !== undefined
+      ? { equivalentUnderlyingCostBps: candidate.equivalentUnderlyingCostBps }
+      : {}),
+    ...(candidate.requiredMoveBps !== undefined ? { requiredMoveBps: candidate.requiredMoveBps } : {}),
+    ...(candidate.costMarginBps !== undefined ? { costMarginBps: candidate.costMarginBps } : {}),
   };
 }
 

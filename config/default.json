@@ -1,5 +1,5 @@
 {
-  "version": "spy-0dte-entry-confirmation-24-protected-exit-reentry",
+  "version": "spy-0dte-entry-confirmation-25-option-selection-retry",
   "symbol": "SPY",
   "timeZone": "America/New_York",
   "session": {
@@ -166,6 +166,7 @@
     "orderPollMs": 350,
     "optionTickSize": 0.01,
     "entrySignalTtlMs": 6500,
+    "optionSelectionRetryMs": 1000,
     "adverseFillSpreadFraction": 0.25,
     "exitTtlMinMs": 250,
     "exitTtlMaxMs": 1800,

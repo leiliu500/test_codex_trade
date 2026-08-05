@@ -925,3 +925,60 @@ test("dashboard exposes the full signal funnel and excludes losses from profit c
   assert.ok(Math.abs((winningTrade?.maxFavorableExcursionPct ?? 0) - 10) < 1e-9);
   assert.ok(Math.abs((winningTrade?.capturePct ?? 0) - 100) < 1e-9);
 });
+
+test("dashboard deduplicates option retries and reports reasons by selector version", () => {
+  const dashboard = historicalDashboard();
+  dashboard.record({
+    ...event("live_signal_selection", {
+      signalId: "retry-signal", timestamp, direction: "BEARISH", kind: "IMPULSE",
+      regime: "STRONG_DOWN", projectedMoveBps: 4, candidate: null,
+      selectionStatus: "RETRYING", selectionAttempt: 1, retryWaitMs: 0,
+      evaluatedContracts: 24, relevantContracts: 12,
+      selectionReasons: ["LATE_ENTRY_OPTION_SPREAD_TOO_WIDE"],
+      closestCandidate: {
+        symbol: "SPY260722P00501000",
+        spreadPct: 0.012,
+        rejectionReasons: ["LATE_ENTRY_OPTION_SPREAD_TOO_WIDE"],
+      },
+    }),
+    configVersion: "selector-v25",
+  });
+
+  let snapshot = dashboard.snapshot();
+  assert.equal(snapshot.signals.length, 1);
+  assert.equal(snapshot.signals[0]?.status, "OPTION_RETRY_PENDING");
+  assert.equal(snapshot.signals[0]?.closestCandidate, "SPY260722P00501000");
+  assert.deepEqual(snapshot.signals[0]?.reasons, ["LATE_ENTRY_OPTION_SPREAD_TOO_WIDE"]);
+  assert.deepEqual(snapshot.performance.optionSelectionByConfig, [{
+    configVersion: "selector-v25",
+    signals: 1,
+    selected: 0,
+    pending: 1,
+    selectionRate: 0,
+    latestSignalTimestamp: timestamp,
+  }]);
+
+  dashboard.record({
+    ...event("live_signal_selection", {
+      signalId: "retry-signal", timestamp, direction: "BEARISH", kind: "IMPULSE",
+      regime: "STRONG_DOWN", projectedMoveBps: 3.8, candidate: "SPY260722P00501000",
+      selectionStatus: "SELECTED", selectionAttempt: 2, retryWaitMs: 125,
+      retryOutcome: "SELECTED_AFTER_RETRY", evaluatedContracts: 24, relevantContracts: 12,
+      selectionReasons: [],
+      candidateMetrics: { delta: -0.52, mid: 2, spreadPct: 0.007, costMarginBps: 2.5 },
+      candidateQuote: { timestamp: timestamp + 125, bidPrice: 1.99, askPrice: 2.01 },
+      closestCandidate: { symbol: "SPY260722P00501000", rejectionReasons: [] },
+    }, 125),
+    configVersion: "selector-v25",
+  });
+
+  snapshot = dashboard.snapshot();
+  assert.equal(snapshot.signals.length, 1);
+  assert.equal(snapshot.signals[0]?.status, "FIRED");
+  assert.equal(snapshot.signals[0]?.candidate, "SPY260722P00501000");
+  assert.equal(snapshot.signals[0]?.retryWaitMs, 125);
+  assert.equal(snapshot.performance.optionsSelected, 1);
+  assert.equal(snapshot.performance.optionSelectionByConfig[0]?.selected, 1);
+  assert.equal(snapshot.performance.optionSelectionByConfig[0]?.pending, 0);
+  assert.equal(snapshot.performance.optionSelectionByConfig[0]?.selectionRate, 1);
+});
