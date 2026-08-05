@@ -1,5 +1,5 @@
 {
-  "version": "spy-0dte-entry-confirmation-23-volume-liquidity-fallback",
+  "version": "spy-0dte-entry-confirmation-24-protected-exit-reentry",
   "symbol": "SPY",
   "timeZone": "America/New_York",
   "session": {
@@ -50,6 +50,12 @@
     "costMultiplier": 1.75,
     "sameDirectionCooldownSec": 600,
     "oppositeDirectionCooldownSec": 60,
+    "protectedExitReentry": {
+      "enabled": true,
+      "cooldownSec": 10,
+      "windowSec": 120,
+      "requiresStrongRegime": true
+    },
     "minimumSignalIntervalSec": 5,
     "lateBullishImpulseStart": "12:45:00",
     "lateBullishImpulseRequiresUpRegime": true,
@@ -176,6 +182,8 @@
     "hardOptionStopPct": 0.25,
     "maxHoldSec": 1200,
     "trendInvalidationGraceSec": 8,
+    "oppositeRegimeGraceSec": 2,
+    "oppositeRegimeMinimumObservations": 3,
     "staleDataEmergencySec": 10,
     "onePositionAtATime": true,
     "softProtectionActivationDollars": 3,

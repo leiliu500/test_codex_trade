@@ -48,6 +48,8 @@ export interface DashboardOrderManagement {
   reversalCusum?: number;
   zeroCrossings?: number;
   pnlObservationCount?: number;
+  oppositeRegimeSince?: number;
+  oppositeRegimeObservationCount?: number;
   optionContinuation?: DashboardOptionContinuation;
 }
 
@@ -388,6 +390,12 @@ function copyManagementState(
     ...(state.pnlObservationCount !== undefined
       ? { pnlObservationCount: state.pnlObservationCount }
       : {}),
+    ...(state.oppositeRegimeSince !== undefined
+      ? { oppositeRegimeSince: state.oppositeRegimeSince }
+      : {}),
+    ...(state.oppositeRegimeObservationCount !== undefined
+      ? { oppositeRegimeObservationCount: state.oppositeRegimeObservationCount }
+      : {}),
     ...(state.optionContinuation
       ? { optionContinuation: { ...state.optionContinuation } }
       : {}),
@@ -414,6 +422,8 @@ export function sameMaterialOrderManagement(
     sameDisplayedNumber(left.reversalCusum, right.reversalCusum, 100) &&
     left.zeroCrossings === right.zeroCrossings &&
     left.pnlObservationCount === right.pnlObservationCount &&
+    left.oppositeRegimeSince === right.oppositeRegimeSince &&
+    left.oppositeRegimeObservationCount === right.oppositeRegimeObservationCount &&
     sameOptionContinuation(left.optionContinuation, right.optionContinuation);
 }
 
