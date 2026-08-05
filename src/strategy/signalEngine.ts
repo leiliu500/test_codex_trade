@@ -23,6 +23,12 @@ export interface SignalEvaluation {
   directions: SignalDirectionEvaluation[];
 }
 
+export interface SignalRevalidation {
+  valid: boolean;
+  signal?: TradeSignal;
+  reasons: string[];
+}
+
 export interface RestoredSignalState {
   lastSignalTimestamp?: number;
   lastEntries?: Partial<Record<Direction, number>>;
@@ -169,6 +175,51 @@ export class SignalEngine {
       signal: selected,
       reasons: selected.reasons,
       directions: directionEvaluations,
+    };
+  }
+
+  /**
+   * Rechecks a fired setup against the latest causal feature without advancing
+   * signal cadence or follow-through state. Used only during the bounded option
+   * quote retry window before an entry order exists.
+   */
+  revalidateForEntry(
+    original: TradeSignal,
+    feature: FeatureSnapshot,
+    regime: RegimeDecision,
+  ): SignalRevalidation {
+    const reasons: string[] = [];
+    if (feature.timestamp < original.timestamp) reasons.push("REVALIDATION_FEATURE_PRECEDES_SIGNAL");
+    if (!feature.dataValid) {
+      reasons.push(...(feature.invalidReasons.length > 0 ? feature.invalidReasons : ["FEATURE_DATA_INVALID"]));
+    }
+    if (!feature.openingRange.complete) reasons.push("OPENING_RANGE_INCOMPLETE");
+    if (!inSessionWindow(
+      feature.timestamp,
+      this.#config.session.entryStart,
+      this.#config.session.entryEnd,
+      this.#config.timeZone,
+    )) reasons.push("OUTSIDE_ENTRY_WINDOW");
+    if (this.#config.signals.blockWhipsaw && regime.regime === "HIGH_VOL_WHIPSAW") {
+      reasons.push("WHIPSAW_REGIME_BLOCKED");
+    }
+    if (reasons.length > 0) return { valid: false, reasons: [...new Set(reasons)] };
+
+    const votes: SignalVote[] = [];
+    const current = this.#evaluateDirection(original.direction, feature, regime, reasons, votes);
+    if (!current) return { valid: false, reasons: [...new Set(reasons)] };
+    if (current.kind !== original.kind) {
+      return { valid: false, reasons: [`SIGNAL_KIND_CHANGED_${original.kind}_TO_${current.kind}`] };
+    }
+    return {
+      valid: true,
+      signal: {
+        ...current,
+        id: original.id,
+        timestamp: original.timestamp,
+        reasons: [...original.reasons, "setup structure revalidated during option quote retry"],
+      },
+      reasons: [],
     };
   }
 

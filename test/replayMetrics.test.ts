@@ -1,11 +1,94 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { defaultConfig } from "../src/config.js";
-import { replayEvents } from "../src/backtest/replay.js";
+import { ReplayEngine, replayEvents } from "../src/backtest/replay.js";
 import { computeStrategyMetrics, maximumDrawdown, predictionMetrics, sessionBootstrap } from "../src/backtest/metrics.js";
 import { buildWalkForwardFolds, purgeAndEmbargo } from "../src/backtest/walkForward.js";
 import type { CompletedTrade } from "../src/backtest/metrics.js";
-import type { ReplayEvent } from "../src/types.js";
+import type { FeatureSnapshot, ReplayEvent, WindowMetrics } from "../src/types.js";
+import { zonedDateTimeToEpoch } from "../src/utils/time.js";
+
+function replayWindowMetric(
+  windowSec: number,
+  slope: number,
+  acceleration: number,
+  normalizedSlope: number,
+  normalizedAcceleration: number,
+): WindowMetrics {
+  return {
+    windowSec,
+    regression: {
+      valid: true,
+      windowSec,
+      pointCount: windowSec + 1,
+      coverageFraction: 1,
+      levelLog: Math.log(501),
+      slopeBpsPerSec: slope,
+      accelerationBpsPerSec2: acceleration,
+      r2: 0.8,
+      coefficients: [Math.log(501), slope * windowSec / 10_000, acceleration * windowSec ** 2 / 20_000],
+    },
+    realizedVolatilityBps: 2,
+    efficiencyRatio: 0.6,
+    noiseFloorBps: 2,
+    normalizedSlope,
+    normalizedAcceleration,
+    signChanges: 0,
+  };
+}
+
+function replayBullishFeature(timestamp: number): FeatureSnapshot {
+  return {
+    symbol: "SPY",
+    timestamp,
+    marketDate: "2026-07-22",
+    price: 501,
+    mid: 501,
+    spreadBps: 0.2,
+    quoteAgeMs: 100,
+    quoteImbalance: 0.5,
+    quoteImbalanceEwma5: 0.5,
+    quoteImbalanceEwma15: 0.4,
+    micropriceDisplacementBps: 0.1,
+    ofi1: 0.1,
+    ofi5: 0.2,
+    ofi15: 0.1,
+    volume60: 100_000,
+    fast: replayWindowMetric(10, 0.6, 0.02, 0.8, 0.2),
+    medium: replayWindowMetric(30, 0.2, 0, 0.6, 0),
+    slow: replayWindowMetric(120, 0.04, 0, 0.3, 0),
+    efficiency60: 0.6,
+    signChanges60: 0,
+    vwap: {
+      sessionVwap: 500,
+      rollingVwap: 500.5,
+      rollingVwapSlopeBpsPerSec: 0.05,
+      anchoredVwaps: {},
+    },
+    openingRange: {
+      complete: true,
+      high: 500.8,
+      low: 499.2,
+      midpoint: 500,
+      widthBps: 32,
+      nearHigh: true,
+      nearLow: false,
+      bullishRetest: false,
+      bearishRetest: false,
+    },
+    thresholds: {
+      source: "static",
+      bucket: "10:20",
+      sampleCount: 0,
+      fastSlope: 0.42,
+      fastAcceleration: 0.1,
+      absoluteOfi5: 0.08,
+      efficiency60: 0.28,
+    },
+    dataValid: true,
+    invalidReasons: [],
+  };
+}
 
 test("replay rejects decreasing arrival timestamps", async () => {
   const events: ReplayEvent[] = [
@@ -28,6 +111,62 @@ test("replay results identify the exact strategy, fill, calibration, and fee ass
     calibrationVersion: null,
     feesPerContractRoundTrip: 1.3,
   });
+});
+
+test("replay retries a transient option spread and selects the refreshed quote", async () => {
+  const timestamp = zonedDateTimeToEpoch("2026-07-22", "10:20:00");
+  const symbol = "SPY260722C00501000";
+  const config = structuredClone(defaultConfig);
+  config.signals.entryConfirmationMode = "SHADOW";
+  config.signals.followThroughMinSec = 0;
+  config.signals.followThroughMaxSec = 0;
+  const engine = new ReplayEngine({ config });
+  await engine.ingest({
+    type: "option_contract",
+    timestamp: timestamp - 30,
+    data: {
+      symbol,
+      underlying: "SPY",
+      expirationDate: "2026-07-22",
+      strike: 501,
+      type: "call",
+      active: true,
+      tradable: true,
+    },
+  });
+  await engine.ingest({
+    type: "option_snapshot",
+    timestamp: timestamp - 20,
+    data: {
+      symbol,
+      timestamp: timestamp - 20,
+      impliedVolatility: 0.22,
+      greeks: { delta: 0.52, gamma: 0.02 },
+      dailyVolume: 1_000,
+      openInterest: 5_000,
+    },
+  });
+  await engine.ingest({
+    type: "option_quote",
+    timestamp: timestamp - 10,
+    data: { symbol, timestamp: timestamp - 10, bidPrice: 2, askPrice: 2.016, bidSize: 100, askSize: 100 },
+  });
+  await engine.ingestRecordedFeature(replayBullishFeature(timestamp));
+  await engine.ingest({
+    type: "option_quote",
+    timestamp: timestamp + 100,
+    data: { symbol, timestamp: timestamp + 100, bidPrice: 2.01, askPrice: 2.02, bidSize: 100, askSize: 100 },
+  });
+
+  const result = await engine.finish();
+  const selections = result.auditEvents.filter((event) => event.type === "option_selection");
+  assert.deepEqual(selections.map((event) => event.data.selectionStatus), ["RETRYING", "SELECTED"]);
+  assert.equal(selections[1]?.data.retryOutcome, "SELECTED_AFTER_RETRY");
+  assert.equal(selections[1]?.data.retryWaitMs, 100);
+  assert.equal(result.funnel.signals, 1);
+  assert.equal(result.funnel.candidateAvailable, 1);
+  assert.equal(result.funnel.ordersSubmitted, 1);
+  assert.equal(result.funnel.fills, 1);
 });
 
 test("trade, drawdown, Sharpe/Sortino and cost metrics use net fills/fees", () => {

@@ -16,6 +16,40 @@ export interface SelectionResult {
   rejectionCounts: Record<string, number>;
 }
 
+const STATIC_SPREAD_REJECTION = /^(MORNING|LATE)_ENTRY_OPTION_SPREAD_TOO_WIDE$/;
+
+export function isTransientOptionSelectionReason(reason: string): boolean {
+  return reason.startsWith("QUOTE_") || STATIC_SPREAD_REJECTION.test(reason);
+}
+
+export function relevantOptionEvaluations(
+  signal: TradeSignal,
+  selection: SelectionResult,
+  config: EngineConfig,
+): OptionCandidateEvaluation[] {
+  const expectedType = signal.direction === "BULLISH" ? "call" : "put";
+  return selection.evaluations
+    .filter((evaluation) => evaluation.contract?.type === expectedType)
+    .sort((left, right) =>
+      Number(right.eligible) - Number(left.eligible) ||
+      (right.score ?? -Infinity) - (left.score ?? -Infinity) ||
+      left.rejectionReasons.length - right.rejectionReasons.length ||
+      Math.abs(Math.abs(left.delta ?? Infinity) - config.options.targetAbsDelta) -
+        Math.abs(Math.abs(right.delta ?? Infinity) - config.options.targetAbsDelta) ||
+      (right.costMarginBps ?? -Infinity) - (left.costMarginBps ?? -Infinity) ||
+      left.symbol.localeCompare(right.symbol));
+}
+
+export function retryableOptionEvaluations(
+  signal: TradeSignal,
+  selection: SelectionResult,
+  config: EngineConfig,
+): OptionCandidateEvaluation[] {
+  return relevantOptionEvaluations(signal, selection, config).filter((evaluation) =>
+    evaluation.rejectionReasons.length > 0 &&
+    evaluation.rejectionReasons.every(isTransientOptionSelectionReason));
+}
+
 export class OptionSelector {
   readonly #config: EngineConfig;
   constructor(config: EngineConfig) { this.#config = config; }
