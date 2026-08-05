@@ -1,8 +1,8 @@
 import type { EngineConfig } from "../config.js";
 import { defaultConfig } from "../config.js";
 import type {
-  AccountState, CalibrationProfile, OptionCandidateEvaluation, OptionQuote, PositionState, ReplayEvent,
-  RiskDecision, SecondBar, TradeSignal,
+  AccountState, CalibrationProfile, FeatureSnapshot, OptionCandidateEvaluation, OptionQuote, PositionState,
+  ReplayEvent, RiskDecision, SecondBar, TradeSignal,
 } from "../types.js";
 import { SecondAggregator } from "../features/secondAggregator.js";
 import { FeatureEngine } from "../features/featureEngine.js";
@@ -57,6 +57,12 @@ export interface ReplayFunnel {
 }
 
 export interface ReplayResult {
+  metadata: {
+    configVersion: string;
+    fillModel: FillModel;
+    calibrationVersion: string | null;
+    feesPerContractRoundTrip: number;
+  };
   funnel: ReplayFunnel;
   trades: CompletedTrade[];
   metrics: StrategyMetrics;
@@ -166,11 +172,29 @@ export class ReplayEngine {
     });
   }
 
+  /** Replays a durable live feature without rebuilding it from retention-sampled raw quotes. */
+  async ingestRecordedFeature(feature: FeatureSnapshot, receivedTimestamp = feature.timestamp): Promise<void> {
+    if (!Number.isFinite(receivedTimestamp) || !Number.isFinite(feature.timestamp)) {
+      throw new Error("Recorded feature has an invalid timestamp");
+    }
+    if (receivedTimestamp < this.#lastTimestamp) {
+      throw new Error(`Replay timestamp decreased: ${receivedTimestamp} < ${this.#lastTimestamp}`);
+    }
+    this.#lastTimestamp = receivedTimestamp;
+    await this.#queue.enqueue(() => this.#handleFeature(feature));
+  }
+
   async finish(): Promise<ReplayResult> {
     if (Number.isFinite(this.#lastTimestamp)) await this.#queue.enqueue(() => this.#handleBars(this.#aggregator.flushThrough(this.#lastTimestamp + 1000)));
     await this.#queue.drained();
     const auditEvents = this.#recorder === this.#memoryRecorder ? this.#memoryRecorder.events.slice() : [];
     return {
+      metadata: {
+        configVersion: this.#config.version,
+        fillModel: this.#fillModel,
+        calibrationVersion: this.#calibration?.version ?? null,
+        feesPerContractRoundTrip: this.#feesPerContractRoundTrip,
+      },
       funnel: { ...this.#funnel },
       trades: this.#trades.slice(),
       metrics: computeStrategyMetrics(this.#trades, this.#account.equity),
@@ -185,130 +209,143 @@ export class ReplayEngine {
     for (const bar of bars) {
       const feature = this.#features.onBar(bar);
       if (!feature) continue;
-      if (feature.dataValid) this.#funnel.validFeatures += 1;
-      const regime = classifyRegime(feature, this.#config.regimes);
-      this.#audit(bar.timestamp, "decision_snapshot", {
-        feature, regime, position: this.#position ?? null, pendingOrder: this.#pending?.state ?? null,
+      await this.#handleFeature(feature);
+    }
+  }
+
+  async #handleFeature(feature: FeatureSnapshot): Promise<void> {
+    const timestamp = feature.timestamp;
+    if (feature.dataValid) this.#funnel.validFeatures += 1;
+    const regime = classifyRegime(feature, this.#config.regimes);
+    this.#audit(timestamp, "decision_snapshot", {
+      feature, regime, position: this.#position ?? null, pendingOrder: this.#pending?.state ?? null,
+    });
+
+    if (this.#pending) this.#advancePending(timestamp);
+    if (this.#pending) return;
+
+    if (this.#position) {
+      const entry = this.#book.get(this.#position.symbol);
+      if (entry?.quote) this.#positionMarks.push((entry.quote.bidPrice + entry.quote.askPrice) / 2);
+      const decision = this.#exits.evaluate({
+        timestamp,
+        position: this.#position,
+        ...(entry?.quote ? { optionQuote: entry.quote } : {}),
+        ...(entry?.snapshot ? { optionSnapshot: entry.snapshot } : {}),
+        feature,
+        regime,
+        killSwitch: this.#account.killSwitch,
       });
-
-      if (this.#pending) this.#advancePending(bar.timestamp);
-      if (this.#pending) continue;
-
-      if (this.#position) {
-        const entry = this.#book.get(this.#position.symbol);
-        if (entry?.quote) this.#positionMarks.push((entry.quote.bidPrice + entry.quote.askPrice) / 2);
-        const decision = this.#exits.evaluate({
-          timestamp: bar.timestamp,
-          position: this.#position,
-          ...(entry?.quote ? { optionQuote: entry.quote } : {}),
-          ...(entry?.snapshot ? { optionSnapshot: entry.snapshot } : {}),
-          feature,
-          regime,
-          killSwitch: this.#account.killSwitch,
+      this.#position = decision.updatedPosition;
+      if (decision.exit) {
+        this.#audit(timestamp, "exit_decision", {
+          reason: decision.reason ?? "UNKNOWN",
+          mark: decision.markPrice ?? null,
         });
-        this.#position = decision.updatedPosition;
-        if (decision.exit) {
-          this.#audit(bar.timestamp, "exit_decision", { reason: decision.reason ?? "UNKNOWN", mark: decision.markPrice ?? null });
-          if (entry?.quote) this.#submitExit(bar.timestamp, entry.quote, decision.reason ?? "UNKNOWN");
-        }
-        continue;
+        if (entry?.quote) this.#submitExit(timestamp, entry.quote, decision.reason ?? "UNKNOWN");
       }
+      return;
+    }
 
-      if (this.#pendingLateBullishGrindConfirmation) {
-        const pendingConfirmation = this.#pendingLateBullishGrindConfirmation;
-        const rawQuote = this.#book.get(pendingConfirmation.candidate.symbol)?.quote;
-        const quote = rawQuote &&
-          bar.timestamp - rawQuote.timestamp <= this.#config.dataQuality.maxOptionQuoteAgeMs
-          ? rawQuote : undefined;
-        const confirmation = evaluateLateBullishGrindOptionConfirmation(
-          this.#config,
+    if (this.#pendingLateBullishGrindConfirmation) {
+      const pendingConfirmation = this.#pendingLateBullishGrindConfirmation;
+      const rawQuote = this.#book.get(pendingConfirmation.candidate.symbol)?.quote;
+      const quote = rawQuote &&
+        timestamp - rawQuote.timestamp <= this.#config.dataQuality.maxOptionQuoteAgeMs
+        ? rawQuote : undefined;
+      const confirmation = evaluateLateBullishGrindOptionConfirmation(
+        this.#config,
+        {
+          armedAt: pendingConfirmation.armedAt,
+          referenceBidPrice: pendingConfirmation.referenceBidPrice,
+        },
+        feature,
+        quote,
+      );
+      this.#audit(timestamp, "late_bullish_grind_confirmation", {
+        signalId: pendingConfirmation.signal.id,
+        decision: confirmation.confirmed ? "CONFIRMED" : confirmation.expired ? "EXPIRED" : "PENDING",
+        armedAt: pendingConfirmation.armedAt,
+        symbol: pendingConfirmation.candidate.symbol,
+        elapsedSec: confirmation.elapsedSec,
+        bidImprovement: Number.isFinite(confirmation.bidImprovement) ? confirmation.bidImprovement : null,
+        projectedMoveBps: confirmation.projectedMoveBps,
+        reasons: confirmation.reasons,
+      });
+      if (confirmation.expired) {
+        this.#pendingLateBullishGrindConfirmation = undefined;
+      } else if (confirmation.confirmed && quote) {
+        const confirmedSignal: TradeSignal = {
+          ...pendingConfirmation.signal,
+          id: `${pendingConfirmation.signal.id}-option-confirmed-${feature.timestamp}`,
+          timestamp: feature.timestamp,
+          regime: regime.regime,
+          projectedMoveBps: currentBullishProjectionBps(this.#config, feature),
+          featureSnapshot: feature,
+          reasons: [
+            ...pendingConfirmation.signal.reasons,
+            `late bullish grind option bid confirmed +${confirmation.bidImprovement.toFixed(3)} after ` +
+              `${confirmation.elapsedSec.toFixed(1)}s`,
+          ],
+        };
+        this.#pendingLateBullishGrindConfirmation = undefined;
+        const {
+          gammaAwareProjectedOptionMove: _staleProjectedOptionMove,
+          ...confirmedCandidate
+        } = pendingConfirmation.candidate;
+        this.#submitEntryCandidate(
+          timestamp,
+          confirmedSignal,
           {
-            armedAt: pendingConfirmation.armedAt,
-            referenceBidPrice: pendingConfirmation.referenceBidPrice,
+            ...confirmedCandidate,
+            mid: (quote.bidPrice + quote.askPrice) / 2,
+            spreadPct: (quote.askPrice - quote.bidPrice) /
+              ((quote.bidPrice + quote.askPrice) / 2),
           },
-          feature,
           quote,
         );
-        this.#audit(bar.timestamp, "late_bullish_grind_confirmation", {
-          signalId: pendingConfirmation.signal.id,
-          decision: confirmation.confirmed ? "CONFIRMED" : confirmation.expired ? "EXPIRED" : "PENDING",
-          armedAt: pendingConfirmation.armedAt,
-          symbol: pendingConfirmation.candidate.symbol,
-          elapsedSec: confirmation.elapsedSec,
-          bidImprovement: Number.isFinite(confirmation.bidImprovement) ? confirmation.bidImprovement : null,
-          projectedMoveBps: confirmation.projectedMoveBps,
-          reasons: confirmation.reasons,
-        });
-        if (confirmation.expired) {
-          this.#pendingLateBullishGrindConfirmation = undefined;
-        } else if (confirmation.confirmed && quote) {
-          const confirmedSignal: TradeSignal = {
-            ...pendingConfirmation.signal,
-            id: `${pendingConfirmation.signal.id}-option-confirmed-${feature.timestamp}`,
-            timestamp: feature.timestamp,
-            regime: regime.regime,
-            projectedMoveBps: currentBullishProjectionBps(this.#config, feature),
-            featureSnapshot: feature,
-            reasons: [
-              ...pendingConfirmation.signal.reasons,
-              `late bullish grind option bid confirmed +${confirmation.bidImprovement.toFixed(3)} after ` +
-                `${confirmation.elapsedSec.toFixed(1)}s`,
-            ],
-          };
-          this.#pendingLateBullishGrindConfirmation = undefined;
-          const {
-            gammaAwareProjectedOptionMove: _staleProjectedOptionMove,
-            ...confirmedCandidate
-          } = pendingConfirmation.candidate;
-          this.#submitEntryCandidate(
-            bar.timestamp,
-            confirmedSignal,
-            {
-              ...confirmedCandidate,
-              mid: (quote.bidPrice + quote.askPrice) / 2,
-              spreadPct: (quote.askPrice - quote.bidPrice) /
-                ((quote.bidPrice + quote.askPrice) / 2),
-            },
-            quote,
-          );
-          continue;
-        } else {
-          continue;
-        }
+        return;
+      } else {
+        return;
       }
-
-      const signal = this.#signals.evaluate(feature, regime);
-      if (!signal) continue;
-      this.#funnel.signals += 1;
-      this.#audit(bar.timestamp, "signal", { signal });
-      const contracts = [...this.#contracts.values()].map((event) => event.data);
-      const selection = this.#selector.select(signal, contracts, this.#book);
-      for (const [reason, count] of Object.entries(selection.rejectionCounts)) this.#rejections[reason] = (this.#rejections[reason] ?? 0) + count;
-      this.#audit(bar.timestamp, "option_selection", { evaluations: selection.evaluations, selected: selection.selected ?? null });
-      if (!selection.selected) continue;
-      this.#funnel.candidateAvailable += 1;
-      this.#funnel.costGatePassed += 1;
-      const candidate = selection.selected;
-      const quote = this.#book.get(candidate.symbol)?.quote;
-      if (!quote) continue;
-      if (requiresLateBullishGrindOptionConfirmation(this.#config, signal)) {
-        this.#pendingLateBullishGrindConfirmation = {
-          signal,
-          candidate,
-          armedAt: signal.timestamp,
-          referenceBidPrice: quote.bidPrice,
-        };
-        this.#audit(bar.timestamp, "late_bullish_grind_confirmation", {
-          signalId: signal.id,
-          decision: "ARMED",
-          symbol: candidate.symbol,
-          armedAt: signal.timestamp,
-          referenceBidPrice: quote.bidPrice,
-        });
-        continue;
-      }
-      this.#submitEntryCandidate(bar.timestamp, signal, candidate, quote);
     }
+
+    const signal = this.#signals.evaluate(feature, regime);
+    if (!signal) return;
+    this.#funnel.signals += 1;
+    this.#audit(timestamp, "signal", { signal });
+    const contracts = [...this.#contracts.values()].map((event) => event.data);
+    const selection = this.#selector.select(signal, contracts, this.#book);
+    for (const [reason, count] of Object.entries(selection.rejectionCounts)) {
+      this.#rejections[reason] = (this.#rejections[reason] ?? 0) + count;
+    }
+    this.#audit(timestamp, "option_selection", {
+      evaluations: selection.evaluations,
+      selected: selection.selected ?? null,
+    });
+    if (!selection.selected) return;
+    this.#funnel.candidateAvailable += 1;
+    this.#funnel.costGatePassed += 1;
+    const candidate = selection.selected;
+    const quote = this.#book.get(candidate.symbol)?.quote;
+    if (!quote) return;
+    if (requiresLateBullishGrindOptionConfirmation(this.#config, signal)) {
+      this.#pendingLateBullishGrindConfirmation = {
+        signal,
+        candidate,
+        armedAt: signal.timestamp,
+        referenceBidPrice: quote.bidPrice,
+      };
+      this.#audit(timestamp, "late_bullish_grind_confirmation", {
+        signalId: signal.id,
+        decision: "ARMED",
+        symbol: candidate.symbol,
+        armedAt: signal.timestamp,
+        referenceBidPrice: quote.bidPrice,
+      });
+      return;
+    }
+    this.#submitEntryCandidate(timestamp, signal, candidate, quote);
   }
 
   #submitEntryCandidate(
@@ -440,6 +477,7 @@ export class ReplayEngine {
       this.#trades.push(trade);
       this.#funnel.completedTrades += 1;
       this.#risk.recordRealizedPnl(timestamp, pnl);
+      this.#signals.recordCompletedExit(position.direction, timestamp, pending.reason, pnl);
       this.#account.optionBuyingPower += 100 * position.quantity * pending.state.averageFillPrice;
       this.#audit(timestamp, "exit_filled", { reason: pending.reason, order: pending.state, pnl, trade });
       this.#position = undefined;

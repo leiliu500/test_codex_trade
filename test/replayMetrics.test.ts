@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { defaultConfig } from "../src/config.js";
 import { replayEvents } from "../src/backtest/replay.js";
 import { computeStrategyMetrics, maximumDrawdown, predictionMetrics, sessionBootstrap } from "../src/backtest/metrics.js";
 import { buildWalkForwardFolds, purgeAndEmbargo } from "../src/backtest/walkForward.js";
@@ -12,6 +13,21 @@ test("replay rejects decreasing arrival timestamps", async () => {
     { type: "prior_close", timestamp: 1, data: { symbol: "SPY", close: 500 } },
   ];
   await assert.rejects(() => replayEvents(events), /timestamp decreased/);
+});
+
+test("replay results identify the exact strategy, fill, calibration, and fee assumptions", async () => {
+  const result = await replayEvents([
+    { type: "prior_close", timestamp: 1, data: { symbol: "SPY", close: 500 } },
+  ], {
+    fillModel: "queue",
+    feesPerContractRoundTrip: 1.3,
+  });
+  assert.deepEqual(result.metadata, {
+    configVersion: defaultConfig.version,
+    fillModel: "queue",
+    calibrationVersion: null,
+    feesPerContractRoundTrip: 1.3,
+  });
 });
 
 test("trade, drawdown, Sharpe/Sortino and cost metrics use net fills/fees", () => {

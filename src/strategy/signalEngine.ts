@@ -26,6 +26,12 @@ export interface SignalEvaluation {
 export interface RestoredSignalState {
   lastSignalTimestamp?: number;
   lastEntries?: Partial<Record<Direction, number>>;
+  lastProtectedExits?: Partial<Record<Direction, number>>;
+}
+
+export function isProtectedProfitExit(reason: unknown, realizedPnl: number): boolean {
+  return realizedPnl > 0 &&
+    (reason === "PROFIT_FLOOR_EXIT" || reason === "OPPOSITE_REGIME");
 }
 
 interface PendingFollowThrough {
@@ -51,6 +57,7 @@ export class SignalEngine {
   readonly #config: EngineConfig;
   #lastSignalTimestamp = -Infinity;
   readonly #lastEntries: Partial<Record<Direction, number>> = {};
+  readonly #lastProtectedExits: Partial<Record<Direction, number>> = {};
   #pendingFollowThrough: PendingFollowThrough | undefined;
 
   constructor(config: EngineConfig) { this.#config = config; }
@@ -60,6 +67,17 @@ export class SignalEngine {
     this.#lastEntries[direction] = Math.max(this.#lastEntries[direction] ?? -Infinity, timestamp);
   }
 
+  /** Opens one guarded cooldown exception after a profitable protective exit. */
+  recordCompletedExit(
+    direction: Direction, timestamp: number, reason: unknown, realizedPnl: number,
+  ): void {
+    if (!isProtectedProfitExit(reason, realizedPnl)) return;
+    this.#lastProtectedExits[direction] = Math.max(
+      this.#lastProtectedExits[direction] ?? -Infinity,
+      timestamp,
+    );
+  }
+
   restoreState(state: RestoredSignalState): void {
     if (state.lastSignalTimestamp !== undefined && Number.isFinite(state.lastSignalTimestamp)) {
       this.#lastSignalTimestamp = Math.max(this.#lastSignalTimestamp, state.lastSignalTimestamp);
@@ -67,6 +85,13 @@ export class SignalEngine {
     for (const direction of ["BULLISH", "BEARISH"] as const) {
       const timestamp = state.lastEntries?.[direction];
       if (timestamp !== undefined && Number.isFinite(timestamp)) this.recordEntry(direction, timestamp);
+      const protectedExitTimestamp = state.lastProtectedExits?.[direction];
+      if (protectedExitTimestamp !== undefined && Number.isFinite(protectedExitTimestamp)) {
+        this.#lastProtectedExits[direction] = Math.max(
+          this.#lastProtectedExits[direction] ?? -Infinity,
+          protectedExitTimestamp,
+        );
+      }
     }
   }
 
@@ -302,10 +327,17 @@ export class SignalEngine {
       isLateBullishLowNoiseGrindFeature(this.#config, direction, f)
         ? this.#config.signals.lateEntryGuard.bullishLowNoiseGrind.reentryCooldownSec
         : this.#config.signals.sameDirectionCooldownSec;
-    if (lastEntry !== undefined && f.timestamp - lastEntry < sameDirectionCooldownSec * 1000) {
+    const protectedExitReentry = this.#protectedExitReentryAllowed(
+      direction, f.timestamp, regime, lastEntry,
+    );
+    if (lastEntry !== undefined && f.timestamp - lastEntry < sameDirectionCooldownSec * 1000 &&
+        !protectedExitReentry) {
       blockedReasons.push("SAME_DIRECTION_COOLDOWN");
       return undefined;
     }
+    const reentryReasons = protectedExitReentry ? [
+      "guarded same-direction re-entry allowed after a profitable protective exit",
+    ] : [];
     const oppositeDirection: Direction = direction === "BULLISH" ? "BEARISH" : "BULLISH";
     const oppositeEntry = this.#lastEntries[oppositeDirection];
     if (oppositeEntry !== undefined &&
@@ -412,6 +444,7 @@ export class SignalEngine {
     if (impulsePassed) {
       return this.#makeSignal(direction, "IMPULSE", directionalProjection, votes, f, regime, [
         "structural gate passed", "opening-range break/proximity/retest", `${voteCount}/4 impulse votes passed`,
+        ...reentryReasons,
       ]);
     }
 
@@ -439,7 +472,7 @@ export class SignalEngine {
       }
       return this.#makeSignal(direction, "GRIND", directionalProjection, votes, f, regime, [
         "structural gate passed", "persistent medium/slow slope", "rolling VWAP and OFI aligned", "acceleration within adverse limit",
-        ...continuationReasons,
+        ...continuationReasons, ...reentryReasons,
       ]);
     }
     if (!locationGate) blockedReasons.push("OPENING_RANGE_LOCATION_NOT_CONFIRMED");
@@ -454,6 +487,24 @@ export class SignalEngine {
     }
     if (!(s * f.ofi15 >= 0)) blockedReasons.push("GRIND_OFI_15");
     return undefined;
+  }
+
+  #protectedExitReentryAllowed(
+    direction: Direction,
+    timestamp: number,
+    regime: RegimeDecision,
+    lastEntry: number | undefined,
+  ): boolean {
+    const profile = this.#config.signals.protectedExitReentry;
+    const exitTimestamp = this.#lastProtectedExits[direction];
+    if (!profile.enabled || lastEntry === undefined || exitTimestamp === undefined ||
+        exitTimestamp < lastEntry) return false;
+    const elapsedMs = timestamp - exitTimestamp;
+    if (elapsedMs < profile.cooldownSec * 1000 || elapsedMs > profile.windowSec * 1000) return false;
+    if (!profile.requiresStrongRegime) return true;
+    return direction === "BULLISH"
+      ? regime.regime === "STRONG_UP"
+      : regime.regime === "STRONG_DOWN";
   }
 
   #makeSignal(

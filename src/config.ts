@@ -58,6 +58,12 @@ export interface EngineConfig {
     costMultiplier: number;
     sameDirectionCooldownSec: number;
     oppositeDirectionCooldownSec: number;
+    protectedExitReentry: {
+      enabled: boolean;
+      cooldownSec: number;
+      windowSec: number;
+      requiresStrongRegime: boolean;
+    };
     minimumSignalIntervalSec: number;
     lateBullishImpulseStart: string;
     lateBullishImpulseRequiresUpRegime: boolean;
@@ -184,6 +190,8 @@ export interface EngineConfig {
     hardOptionStopPct: number;
     maxHoldSec: number;
     trendInvalidationGraceSec: number;
+    oppositeRegimeGraceSec: number;
+    oppositeRegimeMinimumObservations: number;
     staleDataEmergencySec: number;
     onePositionAtATime: boolean;
     softProtectionActivationDollars: number;
@@ -341,6 +349,15 @@ export function validateConfig(config: EngineConfig): void {
         config.signals.sameDirectionCooldownSec >= 0 &&
         Number.isFinite(config.signals.oppositeDirectionCooldownSec) &&
         config.signals.oppositeDirectionCooldownSec >= 0 &&
+        typeof config.signals.protectedExitReentry.enabled === "boolean" &&
+        Number.isFinite(config.signals.protectedExitReentry.cooldownSec) &&
+        config.signals.protectedExitReentry.cooldownSec >= 0 &&
+        Number.isFinite(config.signals.protectedExitReentry.windowSec) &&
+        config.signals.protectedExitReentry.windowSec >=
+          config.signals.protectedExitReentry.cooldownSec &&
+        config.signals.protectedExitReentry.windowSec <=
+          config.signals.sameDirectionCooldownSec &&
+        typeof config.signals.protectedExitReentry.requiresStrongRegime === "boolean" &&
         Number.isFinite(config.signals.minimumSignalIntervalSec) &&
         config.signals.minimumSignalIntervalSec >= 0)) {
     throw new Error("Signal cooldowns and minimum interval must be finite and non-negative");
@@ -454,6 +471,9 @@ export function validateConfig(config: EngineConfig): void {
         config.risk.pnlNoiseMultiplier >= 0 &&
         config.risk.reversalCusumReference >= 0 &&
         config.risk.reversalCusumThreshold > 0 &&
+        config.risk.oppositeRegimeGraceSec >= 0 &&
+        Number.isInteger(config.risk.oppositeRegimeMinimumObservations) &&
+        config.risk.oppositeRegimeMinimumObservations >= 2 &&
         config.risk.recoveryProbabilityMinAgeSec >= 0 &&
         Number.isInteger(config.risk.recoveryProbabilityMinObservations) &&
         config.risk.recoveryProbabilityMinObservations >= 2 &&

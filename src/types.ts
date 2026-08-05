@@ -251,6 +251,12 @@ export interface PositionState {
   stopPrice: number;
   underlyingEntryPrice?: number;
   invalidSince?: number;
+  /** First distinct feature timestamp in the current opposite-regime run. */
+  oppositeRegimeSince?: number;
+  /** Distinct feature observations in the current opposite-regime run. */
+  oppositeRegimeObservationCount?: number;
+  /** Prevents repeated option ticks from counting one feature more than once. */
+  lastOppositeRegimeFeatureTimestamp?: number;
   /** Broker-confirmed trade state. Order submission never changes quantity. */
   tradeState:
     | "OPEN_UNPROTECTED"

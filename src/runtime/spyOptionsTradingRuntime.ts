@@ -17,7 +17,7 @@ import { OptionBook } from "../options/optionBook.js";
 import { OptionSelector } from "../options/optionSelector.js";
 import { OptionUniverseManager } from "../options/optionUniverse.js";
 import {
-  SignalEngine, type RestoredSignalState, type SignalEvaluation,
+  isProtectedProfitExit, SignalEngine, type RestoredSignalState, type SignalEvaluation,
 } from "../strategy/signalEngine.js";
 import { classifyRegime } from "../strategy/regimeClassifier.js";
 import { SpySipReceiver } from "./spySipReceiver.js";
@@ -189,6 +189,17 @@ export class SpyOptionsTradingRuntime {
       config: options.config,
       client: options.client,
       recorder: this.#recorder,
+      onCompletedExit: (exit) => {
+        this.#signals.recordCompletedExit(
+          exit.direction, exit.timestamp, exit.reason, exit.realizedPnl,
+        );
+        this.#lateEntryBaselineSignals?.recordCompletedExit(
+          exit.direction, exit.timestamp, exit.reason, exit.realizedPnl,
+        );
+        for (const engine of this.#shadowSignals.values()) {
+          engine.recordCompletedExit(exit.direction, exit.timestamp, exit.reason, exit.realizedPnl);
+        }
+      },
       restoredRiskState: restored.risk,
       knownClientOrderIds: restored.knownClientOrderIds,
     });
@@ -1211,6 +1222,7 @@ export function restoreRuntimeState(
   const knownClientOrderIds = new Set<string>();
   const filledEntries = new Set<string>();
   const lastEntries: RestoredSignalState["lastEntries"] = {};
+  const lastProtectedExits: RestoredSignalState["lastProtectedExits"] = {};
   let lastSignalTimestamp: number | undefined;
   let realizedPnl = 0;
 
@@ -1233,7 +1245,15 @@ export function restoreRuntimeState(
       filledEntries.add(identity);
       if (direction) lastEntries[direction] = Math.max(lastEntries[direction] ?? -Infinity, entryTimestamp);
     } else if (event.type === "exit_fill") {
-      realizedPnl += finiteNumber(event.data.realizedPnl) ?? 0;
+      const exitPnl = finiteNumber(event.data.realizedPnl) ?? 0;
+      realizedPnl += exitPnl;
+      const direction = directionValue(event.data.direction);
+      if (direction && isProtectedProfitExit(event.data.reason, exitPnl)) {
+        lastProtectedExits[direction] = Math.max(
+          lastProtectedExits[direction] ?? -Infinity,
+          event.timestamp,
+        );
+      }
     }
   }
 
@@ -1241,6 +1261,7 @@ export function restoreRuntimeState(
     signal: {
       ...(lastSignalTimestamp !== undefined ? { lastSignalTimestamp } : {}),
       lastEntries,
+      lastProtectedExits,
     },
     risk: { marketDate: date, entries: filledEntries.size, realizedPnl },
     knownClientOrderIds,
