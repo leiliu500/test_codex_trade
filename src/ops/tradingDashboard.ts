@@ -25,8 +25,10 @@ export interface DashboardSignal {
   direction: string;
   kind: string;
   regime: string;
+  configVersion: string;
   projectedMoveBps?: number;
   candidate?: string;
+  closestCandidate?: string;
   evaluatedContracts?: number;
   selectionScore?: number;
   delta?: number;
@@ -37,7 +39,9 @@ export interface DashboardSignal {
   decisionAsk?: number;
   decisionMid?: number;
   decisionSpreadPct?: number;
-  status: "FIRED" | "NO_ELIGIBLE_OPTION" | "ORDER_SUBMITTED" | "ORDER_BLOCKED";
+  selectionAttempt?: number;
+  retryWaitMs?: number;
+  status: "FIRED" | "OPTION_RETRY_PENDING" | "NO_ELIGIBLE_OPTION" | "ORDER_SUBMITTED" | "ORDER_BLOCKED";
   riskStatus?: "ALLOWED" | "BLOCKED";
   riskReasons?: string[];
   brokerOrderId?: string;
@@ -283,6 +287,14 @@ export interface DashboardLiveData {
 export interface DashboardPerformance {
   signalsFired: number;
   optionsSelected: number;
+  optionSelectionByConfig: Array<{
+    configVersion: string;
+    signals: number;
+    selected: number;
+    pending: number;
+    selectionRate: number;
+    latestSignalTimestamp: number;
+  }>;
   riskAllowed: number;
   riskBlocked: number;
   entryOrders: number;
@@ -547,6 +559,27 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
     const orders = [...this.#orders.values()];
     const signals = [...this.#signals.values()];
     const optionsSelected = signals.filter((signal) => signal.candidate !== undefined).length;
+    const optionSelectionByConfig = [...signals.reduce((groups, signal) => {
+      const group = groups.get(signal.configVersion) ?? {
+        configVersion: signal.configVersion,
+        signals: 0,
+        selected: 0,
+        pending: 0,
+        selectionRate: 0,
+        latestSignalTimestamp: -Infinity,
+      };
+      group.signals += 1;
+      if (signal.candidate !== undefined) group.selected += 1;
+      if (signal.status === "OPTION_RETRY_PENDING") group.pending += 1;
+      group.latestSignalTimestamp = Math.max(group.latestSignalTimestamp, signal.timestamp);
+      groups.set(signal.configVersion, group);
+      return groups;
+    }, new Map<string, DashboardPerformance["optionSelectionByConfig"][number]>()).values()]
+      .map((group) => ({
+        ...group,
+        selectionRate: group.signals > 0 ? group.selected / group.signals : 0,
+      }))
+      .sort((left, right) => right.latestSignalTimestamp - left.latestSignalTimestamp);
     const riskAllowed = signals.filter((signal) => signal.riskStatus === "ALLOWED").length;
     const riskBlocked = signals.filter((signal) => signal.riskStatus === "BLOCKED").length;
     this.#refreshProjectedOrderCards(generatedAt);
@@ -578,6 +611,7 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
       performance: {
         signalsFired: signals.length,
         optionsSelected,
+        optionSelectionByConfig,
         riskAllowed,
         riskBlocked,
         entryOrders: orders.filter((order) => order.purpose === "ENTRY").length,
@@ -686,10 +720,18 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
       directions = decisionDirections(event.data.directions);
     } else if (event.type === "live_signal_selection") {
       stage = "OPTION_SELECTION";
-      outcome = symbol ? "SELECTED" : "NO_ELIGIBLE_OPTION";
+      outcome = stringValue(event.data.selectionStatus) ?? (symbol ? "SELECTED" : "NO_ELIGIBLE_OPTION");
       const count = numberValue(event.data.evaluatedContracts) ?? 0;
-      summary = symbol ? `${symbol} selected from ${count} contracts` : `No option selected from ${count} contracts`;
-      reasons = reasonCounts(event.data.rejectionCounts);
+      const relevant = numberValue(event.data.relevantContracts) ?? count;
+      const closest = recordValue(event.data.closestCandidate);
+      const closestSymbol = stringValue(closest.symbol);
+      summary = symbol
+        ? `${symbol} selected from ${relevant} relevant contracts`
+        : outcome === "RETRYING"
+          ? `Retrying transient quotes for ${closestSymbol ?? `${relevant} relevant contracts`}`
+          : `No option selected from ${relevant} relevant contracts`;
+      reasons = stringArray(event.data.selectionReasons);
+      if (reasons.length === 0) reasons = reasonCounts(event.data.rejectionCounts);
     } else if (event.type === "late_bullish_grind_confirmation") {
       stage = "ENTRY_EVALUATION";
       outcome = stringValue(event.data.decision) ?? "PENDING";
@@ -1007,6 +1049,8 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
     const candidate = stringValue(event.data.candidate);
     const metrics = recordValue(event.data.candidateMetrics);
     const eventQuote = recordValue(event.data.candidateQuote);
+    const closest = recordValue(event.data.closestCandidate);
+    const selectionStatus = stringValue(event.data.selectionStatus);
     const liveQuote = candidate ? this.#latestOptionQuotes.get(candidate) : undefined;
     const decisionBid = numberValue(eventQuote.bidPrice) ?? liveQuote?.bidPrice;
     const decisionAsk = numberValue(eventQuote.askPrice) ?? liveQuote?.askPrice;
@@ -1015,15 +1059,22 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
     const decisionSpreadPct = numberValue(metrics.spreadPct) ??
       (decisionBid !== undefined && decisionAsk !== undefined && decisionMid !== undefined && decisionMid > 0
         ? (decisionAsk - decisionBid) / decisionMid : undefined);
+    const explicitSelectionReasons = stringArray(event.data.selectionReasons);
+    const closestReasons = stringArray(closest.rejectionReasons);
+    const selectionReasons = explicitSelectionReasons.length > 0
+      ? explicitSelectionReasons
+      : closestReasons.length > 0 ? closestReasons : reasonCounts(event.data.rejectionCounts);
     this.#signals.set(id, {
       id,
       timestamp: numberValue(event.data.timestamp) ?? event.timestamp,
       direction: stringValue(event.data.direction) ?? "UNKNOWN",
       kind: stringValue(event.data.kind) ?? "UNKNOWN",
       regime: stringValue(event.data.regime) ?? "UNKNOWN",
+      configVersion: event.configVersion,
       ...(numberValue(event.data.projectedMoveBps) !== undefined
         ? { projectedMoveBps: numberValue(event.data.projectedMoveBps)! } : {}),
       ...(candidate ? { candidate } : {}),
+      ...(stringValue(closest.symbol) ? { closestCandidate: stringValue(closest.symbol)! } : {}),
       ...(numberValue(event.data.evaluatedContracts) !== undefined
         ? { evaluatedContracts: numberValue(event.data.evaluatedContracts)! } : {}),
       ...(numberValue(metrics.score) !== undefined ? { selectionScore: numberValue(metrics.score)! } : {}),
@@ -1037,8 +1088,14 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
       ...(decisionAsk !== undefined ? { decisionAsk } : {}),
       ...(decisionMid !== undefined ? { decisionMid } : {}),
       ...(decisionSpreadPct !== undefined ? { decisionSpreadPct } : {}),
-      status: candidate ? "FIRED" : "NO_ELIGIBLE_OPTION",
-      reasons: [],
+      ...(numberValue(event.data.selectionAttempt) !== undefined
+        ? { selectionAttempt: numberValue(event.data.selectionAttempt)! } : {}),
+      ...(numberValue(event.data.retryWaitMs) !== undefined
+        ? { retryWaitMs: numberValue(event.data.retryWaitMs)! } : {}),
+      status: selectionStatus === "RETRYING"
+        ? "OPTION_RETRY_PENDING"
+        : candidate ? "FIRED" : "NO_ELIGIBLE_OPTION",
+      reasons: selectionReasons,
     });
     this.#pruneMap(this.#signals, 1_000);
   }
@@ -1894,7 +1951,7 @@ export function tradingDashboardHtml(): string {
   return `<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>SPY 0DTE Trading Dashboard</title><style>
-:root{color-scheme:dark;--bg:#07111f;--panel:#0e1b2e;--line:#20324b;--text:#e7eef9;--muted:#91a4bd;--green:#35d07f;--red:#ff667a;--blue:#58a6ff;--amber:#f5c451}*{box-sizing:border-box}body{margin:0;background:linear-gradient(135deg,#06101c,#0a1830);color:var(--text);font:14px ui-sans-serif,system-ui,sans-serif}main{max-width:1500px;margin:auto;padding:24px}header{display:flex;justify-content:space-between;gap:18px;align-items:center;margin-bottom:18px}h1{font-size:24px;margin:0}h2{font-size:16px;margin:0 0 12px}.sub,.muted{color:var(--muted)}#state{display:flex;align-items:center;gap:8px;font-weight:700;padding:8px 12px;border:1px solid var(--line);border-radius:999px}.pulse-dot{width:9px;height:9px;border-radius:50%;background:currentColor;box-shadow:0 0 0 0 currentColor;animation:pulse 1.8s infinite}@keyframes pulse{70%{box-shadow:0 0 0 7px transparent}}.ok{color:var(--green)}.degraded{color:var(--amber)}.halted{color:var(--red)}.liveness-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(185px,1fr));gap:10px;margin-bottom:18px}.status-card{background:#0b192b;border:1px solid var(--line);border-radius:10px;padding:12px}.status-card .label{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.05em}.status-card strong{display:block;margin:5px 0 3px;font-size:14px}.status-detail{color:var(--muted);font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.tabs{display:flex;gap:5px;border-bottom:1px solid var(--line);margin-bottom:16px}.tab{appearance:none;border:0;border-bottom:2px solid transparent;background:transparent;color:var(--muted);font:inherit;font-weight:700;padding:11px 16px;cursor:pointer}.tab:hover{color:var(--text)}.tab.active{color:var(--blue);border-bottom-color:var(--blue)}.tab-panel{display:none}.tab-panel.active{display:block}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:12px;margin-bottom:18px}.card,.panel{background:rgba(14,27,46,.94);border:1px solid var(--line);border-radius:12px;box-shadow:0 10px 30px #0003}.card{padding:14px}.card .value{font-size:23px;font-weight:750;margin-top:6px}.card-detail{font-size:11px;margin-top:4px}.panel{padding:16px;margin:14px 0;overflow:auto}.live-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(360px,1fr));gap:14px}.live-card{background:linear-gradient(145deg,#12243d,#0b1729);border:1px solid #294262;border-radius:13px;padding:16px;min-width:0;box-shadow:inset 3px 0 0 var(--blue)}.live-card.profit{box-shadow:inset 3px 0 0 var(--green)}.live-card.loss{box-shadow:inset 3px 0 0 var(--red)}.live-card.completed{background:linear-gradient(145deg,#101d30,#091421)}.live-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}.live-symbol{font-weight:750;font-size:16px;overflow-wrap:anywhere}.badge,.source{display:inline-block;margin-top:5px;padding:3px 7px;border-radius:999px;background:#58a6ff1c;color:var(--blue);font-size:11px;font-weight:700;letter-spacing:.04em}.source{margin:0}.live-pnl{text-align:right;font-size:22px;font-weight:800}.live-return{text-align:right;font-size:12px;margin-top:3px}.entry-quality{display:grid;gap:3px;border:1px solid var(--line);border-radius:8px;margin-top:13px;padding:9px 11px;background:#07111f80}.entry-quality strong{font-size:11px;letter-spacing:.05em}.entry-quality span{color:var(--muted);font-size:11px}.entry-quality.good{border-color:#35d07f66}.entry-quality.good strong{color:var(--green)}.entry-quality.good-entry-poor-exit,.entry-quality.marginal{border-color:#f5c45166}.entry-quality.good-entry-poor-exit strong,.entry-quality.marginal strong{color:var(--amber)}.entry-quality.poor{border-color:#ff667a66}.entry-quality.poor strong{color:var(--red)}.entry-quality.evaluating strong{color:var(--blue)}.entry-quality.not-rated strong{color:var(--muted)}.live-fields{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin-top:16px}.live-field span{display:block;color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.04em;margin-bottom:4px}.live-field strong{font-size:14px}.order-strip{border-top:1px solid var(--line);margin-top:15px;padding-top:12px;display:flex;justify-content:space-between;gap:10px;color:var(--muted);font-size:12px}.dynamics{border-top:1px solid var(--line);margin-top:14px;padding-top:12px}.dynamics-title{color:var(--muted);font-size:11px;font-weight:750;text-transform:uppercase;letter-spacing:.05em;margin-bottom:7px}.dynamics-list{display:grid;gap:5px}.dynamics-columns,.dynamics-row{display:grid;grid-template-columns:108px minmax(140px,1fr) 82px 76px;gap:7px}.dynamics-columns{color:var(--muted);font-size:9px;font-weight:750;text-transform:uppercase;letter-spacing:.05em;padding:0 7px 4px}.dynamics-row{align-items:center;border-radius:6px;background:#07111f80;padding:7px;font-size:11px}.dynamics-row .dynamics-time,.dynamics-row .dynamics-state{color:var(--muted)}.dynamics-time{display:grid;gap:1px;white-space:nowrap;font-variant-numeric:tabular-nums}.dynamics-date{font-size:9px}.dynamics-clock{color:var(--text);font-size:10px}.dynamics-state-primary,.dynamics-state-change{display:block}.dynamics-state-change{color:var(--text);font-size:10px;margin-top:2px}.dynamics-row .dynamics-pnl,.dynamics-row .dynamics-change{text-align:right;font-variant-numeric:tabular-nums}.empty{color:var(--muted);padding:22px;text-align:center;border:1px dashed var(--line);border-radius:10px}.section-note{color:var(--muted);font-size:12px;margin:-6px 0 12px}.decision-reasons{max-width:560px;white-space:normal;line-height:1.45}.outcome{font-weight:750}.outcome.pass{color:var(--green)}.outcome.block{color:var(--amber)}.tune-controls{display:flex;align-items:end;gap:12px;flex-wrap:wrap;margin-bottom:14px}.tune-control{display:grid;gap:5px}.tune-control label{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.04em}.tune-control select{min-width:150px;background:#0a1728;color:var(--text);border:1px solid var(--line);border-radius:7px;padding:8px 10px}.legend{display:flex;gap:16px;flex-wrap:wrap;color:var(--muted);font-size:11px;margin:8px 0}.quality-status{font-weight:750}.quality-status.WIN,.quality-status.FILLED,.quality-status.OPEN{color:var(--green)}.quality-status.LOSS,.quality-status.BLOCKED{color:var(--red)}.quality-status.WORKING,.quality-status.NO_OPTION{color:var(--amber)}table{border-collapse:collapse;width:100%;min-width:850px}th,td{text-align:left;padding:9px 10px;border-bottom:1px solid var(--line);white-space:nowrap}th{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.04em}tbody tr:hover{background:#ffffff08}.positive{color:var(--green)}.negative{color:var(--red)}@media(max-width:700px){main{padding:14px}header{align-items:flex-start;flex-direction:column}.live-grid{grid-template-columns:1fr}.live-fields{grid-template-columns:repeat(2,minmax(0,1fr))}.dynamics-columns,.dynamics-row{grid-template-columns:94px 1fr 72px}.dynamics-columns .dynamics-change,.dynamics-change{display:none}.tab{padding:10px}.tune-control{width:100%}.tune-control select{width:100%}}
+:root{color-scheme:dark;--bg:#07111f;--panel:#0e1b2e;--line:#20324b;--text:#e7eef9;--muted:#91a4bd;--green:#35d07f;--red:#ff667a;--blue:#58a6ff;--amber:#f5c451}*{box-sizing:border-box}body{margin:0;background:linear-gradient(135deg,#06101c,#0a1830);color:var(--text);font:14px ui-sans-serif,system-ui,sans-serif}main{max-width:1500px;margin:auto;padding:24px}header{display:flex;justify-content:space-between;gap:18px;align-items:center;margin-bottom:18px}h1{font-size:24px;margin:0}h2{font-size:16px;margin:0 0 12px}.sub,.muted{color:var(--muted)}#state{display:flex;align-items:center;gap:8px;font-weight:700;padding:8px 12px;border:1px solid var(--line);border-radius:999px}.pulse-dot{width:9px;height:9px;border-radius:50%;background:currentColor;box-shadow:0 0 0 0 currentColor;animation:pulse 1.8s infinite}@keyframes pulse{70%{box-shadow:0 0 0 7px transparent}}.ok{color:var(--green)}.degraded{color:var(--amber)}.halted{color:var(--red)}.liveness-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(185px,1fr));gap:10px;margin-bottom:18px}.status-card{background:#0b192b;border:1px solid var(--line);border-radius:10px;padding:12px}.status-card .label{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.05em}.status-card strong{display:block;margin:5px 0 3px;font-size:14px}.status-detail{color:var(--muted);font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.tabs{display:flex;gap:5px;border-bottom:1px solid var(--line);margin-bottom:16px}.tab{appearance:none;border:0;border-bottom:2px solid transparent;background:transparent;color:var(--muted);font:inherit;font-weight:700;padding:11px 16px;cursor:pointer}.tab:hover{color:var(--text)}.tab.active{color:var(--blue);border-bottom-color:var(--blue)}.tab-panel{display:none}.tab-panel.active{display:block}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:12px;margin-bottom:18px}.card,.panel{background:rgba(14,27,46,.94);border:1px solid var(--line);border-radius:12px;box-shadow:0 10px 30px #0003}.card{padding:14px}.card .value{font-size:23px;font-weight:750;margin-top:6px}.card-detail{font-size:11px;margin-top:4px}.panel{padding:16px;margin:14px 0;overflow:auto}.live-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(360px,1fr));gap:14px}.live-card{background:linear-gradient(145deg,#12243d,#0b1729);border:1px solid #294262;border-radius:13px;padding:16px;min-width:0;box-shadow:inset 3px 0 0 var(--blue)}.live-card.profit{box-shadow:inset 3px 0 0 var(--green)}.live-card.loss{box-shadow:inset 3px 0 0 var(--red)}.live-card.completed{background:linear-gradient(145deg,#101d30,#091421)}.live-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}.live-symbol{font-weight:750;font-size:16px;overflow-wrap:anywhere}.badge,.source{display:inline-block;margin-top:5px;padding:3px 7px;border-radius:999px;background:#58a6ff1c;color:var(--blue);font-size:11px;font-weight:700;letter-spacing:.04em}.source{margin:0}.live-pnl{text-align:right;font-size:22px;font-weight:800}.live-return{text-align:right;font-size:12px;margin-top:3px}.entry-quality{display:grid;gap:3px;border:1px solid var(--line);border-radius:8px;margin-top:13px;padding:9px 11px;background:#07111f80}.entry-quality strong{font-size:11px;letter-spacing:.05em}.entry-quality span{color:var(--muted);font-size:11px}.entry-quality.good{border-color:#35d07f66}.entry-quality.good strong{color:var(--green)}.entry-quality.good-entry-poor-exit,.entry-quality.marginal{border-color:#f5c45166}.entry-quality.good-entry-poor-exit strong,.entry-quality.marginal strong{color:var(--amber)}.entry-quality.poor{border-color:#ff667a66}.entry-quality.poor strong{color:var(--red)}.entry-quality.evaluating strong{color:var(--blue)}.entry-quality.not-rated strong{color:var(--muted)}.live-fields{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin-top:16px}.live-field span{display:block;color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.04em;margin-bottom:4px}.live-field strong{font-size:14px}.order-strip{border-top:1px solid var(--line);margin-top:15px;padding-top:12px;display:flex;justify-content:space-between;gap:10px;color:var(--muted);font-size:12px}.dynamics{border-top:1px solid var(--line);margin-top:14px;padding-top:12px}.dynamics-title{color:var(--muted);font-size:11px;font-weight:750;text-transform:uppercase;letter-spacing:.05em;margin-bottom:7px}.dynamics-list{display:grid;gap:5px}.dynamics-columns,.dynamics-row{display:grid;grid-template-columns:108px minmax(140px,1fr) 82px 76px;gap:7px}.dynamics-columns{color:var(--muted);font-size:9px;font-weight:750;text-transform:uppercase;letter-spacing:.05em;padding:0 7px 4px}.dynamics-row{align-items:center;border-radius:6px;background:#07111f80;padding:7px;font-size:11px}.dynamics-row .dynamics-time,.dynamics-row .dynamics-state{color:var(--muted)}.dynamics-time{display:grid;gap:1px;white-space:nowrap;font-variant-numeric:tabular-nums}.dynamics-date{font-size:9px}.dynamics-clock{color:var(--text);font-size:10px}.dynamics-state-primary,.dynamics-state-change{display:block}.dynamics-state-change{color:var(--text);font-size:10px;margin-top:2px}.dynamics-row .dynamics-pnl,.dynamics-row .dynamics-change{text-align:right;font-variant-numeric:tabular-nums}.empty{color:var(--muted);padding:22px;text-align:center;border:1px dashed var(--line);border-radius:10px}.section-note{color:var(--muted);font-size:12px;margin:-6px 0 12px}.decision-reasons{max-width:560px;white-space:normal;line-height:1.45}.outcome{font-weight:750}.outcome.pass{color:var(--green)}.outcome.block{color:var(--amber)}.outcome.warn{color:var(--blue)}.tune-controls{display:flex;align-items:end;gap:12px;flex-wrap:wrap;margin-bottom:14px}.tune-control{display:grid;gap:5px}.tune-control label{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.04em}.tune-control select{min-width:150px;background:#0a1728;color:var(--text);border:1px solid var(--line);border-radius:7px;padding:8px 10px}.legend{display:flex;gap:16px;flex-wrap:wrap;color:var(--muted);font-size:11px;margin:8px 0}.quality-status{font-weight:750}.quality-status.WIN,.quality-status.FILLED,.quality-status.OPEN{color:var(--green)}.quality-status.LOSS,.quality-status.BLOCKED{color:var(--red)}.quality-status.WORKING,.quality-status.NO_OPTION{color:var(--amber)}table{border-collapse:collapse;width:100%;min-width:850px}th,td{text-align:left;padding:9px 10px;border-bottom:1px solid var(--line);white-space:nowrap}th{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.04em}tbody tr:hover{background:#ffffff08}.positive{color:var(--green)}.negative{color:var(--red)}@media(max-width:700px){main{padding:14px}header{align-items:flex-start;flex-direction:column}.live-grid{grid-template-columns:1fr}.live-fields{grid-template-columns:repeat(2,minmax(0,1fr))}.dynamics-columns,.dynamics-row{grid-template-columns:94px 1fr 72px}.dynamics-columns .dynamics-change,.dynamics-change{display:none}.tab{padding:10px}.tune-control{width:100%}.tune-control select{width:100%}}
 </style><style>
 .management{margin-top:13px;border:1px solid #294262;border-radius:9px;background:#081526b8;padding:10px}.management-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:9px}.management-title{color:var(--muted);font-size:11px;font-weight:750;text-transform:uppercase;letter-spacing:.05em}.management-badges{display:flex;gap:5px;flex-wrap:wrap;justify-content:flex-end}.management-badges .badge{margin:0}.management-badges .exit{background:#ff667a1c;color:var(--red)}.management-badges .protected{background:#35d07f1c;color:var(--green)}.management-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:9px}.management-detail{grid-column:1/-1;color:var(--muted);font-size:11px;line-height:1.45;overflow-wrap:anywhere}.order-strip{flex-direction:column}.order-strip-row{display:flex;justify-content:space-between;gap:10px}.order-strip-detail{color:var(--muted);font-size:11px;overflow-wrap:anywhere}.dynamics-state{white-space:normal;line-height:1.35}@media(max-width:700px){.management-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
 </style></head><body><main><header><div><h1>SPY 0DTE Option Day-Trade Dashboard</h1><div class="sub">Live SIP signals · OPRA options · Alpaca paper execution · PostgreSQL history</div></div><div id="state"><span class="pulse-dot"></span><span id="stateText">Loading…</span></div></header>
@@ -1927,7 +1984,7 @@ export function tradingDashboardHtml(): string {
 <div class="card"><div class="muted">Option Subs</div><div class="value" id="subscriptions">0</div></div>
 </section>
 <section class="panel"><h2>Orders</h2><div class="section-note">Cards show broker execution plus the order manager lifecycle, buffered soft and full winner-protection states, executable P&amp;L, profit floor, recovery and continuation evidence, exit triggers, urgency, and retries. The complete timeline is stored in PostgreSQL for order-history restoration.</div><div id="orderCards" class="live-grid"><div class="empty">Waiting for an option order…</div></div></section>
-<section class="panel"><h2>Signal → Trade Funnel</h2><div class="section-note">A fired signal is not an order. Each row shows option selection, risk, and submission status explicitly.</div><table><thead><tr><th>Time</th><th>Direction</th><th>Kind</th><th>Regime</th><th>Projected</th><th>Option</th><th>Risk</th><th>Status</th><th>Reason</th></tr></thead><tbody id="signals"></tbody></table></section>
+<section class="panel"><h2>Signal → Trade Funnel</h2><div class="section-note">A fired signal is not an order. Each row shows the selector version, option choice, risk, and submission status explicitly.</div><table><thead><tr><th>Time</th><th>Version</th><th>Direction</th><th>Kind</th><th>Regime</th><th>Projected</th><th>Option</th><th>Risk</th><th>Status</th><th>Reason</th></tr></thead><tbody id="signals"></tbody></table></section>
 <section class="panel"><h2>Potential Missed Entry Review</h2><div class="section-note">Hindsight diagnostic, not an automatic trade recommendation. A row appears only when directional gates produced NO SIGNAL and SPY subsequently moved at least ${MISSED_ENTRY_MOVE_THRESHOLD_BPS.toFixed(1)} bps in one direction over the ${MISSED_ENTRY_HORIZON_SEC}-second projection horizon. Consecutive rows are clustered for readability.</div><table><thead><tr><th>Evaluation</th><th>Direction</th><th>Regime</th><th>SPY Start</th><th>SPY +${MISSED_ENTRY_HORIZON_SEC}s</th><th>Forward Move</th><th>Failed Gates / Votes</th><th>Decision Reason</th></tr></thead><tbody id="potentialMissRows"></tbody></table></section>
 <section class="panel"><h2>Entry Gate Blocks</h2><div class="section-note">Counts every top-level reason that prevented an entry evaluation. This exposes global state failures such as incomplete opening-range recovery even when no hindsight row is created.</div><table><thead><tr><th>Gate / Reason</th><th>Blocked Evaluations</th><th>Share of Evaluations</th></tr></thead><tbody id="gateBlockRows"></tbody></table></section>
 <section class="panel"><h2>Orders &amp; Executions</h2><table><thead><tr><th>Time</th><th>Purpose</th><th>Option</th><th>Side</th><th>Qty</th><th>Limit</th><th>Filled</th><th>Avg Fill</th><th>Status</th></tr></thead><tbody id="orders"></tbody></table></section>
@@ -2017,7 +2074,7 @@ dynamics.append(title,columns,list);card.append(dynamics);return card});
 root.replaceChildren(...cards)
 }
 function setStatus(valueId,detailId,value,detail,level){$(valueId).textContent=value;$(valueId).className=level;$(detailId).textContent=detail}function age(ms){return Number.isFinite(ms)?duration(ms)+' ago':'No events yet'}function storagePolicy(event,live){if(!live.persistenceEnabled)return 'Disabled';if(event.type==='stock_quote'||event.type==='option_quote')return (live.quoteSampleIntervalMs||0)+' ms baseline · active option full';return 'Full retention'}
-function outcomeClass(value){return ['SIGNAL','SELECTED','ALLOWED','SUBMITTED','REQUESTED','FILLED'].includes(value)?'outcome pass':['NO_SIGNAL','NO_ELIGIBLE_OPTION','BLOCKED','SKIPPED'].includes(value)?'outcome block':'outcome'}
+function outcomeClass(value){return ['SIGNAL','SELECTED','ALLOWED','SUBMITTED','REQUESTED','FILLED'].includes(value)?'outcome pass':['NO_SIGNAL','NO_ELIGIBLE_OPTION','BLOCKED','SKIPPED'].includes(value)?'outcome block':value==='RETRYING'?'outcome warn':'outcome'}
 function decisionDetail(item){const details=[...(item.reasons||[])];for(const direction of item.directions||[]){const failedVotes=(direction.votes||[]).filter(v=>!v.passed).map(v=>v.name);const result=direction.passed?'PASS':(direction.reasons||[]).slice(0,6).join(', ');details.push(direction.direction+': '+result+(failedVotes.length?' · failed votes '+failedVotes.join(', '):''))}return details.join(' · ')||'All configured gates passed'}
 let latestDecisions=[];
 function renderDecisionRows(items){latestDecisions=items||[];const view=$('decisionView').value,filtered=view==='ALL'?latestDecisions:view==='NO_SIGNAL'?latestDecisions.filter(x=>x.stage==='ENTRY_EVALUATION'&&x.outcome==='NO_SIGNAL'):latestDecisions.filter(x=>!(x.stage==='ENTRY_EVALUATION'&&x.outcome==='NO_SIGNAL'));rows('decisions',filtered,[x=>({value:time(x.timestamp)}),x=>({value:x.stage.replaceAll('_',' ')}),x=>({value:x.outcome.replaceAll('_',' '),cls:outcomeClass(x.outcome)}),x=>({value:x.direction}),x=>({value:x.symbol}),x=>({value:x.summary}),x=>({value:decisionDetail(x),cls:'decision-reasons'})],view==='ACTIONABLE'?'No actionable signal, option-selection, risk, or order events yet. Routine NO SIGNAL evaluations remain recorded.':'No evaluations match this view.')}
@@ -2053,10 +2110,10 @@ setStatus('brokerState','brokerDetail',h.brokerAvailable?'CONNECTED':'UNAVAILABL
 setStatus('marketState','marketDetail',String(h.marketClockState||'unknown').replaceAll('-',' ').toUpperCase(),h.positionsReconciled?'Positions reconciled':'Reconciliation required',h.positionsReconciled?'ok':'halted');
 const strategyRequired=h.executionEnabled&&h.marketClockState==='market-open',strategyReady=h.strategyStateReady===true||!strategyRequired,strategyPhase=String(h.strategyStateStatus||(!strategyRequired?'NOT_REQUIRED':'UNKNOWN')),strategyStatus=strategyPhase.replaceAll('_',' '),strategyBuilding=strategyRequired&&strategyPhase==='BUILDING_OPENING_RANGE',strategyLabel=strategyBuilding?'BUILDING':strategyReady?'READY':'BLOCKED',strategyLevel=strategyBuilding?'degraded':strategyReady?'ok':'halted',openingRangeEnd=strategyBuilding&&h.strategyOpeningRangeEnd?' until '+String(h.strategyOpeningRangeEnd).replace(/:00$/,'')+' ET':'',restoredBars=h.restoredFeatureBars??h.restoredBars??0,liveBars=h.completedBars??0;
 setStatus('strategyState','strategyDetail',strategyLabel,strategyStatus+openingRangeEnd+' · '+count(h.restoredStockEvents)+' SIP / '+count(restoredBars)+' bars restored at startup · '+count(liveBars)+' live bars / '+count(sipLive)+' SIP events',strategyLevel);
-const signalsFired=p.signalsFired??0,optionsSelected=p.optionsSelected??0;
-$('signalsFired').textContent=count(signalsFired);$('optionsSelected').textContent=count(optionsSelected);$('optionSelectionDetail').textContent=percent(signalsFired>0?100*optionsSelected/signalsFired:0)+' of signals';$('riskAllowed').textContent=count(p.riskAllowed);$('riskDetail').textContent=count(p.riskBlocked)+' blocked';$('entryOrders').textContent=p.entryOrders;$('filledEntries').textContent=p.filledEntryOrders;$('closedTrades').textContent=p.closedTrades;$('winRate').textContent=(p.winRate*100).toFixed(1)+'%';$('pnl').textContent=money(p.realizedPnl);$('pnl').className='value '+(p.realizedPnl>0?'positive':p.realizedPnl<0?'negative':'');$('openPnl').textContent=money(p.unrealizedPnl);$('openPnl').className='value '+(p.unrealizedPnl>0?'positive':p.unrealizedPnl<0?'negative':'');$('totalPnl').textContent=money(p.totalPnl);$('totalPnl').className='value '+(p.totalPnl>0?'positive':p.totalPnl<0?'negative':'');$('profitFactor').textContent=p.profitFactor===null?'—':num(p.profitFactor);$('openTrades').textContent=p.openTrades;$('subscriptions').textContent=subscriptions;$('feedEvents').textContent=count(live.totalEvents);$('sipQuotes').textContent=count(live.eventCounts.stock_quote);$('sipTrades').textContent=count(live.eventCounts.stock_trade);$('opraQuotes').textContent=count(live.eventCounts.option_quote);$('featureEvents').textContent=count(live.eventCounts.feature_snapshot);$('feedAge').textContent=live.lastEventAgeMs===undefined?'—':duration(live.lastEventAgeMs);
+const signalsFired=p.signalsFired??0,optionsSelected=p.optionsSelected??0,latestSelectionVersion=(p.optionSelectionByConfig||[])[0];
+$('signalsFired').textContent=count(signalsFired);$('optionsSelected').textContent=count(optionsSelected);$('optionSelectionDetail').textContent=latestSelectionVersion?percent(100*latestSelectionVersion.selectionRate)+' for '+latestSelectionVersion.configVersion+' · '+count(latestSelectionVersion.pending)+' retrying':percent(signalsFired>0?100*optionsSelected/signalsFired:0)+' of signals';$('riskAllowed').textContent=count(p.riskAllowed);$('riskDetail').textContent=count(p.riskBlocked)+' blocked';$('entryOrders').textContent=p.entryOrders;$('filledEntries').textContent=p.filledEntryOrders;$('closedTrades').textContent=p.closedTrades;$('winRate').textContent=(p.winRate*100).toFixed(1)+'%';$('pnl').textContent=money(p.realizedPnl);$('pnl').className='value '+(p.realizedPnl>0?'positive':p.realizedPnl<0?'negative':'');$('openPnl').textContent=money(p.unrealizedPnl);$('openPnl').className='value '+(p.unrealizedPnl>0?'positive':p.unrealizedPnl<0?'negative':'');$('totalPnl').textContent=money(p.totalPnl);$('totalPnl').className='value '+(p.totalPnl>0?'positive':p.totalPnl<0?'negative':'');$('profitFactor').textContent=p.profitFactor===null?'—':num(p.profitFactor);$('openTrades').textContent=p.openTrades;$('subscriptions').textContent=subscriptions;$('feedEvents').textContent=count(live.totalEvents);$('sipQuotes').textContent=count(live.eventCounts.stock_quote);$('sipTrades').textContent=count(live.eventCounts.stock_trade);$('opraQuotes').textContent=count(live.eventCounts.option_quote);$('featureEvents').textContent=count(live.eventCounts.feature_snapshot);$('feedAge').textContent=live.lastEventAgeMs===undefined?'—':duration(live.lastEventAgeMs);
 renderOrders(data.orderCards||data.activeOrders);
-rows('signals',data.signals,[x=>({value:time(x.timestamp)}),x=>({value:x.direction}),x=>({value:x.kind}),x=>({value:x.regime}),x=>({value:num(x.projectedMoveBps)+' bps'}),x=>({value:x.candidate}),x=>({value:x.riskStatus||'—',cls:x.riskStatus==='ALLOWED'?'positive':x.riskStatus==='BLOCKED'?'negative':''}),x=>({value:x.status}),x=>({value:(x.riskReasons||x.reasons||[]).join(', ')})]);
+rows('signals',data.signals,[x=>({value:time(x.timestamp)}),x=>({value:x.configVersion}),x=>({value:x.direction}),x=>({value:x.kind}),x=>({value:x.regime}),x=>({value:num(x.projectedMoveBps)+' bps'}),x=>({value:x.candidate||x.closestCandidate}),x=>({value:x.riskStatus||'—',cls:x.riskStatus==='ALLOWED'?'positive':x.riskStatus==='BLOCKED'?'negative':''}),x=>({value:x.status}),x=>({value:(x.riskReasons||x.reasons||[]).join(', ')})]);
 rows('orders',data.orders,[x=>({value:time(x.timestamp)}),x=>({value:x.purpose}),x=>({value:x.symbol}),x=>({value:x.side}),x=>({value:x.quantity}),x=>({value:money(x.limitPrice)}),x=>({value:x.filledQuantity}),x=>({value:x.averageFillPrice?money(x.averageFillPrice):'—'}),x=>({value:x.status})]);
 renderTuning(data.tuning||{entries:[]},data.orders||[]);renderPotentialMisses(data.tuning);
 rows('trades',data.trades,[x=>({value:time(x.entryTimestamp)}),x=>({value:time(x.exitTimestamp)}),x=>({value:x.symbol}),x=>({value:x.direction}),x=>({value:x.quantity}),x=>({value:money(x.averageEntryPrice)}),x=>({value:x.averageExitPrice?money(x.averageExitPrice):'—'}),x=>({value:money(x.realizedPnl),cls:x.realizedPnl>0?'positive':x.realizedPnl<0?'negative':''}),x=>({value:x.returnPct===undefined?'—':num(x.returnPct)+'%'}),x=>({value:x.exitReason}),x=>({value:x.status})]);

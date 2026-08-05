@@ -2,7 +2,7 @@ import type { EngineConfig } from "../config.js";
 import { defaultConfig } from "../config.js";
 import type {
   AccountState, CalibrationProfile, FeatureSnapshot, OptionCandidateEvaluation, OptionQuote, PositionState,
-  ReplayEvent, RiskDecision, SecondBar, TradeSignal,
+  RegimeDecision, ReplayEvent, RiskDecision, SecondBar, TradeSignal,
 } from "../types.js";
 import { SecondAggregator } from "../features/secondAggregator.js";
 import { FeatureEngine } from "../features/featureEngine.js";
@@ -13,7 +13,9 @@ import {
   requiresLateBullishGrindOptionConfirmation,
 } from "../strategy/lateBullishGrindConfirmation.js";
 import { OptionBook } from "../options/optionBook.js";
-import { OptionSelector } from "../options/optionSelector.js";
+import {
+  OptionSelector, relevantOptionEvaluations, retryableOptionEvaluations, type SelectionResult,
+} from "../options/optionSelector.js";
 import { RiskManager } from "../risk/riskManager.js";
 import { ExitManager } from "../risk/exitManager.js";
 import { OrderExecutor, type OrderState } from "../execution/orderExecutor.js";
@@ -43,6 +45,14 @@ interface PendingLateBullishGrindConfirmation {
   candidate: OptionCandidateEvaluation;
   armedAt: number;
   referenceBidPrice: number;
+}
+
+interface PendingOptionSelection {
+  signal: TradeSignal;
+  armedAt: number;
+  expiresAt: number;
+  attempts: number;
+  lastSelection: SelectionResult;
 }
 
 export interface ReplayFunnel {
@@ -111,7 +121,10 @@ export class ReplayEngine {
   #positionCandidate: OptionCandidateEvaluation | undefined;
   #positionMarks: number[] = [];
   #pending: PendingOrder | undefined;
+  #pendingOptionSelection: PendingOptionSelection | undefined;
   #pendingLateBullishGrindConfirmation: PendingLateBullishGrindConfirmation | undefined;
+  #lastFeature: FeatureSnapshot | undefined;
+  #lastRegime: RegimeDecision | undefined;
 
   constructor(options: ReplayOptions = {}) {
     this.#config = options.config ?? defaultConfig;
@@ -160,7 +173,11 @@ export class ReplayEngine {
           this.#contracts.set(event.data.symbol, event as ReplayEvent & { type: "option_contract" });
           break;
         case "option_quote":
-          if (!this.#book.updateQuote(event.data)) this.#audit(event.timestamp, "option_quote_rejected", { reason: "OUT_OF_ORDER", symbol: event.data.symbol });
+          if (!this.#book.updateQuote(event.data)) {
+            this.#audit(event.timestamp, "option_quote_rejected", { reason: "OUT_OF_ORDER", symbol: event.data.symbol });
+          } else if (this.#pendingOptionSelection) {
+            this.#advancePendingOptionSelection(event.timestamp);
+          }
           break;
         case "option_snapshot":
           if (!this.#book.updateSnapshot(event.data)) this.#audit(event.timestamp, "option_snapshot_rejected", { reason: "OUT_OF_ORDER", symbol: event.data.symbol });
@@ -186,6 +203,10 @@ export class ReplayEngine {
 
   async finish(): Promise<ReplayResult> {
     if (Number.isFinite(this.#lastTimestamp)) await this.#queue.enqueue(() => this.#handleBars(this.#aggregator.flushThrough(this.#lastTimestamp + 1000)));
+    if (this.#pendingOptionSelection) {
+      const expiresAt = this.#pendingOptionSelection.expiresAt;
+      await this.#queue.enqueue(() => { this.#advancePendingOptionSelection(expiresAt); });
+    }
     await this.#queue.drained();
     const auditEvents = this.#recorder === this.#memoryRecorder ? this.#memoryRecorder.events.slice() : [];
     return {
@@ -217,6 +238,8 @@ export class ReplayEngine {
     const timestamp = feature.timestamp;
     if (feature.dataValid) this.#funnel.validFeatures += 1;
     const regime = classifyRegime(feature, this.#config.regimes);
+    this.#lastFeature = feature;
+    this.#lastRegime = regime;
     this.#audit(timestamp, "decision_snapshot", {
       feature, regime, position: this.#position ?? null, pendingOrder: this.#pending?.state ?? null,
     });
@@ -246,6 +269,8 @@ export class ReplayEngine {
       }
       return;
     }
+
+    if (this.#pendingOptionSelection && this.#advancePendingOptionSelection(timestamp, feature, regime)) return;
 
     if (this.#pendingLateBullishGrindConfirmation) {
       const pendingConfirmation = this.#pendingLateBullishGrindConfirmation;
@@ -314,33 +339,200 @@ export class ReplayEngine {
     if (!signal) return;
     this.#funnel.signals += 1;
     this.#audit(timestamp, "signal", { signal });
+    this.#beginOptionSelection(timestamp, signal);
+  }
+
+  #beginOptionSelection(timestamp: number, signal: TradeSignal): void {
     const contracts = [...this.#contracts.values()].map((event) => event.data);
-    const selection = this.#selector.select(signal, contracts, this.#book);
-    for (const [reason, count] of Object.entries(selection.rejectionCounts)) {
-      this.#rejections[reason] = (this.#rejections[reason] ?? 0) + count;
+    const selection = this.#selector.select(signal, contracts, this.#book, timestamp);
+    const candidate = selection.selected;
+    const quote = candidate ? this.#book.get(candidate.symbol)?.quote : undefined;
+    if (candidate && quote) {
+      this.#recordOptionSelection(signal, signal, selection, timestamp, "SELECTED", {
+        selectionAttempt: 1,
+        retryWaitMs: 0,
+      });
+      this.#handleSelectedCandidate(timestamp, signal, candidate, quote);
+      return;
     }
+
+    const retryable = retryableOptionEvaluations(signal, selection, this.#config);
+    if (this.#config.execution.optionSelectionRetryMs > 0 && retryable.length > 0) {
+      this.#pendingOptionSelection = {
+        signal,
+        armedAt: timestamp,
+        expiresAt: Math.min(
+          signal.timestamp + this.#config.execution.entrySignalTtlMs,
+          timestamp + this.#config.execution.optionSelectionRetryMs,
+        ),
+        attempts: 1,
+        lastSelection: selection,
+      };
+      this.#recordOptionSelection(signal, signal, selection, timestamp, "RETRYING", {
+        selectionAttempt: 1,
+        retryWaitMs: 0,
+        retryDeadline: this.#pendingOptionSelection.expiresAt,
+        retryableCandidates: retryable.map((evaluation) => evaluation.symbol),
+      });
+      return;
+    }
+
+    this.#recordOptionSelection(signal, signal, selection, timestamp, "NO_ELIGIBLE_OPTION", {
+      selectionAttempt: 1,
+      retryWaitMs: 0,
+      retryOutcome: retryable.length > 0 ? "RETRY_DISABLED" : "STRUCTURAL_REJECTION",
+    });
+  }
+
+  #advancePendingOptionSelection(
+    timestamp: number,
+    feature = this.#lastFeature,
+    regime = this.#lastRegime,
+  ): boolean {
+    const pending = this.#pendingOptionSelection;
+    if (!pending) return false;
+    if (timestamp >= pending.expiresAt) {
+      this.#pendingOptionSelection = undefined;
+      this.#recordOptionSelection(
+        pending.signal,
+        pending.signal,
+        pending.lastSelection,
+        timestamp,
+        "NO_ELIGIBLE_OPTION",
+        {
+          selectionAttempt: pending.attempts,
+          retryWaitMs: Math.max(0, timestamp - pending.armedAt),
+          retryOutcome: "EXPIRED",
+        },
+      );
+      return false;
+    }
+
+    if (!feature || !regime) return true;
+    const revalidation = this.#signals.revalidateForEntry(pending.signal, feature, regime);
+    if (!revalidation.valid || !revalidation.signal) {
+      this.#pendingOptionSelection = undefined;
+      this.#recordOptionSelection(
+        pending.signal,
+        pending.signal,
+        pending.lastSelection,
+        timestamp,
+        "NO_ELIGIBLE_OPTION",
+        {
+          selectionAttempt: pending.attempts,
+          retryWaitMs: Math.max(0, timestamp - pending.armedAt),
+          retryOutcome: "SIGNAL_INVALIDATED",
+          selectionReasons: revalidation.reasons,
+        },
+      );
+      return false;
+    }
+
+    pending.attempts += 1;
+    const contracts = [...this.#contracts.values()].map((event) => event.data);
+    const selection = this.#selector.select(revalidation.signal, contracts, this.#book, timestamp);
+    pending.lastSelection = selection;
+    const candidate = selection.selected;
+    const quote = candidate ? this.#book.get(candidate.symbol)?.quote : undefined;
+    if (candidate && quote) {
+      this.#pendingOptionSelection = undefined;
+      this.#recordOptionSelection(
+        pending.signal,
+        revalidation.signal,
+        selection,
+        timestamp,
+        "SELECTED",
+        {
+          selectionAttempt: pending.attempts,
+          retryWaitMs: Math.max(0, timestamp - pending.armedAt),
+          retryOutcome: "SELECTED_AFTER_RETRY",
+        },
+      );
+      this.#handleSelectedCandidate(timestamp, revalidation.signal, candidate, quote);
+      return true;
+    }
+
+    if (retryableOptionEvaluations(revalidation.signal, selection, this.#config).length > 0) return true;
+
+    this.#pendingOptionSelection = undefined;
+    this.#recordOptionSelection(
+      pending.signal,
+      revalidation.signal,
+      selection,
+      timestamp,
+      "NO_ELIGIBLE_OPTION",
+      {
+        selectionAttempt: pending.attempts,
+        retryWaitMs: Math.max(0, timestamp - pending.armedAt),
+        retryOutcome: "STRUCTURAL_REJECTION",
+      },
+    );
+    return false;
+  }
+
+  #recordOptionSelection(
+    identitySignal: TradeSignal,
+    evaluatedSignal: TradeSignal,
+    selection: SelectionResult,
+    timestamp: number,
+    selectionStatus: "SELECTED" | "RETRYING" | "NO_ELIGIBLE_OPTION",
+    retry: {
+      selectionAttempt: number;
+      retryWaitMs: number;
+      retryDeadline?: number;
+      retryOutcome?: string;
+      retryableCandidates?: string[];
+      selectionReasons?: string[];
+    },
+  ): void {
+    if (selectionStatus !== "RETRYING") this.#aggregateOptionRejections(selection);
+    const relevant = relevantOptionEvaluations(evaluatedSignal, selection, this.#config);
+    const closest = relevant[0];
     this.#audit(timestamp, "option_selection", {
+      signalId: identitySignal.id,
+      direction: identitySignal.direction,
+      kind: identitySignal.kind,
+      regime: evaluatedSignal.regime,
+      projectedMoveBps: evaluatedSignal.projectedMoveBps,
+      selectionStatus,
+      selectionAttempt: retry.selectionAttempt,
+      retryWaitMs: retry.retryWaitMs,
+      ...(retry.retryDeadline !== undefined ? { retryDeadline: retry.retryDeadline } : {}),
+      ...(retry.retryOutcome ? { retryOutcome: retry.retryOutcome } : {}),
+      ...(retry.retryableCandidates ? { retryableCandidates: retry.retryableCandidates } : {}),
+      selectionReasons: retry.selectionReasons ?? closest?.rejectionReasons ?? [],
+      closestCandidate: closest ?? null,
       evaluations: selection.evaluations,
       selected: selection.selected ?? null,
     });
-    if (!selection.selected) return;
+  }
+
+  #aggregateOptionRejections(selection: SelectionResult): void {
+    for (const [reason, count] of Object.entries(selection.rejectionCounts)) {
+      this.#rejections[reason] = (this.#rejections[reason] ?? 0) + count;
+    }
+  }
+
+  #handleSelectedCandidate(
+    timestamp: number,
+    signal: TradeSignal,
+    candidate: OptionCandidateEvaluation,
+    quote: OptionQuote,
+  ): void {
     this.#funnel.candidateAvailable += 1;
     this.#funnel.costGatePassed += 1;
-    const candidate = selection.selected;
-    const quote = this.#book.get(candidate.symbol)?.quote;
-    if (!quote) return;
     if (requiresLateBullishGrindOptionConfirmation(this.#config, signal)) {
       this.#pendingLateBullishGrindConfirmation = {
         signal,
         candidate,
-        armedAt: signal.timestamp,
+        armedAt: timestamp,
         referenceBidPrice: quote.bidPrice,
       };
       this.#audit(timestamp, "late_bullish_grind_confirmation", {
         signalId: signal.id,
         decision: "ARMED",
         symbol: candidate.symbol,
-        armedAt: signal.timestamp,
+        armedAt: timestamp,
         referenceBidPrice: quote.bidPrice,
       });
       return;

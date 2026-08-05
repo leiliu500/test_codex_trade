@@ -174,6 +174,7 @@ export interface EngineConfig {
     orderPollMs: number;
     optionTickSize: number;
     entrySignalTtlMs: number;
+    optionSelectionRetryMs: number;
     adverseFillSpreadFraction: number;
     exitTtlMinMs: number;
     exitTtlMaxMs: number;
@@ -432,6 +433,9 @@ export function validateConfig(config: EngineConfig): void {
     throw new Error("Entry order sizing is hard-limited to exactly one option contract");
   }
   if (!(config.execution.entrySignalTtlMs > 0 &&
+        Number.isFinite(config.execution.optionSelectionRetryMs) &&
+        config.execution.optionSelectionRetryMs >= 0 &&
+        config.execution.optionSelectionRetryMs <= config.execution.entrySignalTtlMs &&
         config.execution.exitTtlMinMs > 0 &&
         config.execution.exitTtlMaxMs >= config.execution.exitTtlMinMs &&
         config.execution.exitMarketableOffsetTicks >= 0)) {
