@@ -1,5 +1,5 @@
 {
-  "version": "spy-0dte-entry-confirmation-21-late-grind-option-confirmation",
+  "version": "spy-0dte-entry-confirmation-23-volume-liquidity-fallback",
   "symbol": "SPY",
   "timeZone": "America/New_York",
   "session": {
@@ -142,6 +142,7 @@
     "maxOptionMid": 12.0,
     "minDailyVolume": 50,
     "minOpenInterest": 100,
+    "minDailyVolumeForOpenInterestFallback": 1000,
     "subscriptionCandidatesPerSide": 12,
     "chainRefreshSec": 60,
     "riskFreeRate": 0.045,
