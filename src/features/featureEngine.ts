@@ -81,7 +81,7 @@ export class FeatureEngine {
     const openingGapBps = this.#priorClose && this.#sessionOpen
       ? 10_000 * Math.log(this.#sessionOpen / this.#priorClose) : undefined;
     return {
-      symbol: "SPY",
+      symbol: this.#config.symbol,
       timestamp: bar.timestamp,
       marketDate: date,
       price: bar.microprice,

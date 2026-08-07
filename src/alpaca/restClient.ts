@@ -1,7 +1,11 @@
-import type { AccountState, OptionContract, OptionSnapshot, PositionState, StockQuote } from "../types.js";
+import type {
+  AccountState, OptionContract, OptionQuote, OptionSnapshot, PositionState, StockQuote, UnderlyingSymbol,
+} from "../types.js";
 import type { OrderSide } from "../execution/orderExecutor.js";
 import { parseOccSymbol } from "../options/occSymbol.js";
-import { assertSameDaySpyOptionOrder, sameDaySpyOptionContractReasons, sameDaySpyOptionSymbolReasons } from "../options/tradingInvariants.js";
+import {
+  assertSameDayOptionOrder, sameDayOptionContractReasons, sameDayOptionSymbolReasons,
+} from "../options/tradingInvariants.js";
 import { marketDate } from "../utils/time.js";
 import { defaultConfig } from "../config.js";
 import { adaptAlpacaStockQuote } from "./stockStream.js";
@@ -35,8 +39,9 @@ export interface BrokerPosition {
 export interface TradingRestClient {
   getAccount(): Promise<AccountState>;
   getMarketClock(): Promise<{ timestamp: number; isOpen: boolean }>;
-  listOptionContracts(): Promise<OptionContract[]>;
+  listOptionContracts(underlying?: UnderlyingSymbol): Promise<OptionContract[]>;
   getOptionSnapshots(symbols: readonly string[]): Promise<OptionSnapshot[]>;
+  getLatestOptionQuotes?(symbols: readonly string[]): Promise<OptionQuote[]>;
   submitOrder(request: BrokerOrderRequest): Promise<BrokerOrder>;
   getOrder(orderId: string): Promise<BrokerOrder>;
   getOrderByClientOrderId(clientOrderId: string): Promise<BrokerOrder>;
@@ -56,6 +61,11 @@ export interface AlpacaRestConfig {
   fetch?: typeof fetch;
   now?: () => number;
   timeZone?: string;
+  underlyings?: readonly UnderlyingSymbol[];
+}
+
+export interface MultiUnderlyingTradingRestClient extends TradingRestClient {
+  getLatestUnderlyingSipQuote(underlying: UnderlyingSymbol): Promise<StockQuote>;
 }
 
 interface RawOrder {
@@ -67,12 +77,14 @@ interface RawOrder {
   filled_avg_price?: string | null;
 }
 
-export class AlpacaTradingRestClient implements TradingRestClient {
-  readonly #config: Required<Omit<AlpacaRestConfig, "tradingBaseUrl" | "dataBaseUrl" | "fetch" | "now" | "timeZone">> & {
-    tradingBaseUrl: string; dataBaseUrl: string; fetch: typeof fetch;
+export class AlpacaTradingRestClient implements MultiUnderlyingTradingRestClient {
+  readonly #config: {
+    apiKey: string; apiSecret: string; paper: boolean; tradingBaseUrl: string;
+    dataBaseUrl: string; optionFeed: "indicative" | "opra"; fetch: typeof fetch;
   };
   readonly #now: () => number;
   readonly #timeZone: string;
+  readonly #underlyings: ReadonlySet<UnderlyingSymbol>;
   readonly #validatedOrderIds = new Set<string>();
 
   constructor(config: AlpacaRestConfig) {
@@ -88,6 +100,9 @@ export class AlpacaTradingRestClient implements TradingRestClient {
     };
     this.#now = config.now ?? Date.now;
     this.#timeZone = config.timeZone ?? defaultConfig.timeZone;
+    const underlyings = config.underlyings ?? ["SPY"];
+    if (underlyings.length === 0) throw new Error("At least one broker underlying must be enabled");
+    this.#underlyings = new Set(underlyings);
   }
 
   async getAccount(): Promise<AccountState> {
@@ -108,21 +123,29 @@ export class AlpacaTradingRestClient implements TradingRestClient {
   }
 
   async getLatestSpySipQuote(): Promise<StockQuote> {
-    const raw = await this.#request<{ quote: Record<string, unknown>; symbol?: string }>(
-      this.#config.dataBaseUrl,
-      "/v2/stocks/SPY/quotes/latest?feed=sip",
-    );
-    return adaptAlpacaStockQuote({ ...raw.quote, S: raw.symbol ?? "SPY" });
+    return this.getLatestUnderlyingSipQuote("SPY");
   }
 
-  async listOptionContracts(): Promise<OptionContract[]> {
+  async getLatestUnderlyingSipQuote(underlying: UnderlyingSymbol): Promise<StockQuote> {
+    this.#assertEnabledUnderlying(underlying);
+    const raw = await this.#request<{ quote: Record<string, unknown>; symbol?: string }>(
+      this.#config.dataBaseUrl,
+      `/v2/stocks/${underlying}/quotes/latest?feed=sip`,
+    );
+    const quote = adaptAlpacaStockQuote({ ...raw.quote, S: raw.symbol ?? underlying });
+    if (quote.symbol !== underlying) throw new Error(`Latest SIP quote returned ${quote.symbol}, expected ${underlying}`);
+    return quote;
+  }
+
+  async listOptionContracts(underlying: UnderlyingSymbol = "SPY"): Promise<OptionContract[]> {
+    this.#assertEnabledUnderlying(underlying);
     const now = this.#now();
     const today = marketDate(now, this.#timeZone);
     let pageToken: string | undefined;
     const contracts: OptionContract[] = [];
     do {
       const query = new URLSearchParams({
-        underlying_symbols: "SPY", status: "active", expiration_date_gte: today,
+        underlying_symbols: underlying, status: "active", expiration_date_gte: today,
         expiration_date_lte: today, limit: "10000",
       });
       if (pageToken) query.set("page_token", pageToken);
@@ -130,14 +153,16 @@ export class AlpacaTradingRestClient implements TradingRestClient {
         this.#config.tradingBaseUrl, `/v2/options/contracts?${query}`,
       );
       for (const item of raw.option_contracts) {
-        if (item.underlying_symbol !== "SPY" || (item.type !== "call" && item.type !== "put")) continue;
+        if (item.underlying_symbol !== underlying || (item.type !== "call" && item.type !== "put")) continue;
         const contract: OptionContract = {
-          symbol: String(item.symbol), underlying: "SPY", expirationDate: String(item.expiration_date),
+          symbol: String(item.symbol), underlying, expirationDate: String(item.expiration_date),
           strike: Number(item.strike_price), type: item.type, tradable: item.tradable === true,
           active: item.status === "active",
           ...(Number.isFinite(Number(item.open_interest)) ? { openInterest: Number(item.open_interest) } : {}),
         };
-        if (sameDaySpyOptionContractReasons(contract, now, this.#timeZone).length === 0) contracts.push(contract);
+        if (sameDayOptionContractReasons(contract, now, this.#timeZone, underlying).length === 0) {
+          contracts.push(contract);
+        }
       }
       pageToken = raw.next_page_token ?? raw.page_token;
     } while (pageToken);
@@ -174,8 +199,40 @@ export class AlpacaTradingRestClient implements TradingRestClient {
     return snapshots;
   }
 
+  async getLatestOptionQuotes(symbols: readonly string[]): Promise<OptionQuote[]> {
+    for (const symbol of symbols) this.#assertSameDaySymbol(symbol);
+    const quotes: OptionQuote[] = [];
+    for (let start = 0; start < symbols.length; start += 100) {
+      const query = new URLSearchParams({
+        symbols: symbols.slice(start, start + 100).join(","),
+        feed: this.#config.optionFeed,
+      });
+      const raw = await this.#request<{ quotes: Record<string, Record<string, unknown>> }>(
+        this.#config.dataBaseUrl, `/v1beta1/options/quotes/latest?${query}`,
+      );
+      for (const [symbol, item] of Object.entries(raw.quotes ?? {})) {
+        this.#assertSameDaySymbol(symbol);
+        const quote = {
+          symbol,
+          timestamp: typeof item.t === "string" ? Date.parse(item.t) : item.t,
+          bidPrice: item.bp,
+          askPrice: item.ap,
+          bidSize: item.bs,
+          askSize: item.as,
+        };
+        if (![quote.timestamp, quote.bidPrice, quote.askPrice, quote.bidSize, quote.askSize].every(Number.isFinite)) {
+          throw new Error(`Invalid Alpaca latest option quote payload for ${symbol}`);
+        }
+        quotes.push(quote as OptionQuote);
+      }
+    }
+    return quotes;
+  }
+
   async submitOrder(request: BrokerOrderRequest): Promise<BrokerOrder> {
-    assertSameDaySpyOptionOrder(request.symbol, request.side, this.#now(), {
+    const underlying = this.#assertSameDaySymbol(request.symbol);
+    assertSameDayOptionOrder(request.symbol, request.side, this.#now(), {
+      symbol: underlying,
       timeZone: this.#timeZone,
       session: defaultConfig.session,
       options: defaultConfig.options,
@@ -190,7 +247,7 @@ export class AlpacaTradingRestClient implements TradingRestClient {
         extended_hours: false }),
     });
     this.#assertSameDaySymbol(raw.symbol);
-    if (raw.symbol !== request.symbol) throw new Error("Broker returned a different symbol than the submitted SPY option");
+    if (raw.symbol !== request.symbol) throw new Error("Broker returned a different symbol than the submitted option");
     this.#validatedOrderIds.add(raw.id);
     return mapOrder(raw);
   }
@@ -217,7 +274,9 @@ export class AlpacaTradingRestClient implements TradingRestClient {
   }
 
   async replaceOrder(orderId: string, limitPrice: number): Promise<BrokerOrder> {
-    if (!this.#validatedOrderIds.has(orderId)) throw new Error("Cannot replace an order that was not validated as a same-day SPY option");
+    if (!this.#validatedOrderIds.has(orderId)) {
+      throw new Error(`Cannot replace an order that was not validated as a same-day ${this.#underlyingLabel()} option`);
+    }
     const raw = await this.#request<RawOrder>(this.#config.tradingBaseUrl, `/v2/orders/${encodeURIComponent(orderId)}`, {
       method: "PATCH", body: JSON.stringify({ limit_price: limitPrice.toFixed(2) }),
     });
@@ -228,7 +287,7 @@ export class AlpacaTradingRestClient implements TradingRestClient {
 
   async cancelOrder(orderId: string): Promise<void> {
     if (!this.#validatedOrderIds.has(orderId)) {
-      throw new Error("Cannot cancel an order that was not validated as a same-day SPY option");
+      throw new Error(`Cannot cancel an order that was not validated as a same-day ${this.#underlyingLabel()} option`);
     }
     await this.#request<void>(this.#config.tradingBaseUrl, `/v2/orders/${encodeURIComponent(orderId)}`, { method: "DELETE" });
   }
@@ -255,10 +314,28 @@ export class AlpacaTradingRestClient implements TradingRestClient {
     });
   }
 
-  #assertSameDaySymbol(symbol: string): void {
-    const reasons = sameDaySpyOptionSymbolReasons(symbol, this.#now(), this.#timeZone);
+  #assertSameDaySymbol(symbol: string): UnderlyingSymbol {
+    const parsed = parseOccSymbol(symbol);
+    if (!parsed) {
+      const expected = this.#underlyings.values().next().value ?? "SPY";
+      const reasons = sameDayOptionSymbolReasons(symbol, this.#now(), this.#timeZone, expected);
+      throw new Error(`Broker state contains a non-compliant position/order ${symbol}: ${reasons.join(",")}`);
+    }
+    const underlying = parsed?.underlying;
+    if (underlying !== "SPY" && underlying !== "QQQ") {
+      throw new Error(`Broker state contains a non-compliant position/order ${symbol}: WRONG_UNDERLYING`);
+    }
+    this.#assertEnabledUnderlying(underlying);
+    const reasons = sameDayOptionSymbolReasons(symbol, this.#now(), this.#timeZone, underlying);
     if (reasons.length > 0) throw new Error(`Broker state contains a non-compliant position/order ${symbol}: ${reasons.join(",")}`);
+    return underlying;
   }
+
+  #assertEnabledUnderlying(underlying: UnderlyingSymbol): void {
+    if (!this.#underlyings.has(underlying)) throw new Error(`${underlying} is not enabled at the broker boundary`);
+  }
+
+  #underlyingLabel(): string { return [...this.#underlyings].join("/"); }
 
   async #request<T>(base: string, path: string, init: RequestInit = {}): Promise<T> {
     const response = await this.#config.fetch(`${base}${path}`, {
@@ -276,6 +353,96 @@ export class AlpacaTradingRestClient implements TradingRestClient {
     }
     if (response.status === 204) return undefined as T;
     return await response.json() as T;
+  }
+}
+
+/**
+ * Presents one underlying to a strategy runtime while retaining one shared broker account.
+ * Global account state stays shared; positions, orders, contracts, and snapshots are scoped.
+ */
+export class UnderlyingTradingRestClient implements MultiUnderlyingTradingRestClient {
+  readonly #client: MultiUnderlyingTradingRestClient;
+  readonly #underlying: UnderlyingSymbol;
+
+  constructor(client: MultiUnderlyingTradingRestClient, underlying: UnderlyingSymbol) {
+    this.#client = client;
+    this.#underlying = underlying;
+  }
+
+  getAccount(): Promise<AccountState> { return this.#client.getAccount(); }
+  getMarketClock(): Promise<{ timestamp: number; isOpen: boolean }> { return this.#client.getMarketClock(); }
+
+  getLatestUnderlyingSipQuote(underlying: UnderlyingSymbol): Promise<StockQuote> {
+    this.#assertUnderlying(underlying);
+    return this.#client.getLatestUnderlyingSipQuote(this.#underlying);
+  }
+
+  getLatestSpySipQuote(): Promise<StockQuote> {
+    this.#assertUnderlying("SPY");
+    return this.#client.getLatestUnderlyingSipQuote("SPY");
+  }
+
+  listOptionContracts(underlying: UnderlyingSymbol = this.#underlying): Promise<OptionContract[]> {
+    this.#assertUnderlying(underlying);
+    return this.#client.listOptionContracts(this.#underlying);
+  }
+
+  async getOptionSnapshots(symbols: readonly string[]): Promise<OptionSnapshot[]> {
+    for (const symbol of symbols) this.#assertOptionSymbol(symbol);
+    const snapshots = await this.#client.getOptionSnapshots(symbols);
+    for (const snapshot of snapshots) this.#assertOptionSymbol(snapshot.symbol);
+    return snapshots;
+  }
+
+  async getLatestOptionQuotes(symbols: readonly string[]): Promise<OptionQuote[]> {
+    for (const symbol of symbols) this.#assertOptionSymbol(symbol);
+    const quotes = await this.#client.getLatestOptionQuotes?.(symbols) ?? [];
+    for (const quote of quotes) this.#assertOptionSymbol(quote.symbol);
+    return quotes;
+  }
+
+  async submitOrder(request: BrokerOrderRequest): Promise<BrokerOrder> {
+    this.#assertOptionSymbol(request.symbol);
+    return this.#assertOrder(await this.#client.submitOrder(request));
+  }
+
+  async getOrder(orderId: string): Promise<BrokerOrder> {
+    return this.#assertOrder(await this.#client.getOrder(orderId));
+  }
+
+  async getOrderByClientOrderId(clientOrderId: string): Promise<BrokerOrder> {
+    return this.#assertOrder(await this.#client.getOrderByClientOrderId(clientOrderId));
+  }
+
+  async replaceOrder(orderId: string, limitPrice: number): Promise<BrokerOrder> {
+    return this.#assertOrder(await this.#client.replaceOrder(orderId, limitPrice));
+  }
+
+  cancelOrder(orderId: string): Promise<void> { return this.#client.cancelOrder(orderId); }
+
+  async listOpenOrders(): Promise<BrokerOrder[]> {
+    return (await this.#client.listOpenOrders()).filter((order) => this.#matches(order.symbol));
+  }
+
+  async listPositions(): Promise<BrokerPosition[]> {
+    return (await this.#client.listPositions()).filter((position) => this.#matches(position.symbol));
+  }
+
+  #assertOrder(order: BrokerOrder): BrokerOrder {
+    this.#assertOptionSymbol(order.symbol);
+    return order;
+  }
+
+  #matches(symbol: string): boolean { return parseOccSymbol(symbol)?.underlying === this.#underlying; }
+
+  #assertOptionSymbol(symbol: string): void {
+    if (!this.#matches(symbol)) throw new Error(`${this.#underlying} runtime rejected cross-underlying option ${symbol}`);
+  }
+
+  #assertUnderlying(underlying: UnderlyingSymbol): void {
+    if (underlying !== this.#underlying) {
+      throw new Error(`${this.#underlying} runtime cannot request ${underlying} market data`);
+    }
   }
 }
 

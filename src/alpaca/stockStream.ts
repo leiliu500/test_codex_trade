@@ -1,4 +1,4 @@
-import type { StockQuote, StockTrade } from "../types.js";
+import type { StockQuote, StockTrade, UnderlyingSymbol } from "../types.js";
 import WebSocket, { type RawData } from "ws";
 
 export interface StockStreamHandlers {
@@ -22,13 +22,22 @@ export interface AlpacaStockStreamConfig {
   apiKey: string;
   apiSecret: string;
   feed?: "iex" | "sip";
-  symbol?: "SPY";
+  /** `symbol` is retained for single-underlying callers. */
+  symbol?: UnderlyingSymbol;
+  symbols?: readonly UnderlyingSymbol[];
   url?: string;
   connectTimeoutMs?: number;
 }
 
 export class AlpacaStockWebSocket implements StockStream {
-  readonly #config: Required<Omit<AlpacaStockStreamConfig, "url">> & { url: string };
+  readonly #config: {
+    apiKey: string;
+    apiSecret: string;
+    feed: "iex" | "sip";
+    symbols: readonly UnderlyingSymbol[];
+    url: string;
+    connectTimeoutMs: number;
+  };
   #socket: WebSocket | undefined;
   #handlers: StockStreamHandlers | undefined;
   readonly #pendingEvents: StockStreamEvent[] = [];
@@ -37,11 +46,13 @@ export class AlpacaStockWebSocket implements StockStream {
 
   constructor(config: AlpacaStockStreamConfig) {
     const feed = config.feed ?? "iex";
+    const symbols = [...new Set(config.symbols ?? [config.symbol ?? "SPY"])] as UnderlyingSymbol[];
+    if (symbols.length === 0) throw new Error("At least one stock-stream symbol is required");
     this.#config = {
       apiKey: config.apiKey,
       apiSecret: config.apiSecret,
       feed,
-      symbol: config.symbol ?? "SPY",
+      symbols,
       url: config.url ?? `wss://stream.data.alpaca.markets/v2/${feed}`,
       connectTimeoutMs: config.connectTimeoutMs ?? 10_000,
     };
@@ -58,7 +69,9 @@ export class AlpacaStockWebSocket implements StockStream {
         if (settled) return;
         settled = true;
         socket.terminate();
-        reject(new Error(`Timed out authenticating SPY ${this.#config.feed.toUpperCase()} stream`));
+        reject(new Error(
+          `Timed out authenticating ${this.#config.symbols.join(",")} ${this.#config.feed.toUpperCase()} stream`,
+        ));
       }, this.#config.connectTimeoutMs);
       const resolveOnce = (): void => {
         if (settled) return;
@@ -83,13 +96,15 @@ export class AlpacaStockWebSocket implements StockStream {
           for (const message of messages) {
             if (message.T === "success" && message.msg === "authenticated") {
               socket.send(JSON.stringify({
-                action: "subscribe", trades: [this.#config.symbol], quotes: [this.#config.symbol],
+                action: "subscribe", trades: this.#config.symbols, quotes: this.#config.symbols,
               }));
             } else if (message.T === "subscription") {
               const trades = Array.isArray(message.trades) ? message.trades : [];
               const quotes = Array.isArray(message.quotes) ? message.quotes : [];
-              if (!trades.includes(this.#config.symbol) || !quotes.includes(this.#config.symbol)) {
-                throw new Error(`SPY ${this.#config.feed.toUpperCase()} subscription acknowledgement is incomplete`);
+              if (this.#config.symbols.some((symbol) => !trades.includes(symbol) || !quotes.includes(symbol))) {
+                throw new Error(
+                  `${this.#config.symbols.join(",")} ${this.#config.feed.toUpperCase()} subscription acknowledgement is incomplete`,
+                );
               }
               resolveOnce();
             } else if (message.T === "q") events.push({ type: "quote", value: adaptAlpacaStockQuote(message) });
@@ -109,7 +124,9 @@ export class AlpacaStockWebSocket implements StockStream {
       socket.on("close", () => {
         this.#socket = undefined;
         handlers.onState?.(false);
-        rejectOnce(new Error(`SPY ${this.#config.feed.toUpperCase()} stream closed before subscription`));
+        rejectOnce(new Error(
+          `${this.#config.symbols.join(",")} ${this.#config.feed.toUpperCase()} stream closed before subscription`,
+        ));
       });
     });
   }
@@ -171,7 +188,8 @@ export function adaptAlpacaStockQuote(raw: Record<string, unknown>): StockQuote 
     askExchange: raw.ax,
     conditions: raw.c,
   };
-  if (quote.symbol !== "SPY" || ![quote.timestamp, quote.bidPrice, quote.askPrice, quote.bidSize, quote.askSize].every(Number.isFinite)) {
+  if (!isUnderlyingSymbol(quote.symbol) ||
+      ![quote.timestamp, quote.bidPrice, quote.askPrice, quote.bidSize, quote.askSize].every(Number.isFinite)) {
     throw new Error("Invalid Alpaca stock quote payload");
   }
   return quote as StockQuote;
@@ -186,8 +204,12 @@ export function adaptAlpacaStockTrade(raw: Record<string, unknown>): StockTrade 
     exchange: raw.x,
     conditions: raw.c,
   };
-  if (trade.symbol !== "SPY" || ![trade.timestamp, trade.price, trade.size].every(Number.isFinite)) {
+  if (!isUnderlyingSymbol(trade.symbol) || ![trade.timestamp, trade.price, trade.size].every(Number.isFinite)) {
     throw new Error("Invalid Alpaca stock trade payload");
   }
   return trade as StockTrade;
+}
+
+function isUnderlyingSymbol(value: unknown): value is UnderlyingSymbol {
+  return value === "SPY" || value === "QQQ";
 }

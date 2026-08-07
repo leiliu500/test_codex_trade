@@ -5,7 +5,7 @@ import type {
   DashboardOrderDynamicsUpdate,
   DashboardOrderQuote,
 } from "../ops/orderCards.js";
-import type { FeatureSnapshot } from "../types.js";
+import type { FeatureSnapshot, UnderlyingSymbol } from "../types.js";
 import type { HistoricalMarketEvent, HistoryStore } from "./types.js";
 
 export interface DatabaseClient {
@@ -551,7 +551,7 @@ export class PostgresHistoryStore implements HistoryStore, AuditRecorder {
     return quotesByCard;
   }
 
-  async loadReplayEvents(marketDate: string): Promise<Array<{
+  async loadReplayEvents(marketDate: string, underlying?: UnderlyingSymbol): Promise<Array<{
     type: ReplayRow["event_type"];
     timestamp: number;
     data: Record<string, unknown>;
@@ -561,8 +561,11 @@ export class PostgresHistoryStore implements HistoryStore, AuditRecorder {
        FROM market_events
        WHERE market_date = $1
          AND event_type IN ('stock_quote','stock_trade','option_contract','option_quote','option_snapshot')
+         AND ($2::text IS NULL
+           OR (event_type IN ('stock_quote','stock_trade') AND symbol = $2)
+           OR (event_type IN ('option_contract','option_quote','option_snapshot') AND symbol LIKE ($2 || '%')))
        ORDER BY id ASC`,
-      [marketDate],
+      [marketDate, underlying ?? null],
     );
     return result.rows.map((row) => ({
       type: row.event_type,
@@ -615,7 +618,9 @@ export class PostgresHistoryStore implements HistoryStore, AuditRecorder {
     }
   }
 
-  async loadLatestRecoveredFeature(marketDate: string): Promise<FeatureSnapshot | undefined> {
+  async loadLatestRecoveredFeature(
+    marketDate: string, underlying: UnderlyingSymbol = "SPY",
+  ): Promise<FeatureSnapshot | undefined> {
     const result = await this.#client.query<FeatureRow>(
       `WITH recovery AS (
          SELECT MAX(event_timestamp) AS recovered_at
@@ -623,16 +628,18 @@ export class PostgresHistoryStore implements HistoryStore, AuditRecorder {
          WHERE market_date = $1
            AND event_type = 'strategy_state_recovery'
            AND data->>'ready' = 'true'
+           AND (data->>'underlying' = $2 OR ($2 = 'SPY' AND data->>'underlying' IS NULL))
        )
        SELECT market_events.data
        FROM market_events CROSS JOIN recovery
        WHERE market_events.market_date = $1
          AND market_events.event_type = 'feature_snapshot'
+         AND market_events.symbol = $2
          AND recovery.recovered_at IS NOT NULL
          AND market_events.received_timestamp >= recovery.recovered_at
        ORDER BY market_events.id DESC
        LIMIT 1`,
-      [marketDate],
+      [marketDate, underlying],
     );
     return result.rows[0]?.data;
   }

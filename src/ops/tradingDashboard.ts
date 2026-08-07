@@ -1,5 +1,7 @@
 import type { AuditEvent, AuditRecorder } from "./recorder.js";
 import type { HistoricalMarketEvent, HistoricalMarketEventType, MarketHistorySink } from "../history/types.js";
+import type { UnderlyingSymbol } from "../types.js";
+import { parseOccSymbol } from "../options/occSymbol.js";
 import { marketDate, zonedDateTimeToEpoch } from "../utils/time.js";
 import {
   classifyOrderCardEntryQuality,
@@ -21,6 +23,7 @@ export type {
 
 export interface DashboardSignal {
   id: string;
+  underlying: UnderlyingSymbol;
   timestamp: number;
   direction: string;
   kind: string;
@@ -109,6 +112,7 @@ export interface DashboardTrade extends DashboardOrderManagement {
 
 export interface DashboardEntryQuality {
   signalId: string;
+  underlying: UnderlyingSymbol;
   signalTimestamp: number;
   sessionBucket: string;
   symbol?: string;
@@ -171,6 +175,7 @@ export interface DashboardTuning {
 export interface DashboardPotentialMiss {
   id: string;
   timestamp: number;
+  underlying?: string;
   direction: "BULLISH" | "BEARISH";
   regime: string;
   price: number;
@@ -239,6 +244,7 @@ export interface DashboardActiveOrder extends DashboardOrderManagement {
 export interface DashboardDecision {
   id: string;
   timestamp: number;
+  underlying?: string;
   stage: "ENTRY_EVALUATION" | "OPTION_SELECTION" | "RISK" | "ORDER_SUBMISSION" | "EXECUTION";
   outcome: string;
   signalId?: string;
@@ -314,14 +320,7 @@ export interface DashboardPerformance {
   worstTradePnl: number | null;
 }
 
-export interface TradingDashboardSnapshot {
-  startedAt: number;
-  generatedAt: number;
-  displayDate: string;
-  displayTimeZone: string;
-  nextDisplayRolloverAt: number;
-  lastMarketDate?: string;
-  lastExecutionError?: string;
+export interface TradingDashboardView {
   performance: DashboardPerformance;
   activeOrders: DashboardActiveOrder[];
   orderCards: DashboardOrderCard[];
@@ -331,6 +330,17 @@ export interface TradingDashboardSnapshot {
   signals: DashboardSignal[];
   orders: DashboardOrder[];
   trades: DashboardTrade[];
+}
+
+export interface TradingDashboardSnapshot extends TradingDashboardView {
+  startedAt: number;
+  generatedAt: number;
+  displayDate: string;
+  displayTimeZone: string;
+  nextDisplayRolloverAt: number;
+  lastMarketDate?: string;
+  lastExecutionError?: string;
+  underlyingViews: Record<UnderlyingSymbol, TradingDashboardView>;
 }
 
 interface MutableTrade extends Omit<DashboardTrade,
@@ -346,6 +356,13 @@ interface DashboardOptionQuote {
   timestamp: number;
   bidPrice: number;
   askPrice: number;
+}
+
+interface UnderlyingEntryStats {
+  evaluations: number;
+  noSignalEvaluations: number;
+  matureNoSignalEvaluations: number;
+  gateBlocks: Map<string, number>;
 }
 
 const MISSED_ENTRY_HORIZON_SEC = 5;
@@ -406,11 +423,15 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
   readonly #closedTrades: MutableTrade[] = [];
   readonly #latestOptionQuotes = new Map<string, DashboardOptionQuote>();
   readonly #marketEventCounts = emptyMarketEventCounts();
+  readonly #marketEventCountsByUnderlying = new Map<UnderlyingSymbol, Record<HistoricalMarketEventType, number>>();
   readonly #recentMarketEvents: DashboardLiveFeedEvent[] = [];
-  readonly #lastFeedSampleAt = new Map<HistoricalMarketEventType, number>();
+  readonly #lastFeedSampleAt = new Map<string, number>();
   readonly #decisions: DashboardDecision[] = [];
   readonly #potentialMisses: DashboardPotentialMiss[] = [];
   readonly #entryGateBlocks = new Map<string, number>();
+  readonly #entryStatsByUnderlying = new Map<UnderlyingSymbol, UnderlyingEntryStats>();
+  readonly #lastMarketEventReceivedAtByUnderlying = new Map<UnderlyingSymbol, number>();
+  readonly #lastProviderTimestampByUnderlying = new Map<UnderlyingSymbol, number>();
   #lastMarketEventReceivedAt: number | undefined;
   #lastProviderTimestamp: number | undefined;
   #feedSequence = 0;
@@ -506,10 +527,25 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
   }
 
   #recordCurrentDisplayMarketEvent(event: HistoricalMarketEvent): void {
+    const underlying = dashboardUnderlyingFromSymbol(event.symbol) ??
+      dashboardUnderlying(stringValue(event.data.symbol));
     this.#lastMarketDate = event.marketDate;
     this.#marketEventCounts[event.type] += 1;
     this.#lastMarketEventReceivedAt = Math.max(this.#lastMarketEventReceivedAt ?? -Infinity, event.receivedTimestamp);
     this.#lastProviderTimestamp = Math.max(this.#lastProviderTimestamp ?? -Infinity, event.providerTimestamp);
+    if (underlying) {
+      const counts = this.#marketEventCountsByUnderlying.get(underlying) ?? emptyMarketEventCounts();
+      counts[event.type] += 1;
+      this.#marketEventCountsByUnderlying.set(underlying, counts);
+      this.#lastMarketEventReceivedAtByUnderlying.set(
+        underlying,
+        Math.max(this.#lastMarketEventReceivedAtByUnderlying.get(underlying) ?? -Infinity, event.receivedTimestamp),
+      );
+      this.#lastProviderTimestampByUnderlying.set(
+        underlying,
+        Math.max(this.#lastProviderTimestampByUnderlying.get(underlying) ?? -Infinity, event.providerTimestamp),
+      );
+    }
 
     if (event.type === "option_quote") {
       const timestamp = numberValue(event.data.timestamp) ?? event.providerTimestamp;
@@ -526,9 +562,10 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
     }
 
     const sampleInterval = ["stock_quote", "stock_trade", "option_quote"].includes(event.type) ? 250 : 0;
-    const lastSample = this.#lastFeedSampleAt.get(event.type);
+    const sampleKey = `${underlying ?? "UNKNOWN"}:${event.type}`;
+    const lastSample = this.#lastFeedSampleAt.get(sampleKey);
     if (lastSample === undefined || event.receivedTimestamp - lastSample >= sampleInterval) {
-      this.#lastFeedSampleAt.set(event.type, event.receivedTimestamp);
+      this.#lastFeedSampleAt.set(sampleKey, event.receivedTimestamp);
       this.#recentMarketEvents.unshift({
         id: ++this.#feedSequence,
         type: event.type,
@@ -540,7 +577,7 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
         marketDate: event.marketDate,
         summary: marketEventSummary(event),
       });
-      if (this.#recentMarketEvents.length > 100) this.#recentMarketEvents.length = 100;
+      if (this.#recentMarketEvents.length > 1_000) this.#recentMarketEvents.length = 1_000;
     }
   }
 
@@ -549,15 +586,39 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
   snapshot(): TradingDashboardSnapshot {
     const generatedAt = this.#now();
     this.#synchronizeDisplayWindow(generatedAt);
-    const closed = this.#closedTrades;
-    const realizedPnl = [...closed, ...this.#openTrades.values()].reduce((sum, trade) => sum + trade.realizedPnl, 0);
+    this.#refreshProjectedOrderCards(generatedAt);
+    const aggregate = this.#buildView(generatedAt);
+    return {
+      startedAt: this.#startedAt,
+      generatedAt,
+      displayDate: this.#displayDate,
+      displayTimeZone: DASHBOARD_DISPLAY_TIME_ZONE,
+      nextDisplayRolloverAt: nextDashboardDisplayRollover(generatedAt),
+      ...(this.#lastMarketDate ? { lastMarketDate: this.#lastMarketDate } : {}),
+      ...(this.#lastExecutionError ? { lastExecutionError: this.#lastExecutionError } : {}),
+      ...aggregate,
+      underlyingViews: {
+        SPY: this.#buildView(generatedAt, "SPY"),
+        QQQ: this.#buildView(generatedAt, "QQQ"),
+      },
+    };
+  }
+
+  #buildView(generatedAt: number, underlying?: UnderlyingSymbol): TradingDashboardView {
+    const matchesSymbol = (symbol: string): boolean =>
+      underlying === undefined || dashboardUnderlyingFromSymbol(symbol) === underlying;
+    const closed = this.#closedTrades.filter((trade) => matchesSymbol(trade.symbol));
+    const openTrades = [...this.#openTrades.values()].filter((trade) => matchesSymbol(trade.symbol));
+    const allTrades = [...closed, ...openTrades];
+    const realizedPnl = allTrades.reduce((sum, trade) => sum + trade.realizedPnl, 0);
     const wins = closed.filter((trade) => trade.realizedPnl > 0).length;
     const losses = closed.filter((trade) => trade.realizedPnl < 0).length;
     const grossProfit = closed.reduce((sum, trade) => sum + Math.max(0, trade.realizedPnl), 0);
     const grossLoss = Math.abs(closed.reduce((sum, trade) => sum + Math.min(0, trade.realizedPnl), 0));
     const pnls = closed.map((trade) => trade.realizedPnl);
-    const orders = [...this.#orders.values()];
-    const signals = [...this.#signals.values()];
+    const orders = [...this.#orders.values()].filter((order) => matchesSymbol(order.symbol));
+    const signals = [...this.#signals.values()].filter((signal) =>
+      underlying === undefined || signal.underlying === underlying);
     const optionsSelected = signals.filter((signal) => signal.candidate !== undefined).length;
     const optionSelectionByConfig = [...signals.reduce((groups, signal) => {
       const group = groups.get(signal.configVersion) ?? {
@@ -582,14 +643,16 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
       .sort((left, right) => right.latestSignalTimestamp - left.latestSignalTimestamp);
     const riskAllowed = signals.filter((signal) => signal.riskStatus === "ALLOWED").length;
     const riskBlocked = signals.filter((signal) => signal.riskStatus === "BLOCKED").length;
-    this.#refreshProjectedOrderCards(generatedAt);
-    const activeOrders = this.#activeOrders(generatedAt, orders).map((order) => ({
-      ...order,
-      ...(this.#orderCards.get(order.id)
-        ? { updates: this.#orderCards.get(order.id)!.updates.map((update) => ({ ...update })) } : {}),
-    }));
+    const activeOrders = this.#activeOrders(generatedAt, orders)
+      .filter((order) => matchesSymbol(order.symbol))
+      .map((order) => ({
+        ...order,
+        ...(this.#orderCards.get(order.id)
+          ? { updates: this.#orderCards.get(order.id)!.updates.map((update) => ({ ...update })) } : {}),
+      }));
     const unrealizedPnl = activeOrders.reduce((sum, order) => sum + (order.unrealizedPnl ?? 0), 0);
     const orderCards = [...this.#orderCards.values()]
+      .filter((card) => matchesSymbol(card.symbol))
       .sort((a, b) =>
         Number(b.active) - Number(a.active) ||
         (b.exitTimestamp ?? b.entryTimestamp ?? b.updates.at(-1)?.timestamp ?? 0) -
@@ -597,17 +660,22 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
       .slice(0, 250)
       .map(cloneOrderCard);
     const publicOrders = orders.slice(-250).reverse().map((order) => this.#publicOrder(order, generatedAt));
-    const publicTrades = [...closed, ...this.#openTrades.values()]
-      .slice(-250).reverse().map((trade) => this.#publicTrade(trade));
-    const entryQuality = this.#entryQuality(orders, [...closed, ...this.#openTrades.values()]);
+    const publicTrades = allTrades.slice(-250).reverse().map((trade) => this.#publicTrade(trade));
+    const entryQuality = this.#entryQuality(orders, allTrades, signals);
+    const eventCounts = underlying
+      ? { ...(this.#marketEventCountsByUnderlying.get(underlying) ?? emptyMarketEventCounts()) }
+      : { ...this.#marketEventCounts };
+    const lastMarketEventReceivedAt = underlying
+      ? this.#lastMarketEventReceivedAtByUnderlying.get(underlying)
+      : this.#lastMarketEventReceivedAt;
+    const lastProviderTimestamp = underlying
+      ? this.#lastProviderTimestampByUnderlying.get(underlying)
+      : this.#lastProviderTimestamp;
+    const decisions = this.#decisions.filter((decision) =>
+      underlying === undefined || dashboardDecisionUnderlying(decision) === underlying);
+    const potentialMisses = this.#potentialMisses.filter((miss) =>
+      underlying === undefined || (miss.underlying ?? "SPY") === underlying);
     return {
-      startedAt: this.#startedAt,
-      generatedAt,
-      displayDate: this.#displayDate,
-      displayTimeZone: DASHBOARD_DISPLAY_TIME_ZONE,
-      nextDisplayRolloverAt: nextDashboardDisplayRollover(generatedAt),
-      ...(this.#lastMarketDate ? { lastMarketDate: this.#lastMarketDate } : {}),
-      ...(this.#lastExecutionError ? { lastExecutionError: this.#lastExecutionError } : {}),
       performance: {
         signalsFired: signals.length,
         optionsSelected,
@@ -618,7 +686,7 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
         exitOrders: orders.filter((order) => order.purpose === "EXIT").length,
         filledEntryOrders: orders.filter((order) => order.purpose === "ENTRY" && order.filledQuantity > 0).length,
         closedTrades: closed.length,
-        openTrades: this.#openTrades.size,
+        openTrades: openTrades.length,
         wins,
         losses,
         winRate: closed.length > 0 ? wins / closed.length : 0,
@@ -632,12 +700,12 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
       },
       activeOrders,
       orderCards,
-      decisions: this.#decisions.slice(0, 100).map(publicDecision),
+      decisions: decisions.slice(0, 100).map(publicDecision),
       tuning: {
         summary: tuningSummary(entryQuality),
         entries: entryQuality,
-        falseNegativeSummary: this.#falseNegativeSummary(),
-        potentialMisses: this.#potentialMisses.slice(0, 250).map((miss) => ({
+        falseNegativeSummary: this.#falseNegativeSummary(underlying),
+        potentialMisses: potentialMisses.slice(0, 250).map((miss) => ({
           ...miss, reasons: [...miss.reasons], failedGates: [...miss.failedGates],
         })),
       },
@@ -646,16 +714,19 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
         quoteSampleIntervalMs: this.#quoteSampleIntervalMs,
         retentionDays: this.#retentionDays,
         uptimeMs: Math.max(0, generatedAt - this.#startedAt),
-        totalEvents: Object.values(this.#marketEventCounts).reduce((sum, count) => sum + count, 0),
-        eventCounts: { ...this.#marketEventCounts },
-        ...(this.#lastMarketEventReceivedAt !== undefined ? {
-          lastEventReceivedAt: this.#lastMarketEventReceivedAt,
-          lastEventAgeMs: Math.max(0, generatedAt - this.#lastMarketEventReceivedAt),
+        totalEvents: Object.values(eventCounts).reduce((sum, count) => sum + count, 0),
+        eventCounts,
+        ...(lastMarketEventReceivedAt !== undefined ? {
+          lastEventReceivedAt: lastMarketEventReceivedAt,
+          lastEventAgeMs: Math.max(0, generatedAt - lastMarketEventReceivedAt),
         } : {}),
-        ...(this.#lastProviderTimestamp !== undefined ? { lastProviderTimestamp: this.#lastProviderTimestamp } : {}),
-        recentEvents: this.#recentMarketEvents.map((event) => ({ ...event })),
+        ...(lastProviderTimestamp !== undefined ? { lastProviderTimestamp } : {}),
+        recentEvents: this.#recentMarketEvents
+          .filter((event) => underlying === undefined || dashboardUnderlyingFromSymbol(event.symbol) === underlying)
+          .slice(0, 100)
+          .map((event) => ({ ...event })),
       },
-      signals: [...this.#signals.values()].slice(-250).reverse().map((signal) => ({
+      signals: signals.slice(-250).reverse().map((signal) => ({
         ...signal,
         reasons: [...signal.reasons],
         ...(signal.riskReasons ? { riskReasons: [...signal.riskReasons] } : {}),
@@ -676,11 +747,15 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
     this.#orderCards.clear();
     this.#latestOptionQuotes.clear();
     Object.assign(this.#marketEventCounts, emptyMarketEventCounts());
+    this.#marketEventCountsByUnderlying.clear();
     this.#recentMarketEvents.length = 0;
     this.#lastFeedSampleAt.clear();
     this.#decisions.length = 0;
     this.#potentialMisses.length = 0;
     this.#entryGateBlocks.clear();
+    this.#entryStatsByUnderlying.clear();
+    this.#lastMarketEventReceivedAtByUnderlying.clear();
+    this.#lastProviderTimestampByUnderlying.clear();
     this.#lastMarketEventReceivedAt = undefined;
     this.#lastProviderTimestamp = undefined;
     this.#feedSequence = 0;
@@ -703,20 +778,32 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
     let directions: DashboardDecision["directions"] | undefined;
     let regime: string | undefined;
     let price: number | undefined;
+    let underlying = stringValue(event.data.underlying) ?? "SPY";
 
     if (event.type === "live_entry_evaluation") {
       stage = "ENTRY_EVALUATION";
       outcome = stringValue(event.data.decision) ?? "UNKNOWN";
       regime = stringValue(event.data.regime) ?? "UNKNOWN";
       const feature = recordValue(event.data.feature);
+      underlying = stringValue(feature.symbol) ?? underlying;
       price = numberValue(feature.price);
-      if (price !== undefined) this.#updateForwardEntryEvaluations(event.timestamp, price);
+      if (price !== undefined && underlying) {
+        this.#updateForwardEntryEvaluations(event.timestamp, price, underlying);
+      }
       this.#entryEvaluationCount += 1;
       if (outcome === "NO_SIGNAL") this.#noSignalEvaluationCount += 1;
+      const underlyingSymbol = dashboardUnderlying(underlying) ?? "SPY";
+      const underlyingStats = this.#underlyingEntryStats(underlyingSymbol);
+      underlyingStats.evaluations += 1;
+      if (outcome === "NO_SIGNAL") underlyingStats.noSignalEvaluations += 1;
       if (outcome === "NO_SIGNAL" || outcome === "SKIPPED") {
-        for (const reason of reasons) this.#entryGateBlocks.set(reason, (this.#entryGateBlocks.get(reason) ?? 0) + 1);
+        for (const reason of reasons) {
+          this.#entryGateBlocks.set(reason, (this.#entryGateBlocks.get(reason) ?? 0) + 1);
+          underlyingStats.gateBlocks.set(reason, (underlyingStats.gateBlocks.get(reason) ?? 0) + 1);
+        }
       }
-      summary = `${regime} · SPY ${formatFeedNumber(numberValue(feature.price))}`;
+      summary = `${regime} · ${stringValue(feature.symbol) ?? stringValue(event.data.underlying) ?? "SPY"} ` +
+        `${formatFeedNumber(numberValue(feature.price))}`;
       directions = decisionDirections(event.data.directions);
     } else if (event.type === "live_signal_selection") {
       stage = "OPTION_SELECTION";
@@ -770,6 +857,7 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
     this.#decisions.unshift({
       id: `decision-${event.timestamp}-${++this.#decisionSequence}`,
       timestamp: event.timestamp,
+      ...(underlying ? { underlying } : {}),
       stage,
       outcome,
       ...(signalId ? { signalId } : {}),
@@ -784,11 +872,11 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
     if (this.#decisions.length > 1_000) this.#decisions.length = 1_000;
   }
 
-  #updateForwardEntryEvaluations(timestamp: number, forwardPrice: number): void {
+  #updateForwardEntryEvaluations(timestamp: number, forwardPrice: number, underlying: string): void {
     const horizonMs = MISSED_ENTRY_HORIZON_SEC * 1_000;
     for (const decision of this.#decisions) {
       if (decision.stage !== "ENTRY_EVALUATION" || decision.price === undefined ||
-          decision.forwardMoveBps !== undefined) continue;
+          decision.forwardMoveBps !== undefined || decision.underlying !== underlying) continue;
       const elapsed = timestamp - decision.timestamp;
       if (elapsed < horizonMs) continue;
       if (elapsed > horizonMs + FORWARD_SAMPLE_TOLERANCE_MS) continue;
@@ -797,10 +885,12 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
       decision.forwardMoveBps = forwardMoveBps;
       if (decision.outcome !== "NO_SIGNAL") continue;
       this.#matureNoSignalEvaluationCount += 1;
+      const underlyingSymbol = dashboardUnderlying(underlying) ?? "SPY";
+      this.#underlyingEntryStats(underlyingSymbol).matureNoSignalEvaluations += 1;
       if (!decision.reasons.includes("NO_DIRECTION_PASSED") ||
           Math.abs(forwardMoveBps) < MISSED_ENTRY_MOVE_THRESHOLD_BPS) continue;
       const direction: DashboardPotentialMiss["direction"] = forwardMoveBps > 0 ? "BULLISH" : "BEARISH";
-      if (this.#potentialMisses.some((miss) => miss.direction === direction &&
+      if (this.#potentialMisses.some((miss) => miss.underlying === underlying && miss.direction === direction &&
           Math.abs(miss.timestamp - decision.timestamp) < MISSED_ENTRY_CLUSTER_MS)) continue;
       const directionDecision = decision.directions?.find((item) => item.direction === direction);
       const failedVotes = directionDecision?.votes.filter((vote) => !vote.passed).map((vote) =>
@@ -808,6 +898,7 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
       this.#potentialMisses.unshift({
         id: `potential-miss-${decision.id}`,
         timestamp: decision.timestamp,
+        underlying,
         direction,
         regime: decision.regime ?? "UNKNOWN",
         price: decision.price,
@@ -822,23 +913,44 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
     }
   }
 
-  #falseNegativeSummary(): DashboardFalseNegativeSummary {
-    const potentialMisses = this.#potentialMisses.length;
+  #falseNegativeSummary(underlying?: UnderlyingSymbol): DashboardFalseNegativeSummary {
+    const misses = underlying
+      ? this.#potentialMisses.filter((miss) => (miss.underlying ?? "SPY") === underlying)
+      : this.#potentialMisses;
+    const stats = underlying ? this.#entryStatsByUnderlying.get(underlying) : undefined;
+    const evaluations = stats?.evaluations ?? (underlying ? 0 : this.#entryEvaluationCount);
+    const noSignalEvaluations = stats?.noSignalEvaluations ?? (underlying ? 0 : this.#noSignalEvaluationCount);
+    const matureNoSignalEvaluations = stats?.matureNoSignalEvaluations ??
+      (underlying ? 0 : this.#matureNoSignalEvaluationCount);
+    const gateBlocks = stats?.gateBlocks ?? this.#entryGateBlocks;
+    const potentialMisses = misses.length;
     return {
-      evaluations: this.#entryEvaluationCount,
-      noSignalEvaluations: this.#noSignalEvaluationCount,
-      matureNoSignalEvaluations: this.#matureNoSignalEvaluationCount,
+      evaluations,
+      noSignalEvaluations,
+      matureNoSignalEvaluations,
       potentialMisses,
-      potentialMissRate: this.#matureNoSignalEvaluationCount > 0
-        ? potentialMisses / this.#matureNoSignalEvaluationCount : 0,
-      bullishPotentialMisses: this.#potentialMisses.filter((miss) => miss.direction === "BULLISH").length,
-      bearishPotentialMisses: this.#potentialMisses.filter((miss) => miss.direction === "BEARISH").length,
+      potentialMissRate: matureNoSignalEvaluations > 0 ? potentialMisses / matureNoSignalEvaluations : 0,
+      bullishPotentialMisses: misses.filter((miss) => miss.direction === "BULLISH").length,
+      bearishPotentialMisses: misses.filter((miss) => miss.direction === "BEARISH").length,
       horizonSec: MISSED_ENTRY_HORIZON_SEC,
       thresholdBps: MISSED_ENTRY_MOVE_THRESHOLD_BPS,
-      gateBlocks: [...this.#entryGateBlocks.entries()]
+      gateBlocks: [...gateBlocks.entries()]
         .map(([reason, count]) => ({ reason, count }))
         .sort((a, b) => b.count - a.count || a.reason.localeCompare(b.reason)),
     };
+  }
+
+  #underlyingEntryStats(underlying: UnderlyingSymbol): UnderlyingEntryStats {
+    const existing = this.#entryStatsByUnderlying.get(underlying);
+    if (existing) return existing;
+    const created: UnderlyingEntryStats = {
+      evaluations: 0,
+      noSignalEvaluations: 0,
+      matureNoSignalEvaluations: 0,
+      gateBlocks: new Map(),
+    };
+    this.#entryStatsByUnderlying.set(underlying, created);
+    return created;
   }
 
   #activeOrders(generatedAt: number, orders: DashboardOrder[]): DashboardActiveOrder[] {
@@ -940,9 +1052,11 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
     };
   }
 
-  #entryQuality(orders: DashboardOrder[], trades: MutableTrade[]): DashboardEntryQuality[] {
+  #entryQuality(
+    orders: DashboardOrder[], trades: MutableTrade[], signals: DashboardSignal[] = [...this.#signals.values()],
+  ): DashboardEntryQuality[] {
     const entryOrders = orders.filter((order) => order.purpose === "ENTRY");
-    return [...this.#signals.values()].slice(-500).reverse().map((signal) => {
+    return signals.slice(-500).reverse().map((signal) => {
       const order = entryOrders.find((candidate) => candidate.signalId === signal.id)
         ?? entryOrders.find((candidate) => signal.brokerOrderId && candidate.brokerOrderId === signal.brokerOrderId)
         ?? [...entryOrders].reverse().find((candidate) => candidate.symbol === signal.candidate &&
@@ -964,6 +1078,7 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
       if (trade?.status === "CLOSED") status = trade.realizedPnl > 0 ? "WIN" : trade.realizedPnl < 0 ? "LOSS" : "FLAT";
       return {
         signalId: signal.id,
+        underlying: signal.underlying,
         signalTimestamp: signal.timestamp,
         sessionBucket: sessionBucket(signal.timestamp),
         ...(signal.candidate ? { symbol: signal.candidate } : {}),
@@ -1064,8 +1179,13 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
     const selectionReasons = explicitSelectionReasons.length > 0
       ? explicitSelectionReasons
       : closestReasons.length > 0 ? closestReasons : reasonCounts(event.data.rejectionCounts);
+    const underlying = dashboardUnderlying(stringValue(event.data.underlying)) ??
+      (candidate ? dashboardUnderlyingFromSymbol(candidate) : undefined) ??
+      (stringValue(closest.symbol) ? dashboardUnderlyingFromSymbol(stringValue(closest.symbol)!) : undefined) ??
+      "SPY";
     this.#signals.set(id, {
       id,
+      underlying,
       timestamp: numberValue(event.data.timestamp) ?? event.timestamp,
       direction: stringValue(event.data.direction) ?? "UNKNOWN",
       kind: stringValue(event.data.kind) ?? "UNKNOWN",
@@ -1630,6 +1750,20 @@ function emptyMarketEventCounts(): Record<HistoricalMarketEventType, number> {
   };
 }
 
+function dashboardUnderlying(value: string | undefined): UnderlyingSymbol | undefined {
+  return value === "SPY" || value === "QQQ" ? value : undefined;
+}
+
+function dashboardUnderlyingFromSymbol(symbol: string): UnderlyingSymbol | undefined {
+  return dashboardUnderlying(symbol) ?? dashboardUnderlying(parseOccSymbol(symbol)?.underlying);
+}
+
+function dashboardDecisionUnderlying(decision: DashboardDecision): UnderlyingSymbol {
+  return dashboardUnderlying(decision.underlying) ??
+    (decision.symbol ? dashboardUnderlyingFromSymbol(decision.symbol) : undefined) ??
+    "SPY";
+}
+
 function marketEventChannel(type: HistoricalMarketEventType): DashboardLiveFeedEvent["channel"] {
   if (type === "stock_quote" || type === "stock_trade") return "SIP";
   if (type === "option_quote") return "OPRA";
@@ -1653,7 +1787,9 @@ function marketEventSummary(event: HistoricalMarketEvent): string {
     return `IV ${formatFeedNumber(numberValue(data.impliedVolatility), 4)} · delta ${formatFeedNumber(numberValue(greeks.delta), 3)} · volume ${formatFeedNumber(numberValue(data.dailyVolume), 0)}`;
   }
   const fast = recordValue(data.fast);
-  return `SPY ${formatFeedNumber(numberValue(data.price))} · fast slope ${formatFeedNumber(numberValue(fast.normalizedSlope), 3)} · OFI5 ${formatFeedNumber(numberValue(data.ofi5), 3)}`;
+  return `${stringValue(data.symbol) ?? "SPY"} ${formatFeedNumber(numberValue(data.price))} · ` +
+    `fast slope ${formatFeedNumber(numberValue(fast.normalizedSlope), 3)} · ` +
+    `OFI5 ${formatFeedNumber(numberValue(data.ofi5), 3)}`;
 }
 
 function formatFeedNumber(value: number | undefined, digits = 2): string {
@@ -1950,14 +2086,15 @@ function stringArray(value: unknown): string[] {
 export function tradingDashboardHtml(): string {
   return `<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>SPY 0DTE Trading Dashboard</title><style>
+<title>SPY + QQQ 0DTE Trading Dashboard</title><style>
 :root{color-scheme:dark;--bg:#07111f;--panel:#0e1b2e;--line:#20324b;--text:#e7eef9;--muted:#91a4bd;--green:#35d07f;--red:#ff667a;--blue:#58a6ff;--amber:#f5c451}*{box-sizing:border-box}body{margin:0;background:linear-gradient(135deg,#06101c,#0a1830);color:var(--text);font:14px ui-sans-serif,system-ui,sans-serif}main{max-width:1500px;margin:auto;padding:24px}header{display:flex;justify-content:space-between;gap:18px;align-items:center;margin-bottom:18px}h1{font-size:24px;margin:0}h2{font-size:16px;margin:0 0 12px}.sub,.muted{color:var(--muted)}#state{display:flex;align-items:center;gap:8px;font-weight:700;padding:8px 12px;border:1px solid var(--line);border-radius:999px}.pulse-dot{width:9px;height:9px;border-radius:50%;background:currentColor;box-shadow:0 0 0 0 currentColor;animation:pulse 1.8s infinite}@keyframes pulse{70%{box-shadow:0 0 0 7px transparent}}.ok{color:var(--green)}.degraded{color:var(--amber)}.halted{color:var(--red)}.liveness-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(185px,1fr));gap:10px;margin-bottom:18px}.status-card{background:#0b192b;border:1px solid var(--line);border-radius:10px;padding:12px}.status-card .label{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.05em}.status-card strong{display:block;margin:5px 0 3px;font-size:14px}.status-detail{color:var(--muted);font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.tabs{display:flex;gap:5px;border-bottom:1px solid var(--line);margin-bottom:16px}.tab{appearance:none;border:0;border-bottom:2px solid transparent;background:transparent;color:var(--muted);font:inherit;font-weight:700;padding:11px 16px;cursor:pointer}.tab:hover{color:var(--text)}.tab.active{color:var(--blue);border-bottom-color:var(--blue)}.tab-panel{display:none}.tab-panel.active{display:block}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:12px;margin-bottom:18px}.card,.panel{background:rgba(14,27,46,.94);border:1px solid var(--line);border-radius:12px;box-shadow:0 10px 30px #0003}.card{padding:14px}.card .value{font-size:23px;font-weight:750;margin-top:6px}.card-detail{font-size:11px;margin-top:4px}.panel{padding:16px;margin:14px 0;overflow:auto}.live-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(360px,1fr));gap:14px}.live-card{background:linear-gradient(145deg,#12243d,#0b1729);border:1px solid #294262;border-radius:13px;padding:16px;min-width:0;box-shadow:inset 3px 0 0 var(--blue)}.live-card.profit{box-shadow:inset 3px 0 0 var(--green)}.live-card.loss{box-shadow:inset 3px 0 0 var(--red)}.live-card.completed{background:linear-gradient(145deg,#101d30,#091421)}.live-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}.live-symbol{font-weight:750;font-size:16px;overflow-wrap:anywhere}.badge,.source{display:inline-block;margin-top:5px;padding:3px 7px;border-radius:999px;background:#58a6ff1c;color:var(--blue);font-size:11px;font-weight:700;letter-spacing:.04em}.source{margin:0}.live-pnl{text-align:right;font-size:22px;font-weight:800}.live-return{text-align:right;font-size:12px;margin-top:3px}.entry-quality{display:grid;gap:3px;border:1px solid var(--line);border-radius:8px;margin-top:13px;padding:9px 11px;background:#07111f80}.entry-quality strong{font-size:11px;letter-spacing:.05em}.entry-quality span{color:var(--muted);font-size:11px}.entry-quality.good{border-color:#35d07f66}.entry-quality.good strong{color:var(--green)}.entry-quality.good-entry-poor-exit,.entry-quality.marginal{border-color:#f5c45166}.entry-quality.good-entry-poor-exit strong,.entry-quality.marginal strong{color:var(--amber)}.entry-quality.poor{border-color:#ff667a66}.entry-quality.poor strong{color:var(--red)}.entry-quality.evaluating strong{color:var(--blue)}.entry-quality.not-rated strong{color:var(--muted)}.live-fields{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin-top:16px}.live-field span{display:block;color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.04em;margin-bottom:4px}.live-field strong{font-size:14px}.order-strip{border-top:1px solid var(--line);margin-top:15px;padding-top:12px;display:flex;justify-content:space-between;gap:10px;color:var(--muted);font-size:12px}.dynamics{border-top:1px solid var(--line);margin-top:14px;padding-top:12px}.dynamics-title{color:var(--muted);font-size:11px;font-weight:750;text-transform:uppercase;letter-spacing:.05em;margin-bottom:7px}.dynamics-list{display:grid;gap:5px}.dynamics-columns,.dynamics-row{display:grid;grid-template-columns:108px minmax(140px,1fr) 82px 76px;gap:7px}.dynamics-columns{color:var(--muted);font-size:9px;font-weight:750;text-transform:uppercase;letter-spacing:.05em;padding:0 7px 4px}.dynamics-row{align-items:center;border-radius:6px;background:#07111f80;padding:7px;font-size:11px}.dynamics-row .dynamics-time,.dynamics-row .dynamics-state{color:var(--muted)}.dynamics-time{display:grid;gap:1px;white-space:nowrap;font-variant-numeric:tabular-nums}.dynamics-date{font-size:9px}.dynamics-clock{color:var(--text);font-size:10px}.dynamics-state-primary,.dynamics-state-change{display:block}.dynamics-state-change{color:var(--text);font-size:10px;margin-top:2px}.dynamics-row .dynamics-pnl,.dynamics-row .dynamics-change{text-align:right;font-variant-numeric:tabular-nums}.empty{color:var(--muted);padding:22px;text-align:center;border:1px dashed var(--line);border-radius:10px}.section-note{color:var(--muted);font-size:12px;margin:-6px 0 12px}.decision-reasons{max-width:560px;white-space:normal;line-height:1.45}.outcome{font-weight:750}.outcome.pass{color:var(--green)}.outcome.block{color:var(--amber)}.outcome.warn{color:var(--blue)}.tune-controls{display:flex;align-items:end;gap:12px;flex-wrap:wrap;margin-bottom:14px}.tune-control{display:grid;gap:5px}.tune-control label{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.04em}.tune-control select{min-width:150px;background:#0a1728;color:var(--text);border:1px solid var(--line);border-radius:7px;padding:8px 10px}.legend{display:flex;gap:16px;flex-wrap:wrap;color:var(--muted);font-size:11px;margin:8px 0}.quality-status{font-weight:750}.quality-status.WIN,.quality-status.FILLED,.quality-status.OPEN{color:var(--green)}.quality-status.LOSS,.quality-status.BLOCKED{color:var(--red)}.quality-status.WORKING,.quality-status.NO_OPTION{color:var(--amber)}table{border-collapse:collapse;width:100%;min-width:850px}th,td{text-align:left;padding:9px 10px;border-bottom:1px solid var(--line);white-space:nowrap}th{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.04em}tbody tr:hover{background:#ffffff08}.positive{color:var(--green)}.negative{color:var(--red)}@media(max-width:700px){main{padding:14px}header{align-items:flex-start;flex-direction:column}.live-grid{grid-template-columns:1fr}.live-fields{grid-template-columns:repeat(2,minmax(0,1fr))}.dynamics-columns,.dynamics-row{grid-template-columns:94px 1fr 72px}.dynamics-columns .dynamics-change,.dynamics-change{display:none}.tab{padding:10px}.tune-control{width:100%}.tune-control select{width:100%}}
 </style><style>
-.management{margin-top:13px;border:1px solid #294262;border-radius:9px;background:#081526b8;padding:10px}.management-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:9px}.management-title{color:var(--muted);font-size:11px;font-weight:750;text-transform:uppercase;letter-spacing:.05em}.management-badges{display:flex;gap:5px;flex-wrap:wrap;justify-content:flex-end}.management-badges .badge{margin:0}.management-badges .exit{background:#ff667a1c;color:var(--red)}.management-badges .protected{background:#35d07f1c;color:var(--green)}.management-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:9px}.management-detail{grid-column:1/-1;color:var(--muted);font-size:11px;line-height:1.45;overflow-wrap:anywhere}.order-strip{flex-direction:column}.order-strip-row{display:flex;justify-content:space-between;gap:10px}.order-strip-detail{color:var(--muted);font-size:11px;overflow-wrap:anywhere}.dynamics-state{white-space:normal;line-height:1.35}@media(max-width:700px){.management-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
-</style></head><body><main><header><div><h1>SPY 0DTE Option Day-Trade Dashboard</h1><div class="sub">Live SIP signals · OPRA options · Alpaca paper execution · PostgreSQL history</div></div><div id="state"><span class="pulse-dot"></span><span id="stateText">Loading…</span></div></header>
+.scope-bar{display:flex;align-items:center;justify-content:space-between;gap:16px;margin:0 0 18px;padding:12px 14px;background:#0b192b;border:1px solid var(--line);border-radius:10px}.scope-control{display:flex;align-items:center;gap:10px}.scope-control label{color:var(--muted);font-size:11px;font-weight:750;text-transform:uppercase;letter-spacing:.05em}.scope-control select{min-width:180px;background:#07111f;color:var(--text);border:1px solid #355378;border-radius:8px;padding:8px 10px;font:inherit;font-weight:750}.scope-summary{color:var(--muted);font-size:12px}.management{margin-top:13px;border:1px solid #294262;border-radius:9px;background:#081526b8;padding:10px}.management-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:9px}.management-title{color:var(--muted);font-size:11px;font-weight:750;text-transform:uppercase;letter-spacing:.05em}.management-badges{display:flex;gap:5px;flex-wrap:wrap;justify-content:flex-end}.management-badges .badge{margin:0}.management-badges .exit{background:#ff667a1c;color:var(--red)}.management-badges .protected{background:#35d07f1c;color:var(--green)}.management-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:9px}.management-detail{grid-column:1/-1;color:var(--muted);font-size:11px;line-height:1.45;overflow-wrap:anywhere}.order-strip{flex-direction:column}.order-strip-row{display:flex;justify-content:space-between;gap:10px}.order-strip-detail{color:var(--muted);font-size:11px;overflow-wrap:anywhere}.dynamics-state{white-space:normal;line-height:1.35}@media(max-width:700px){.scope-bar{align-items:flex-start;flex-direction:column}.scope-control{width:100%;justify-content:space-between}.scope-control select{flex:1}.management-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
+</style></head><body><main><header><div><h1>0DTE Option Day-Trade Dashboard</h1><div class="sub">Isolated SIP signals · shared OPRA options · Alpaca paper execution · PostgreSQL history</div></div><div id="state"><span class="pulse-dot"></span><span id="stateText">Loading…</span></div></header>
+<section class="scope-bar" aria-label="Underlying dashboard scope"><div class="scope-control"><label for="underlyingView">Dashboard scope</label><select id="underlyingView"><option value="ALL">All portfolio</option><option value="SPY">SPY only</option><option value="QQQ">QQQ only</option></select></div><div class="scope-summary" id="scopeSummary">Showing combined SPY + QQQ activity</div></section>
 <section class="liveness-grid" aria-label="System liveness">
 <div class="status-card"><div class="label">Engine heartbeat</div><strong id="engineState">Connecting</strong><div class="status-detail" id="engineDetail">Waiting for dashboard API</div></div>
-<div class="status-card"><div class="label">SPY SIP feed</div><strong id="sipState">Connecting</strong><div class="status-detail" id="sipDetail">Waiting for stock stream</div></div>
+<div class="status-card"><div class="label">Underlying SIP feeds</div><strong id="sipState">Connecting</strong><div class="status-detail" id="sipDetail">Waiting for stock stream</div></div>
 <div class="status-card"><div class="label">OPRA option feed</div><strong id="opraState">Connecting</strong><div class="status-detail" id="opraDetail">Waiting for option stream</div></div>
 <div class="status-card"><div class="label">PostgreSQL history</div><strong id="databaseState">Checking</strong><div class="status-detail" id="databaseDetail">Verifying market event writer</div></div>
 <div class="status-card"><div class="label">Paper broker</div><strong id="brokerState">Checking</strong><div class="status-detail" id="brokerDetail">Verifying execution connection</div></div>
@@ -1984,11 +2121,11 @@ export function tradingDashboardHtml(): string {
 <div class="card"><div class="muted">Option Subs</div><div class="value" id="subscriptions">0</div></div>
 </section>
 <section class="panel"><h2>Orders</h2><div class="section-note">Cards show broker execution plus the order manager lifecycle, buffered soft and full winner-protection states, executable P&amp;L, profit floor, recovery and continuation evidence, exit triggers, urgency, and retries. The complete timeline is stored in PostgreSQL for order-history restoration.</div><div id="orderCards" class="live-grid"><div class="empty">Waiting for an option order…</div></div></section>
-<section class="panel"><h2>Signal → Trade Funnel</h2><div class="section-note">A fired signal is not an order. Each row shows the selector version, option choice, risk, and submission status explicitly.</div><table><thead><tr><th>Time</th><th>Version</th><th>Direction</th><th>Kind</th><th>Regime</th><th>Projected</th><th>Option</th><th>Risk</th><th>Status</th><th>Reason</th></tr></thead><tbody id="signals"></tbody></table></section>
-<section class="panel"><h2>Potential Missed Entry Review</h2><div class="section-note">Hindsight diagnostic, not an automatic trade recommendation. A row appears only when directional gates produced NO SIGNAL and SPY subsequently moved at least ${MISSED_ENTRY_MOVE_THRESHOLD_BPS.toFixed(1)} bps in one direction over the ${MISSED_ENTRY_HORIZON_SEC}-second projection horizon. Consecutive rows are clustered for readability.</div><table><thead><tr><th>Evaluation</th><th>Direction</th><th>Regime</th><th>SPY Start</th><th>SPY +${MISSED_ENTRY_HORIZON_SEC}s</th><th>Forward Move</th><th>Failed Gates / Votes</th><th>Decision Reason</th></tr></thead><tbody id="potentialMissRows"></tbody></table></section>
+<section class="panel"><h2>Signal → Trade Funnel</h2><div class="section-note">A fired signal is not an order. Each row shows the selector version, option choice, risk, and submission status explicitly.</div><table><thead><tr><th>Time</th><th>Underlying</th><th>Version</th><th>Direction</th><th>Kind</th><th>Regime</th><th>Projected</th><th>Option</th><th>Risk</th><th>Status</th><th>Reason</th></tr></thead><tbody id="signals"></tbody></table></section>
+<section class="panel"><h2>Potential Missed Entry Review</h2><div class="section-note">Hindsight diagnostic, not an automatic trade recommendation. A row appears only when directional gates produced NO SIGNAL and the same underlying subsequently moved at least ${MISSED_ENTRY_MOVE_THRESHOLD_BPS.toFixed(1)} bps in one direction over the ${MISSED_ENTRY_HORIZON_SEC}-second projection horizon. Consecutive rows are clustered per underlying for readability.</div><table><thead><tr><th>Evaluation</th><th>Underlying</th><th>Direction</th><th>Regime</th><th>Start</th><th>+${MISSED_ENTRY_HORIZON_SEC}s</th><th>Forward Move</th><th>Failed Gates / Votes</th><th>Decision Reason</th></tr></thead><tbody id="potentialMissRows"></tbody></table></section>
 <section class="panel"><h2>Entry Gate Blocks</h2><div class="section-note">Counts every top-level reason that prevented an entry evaluation. This exposes global state failures such as incomplete opening-range recovery even when no hindsight row is created.</div><table><thead><tr><th>Gate / Reason</th><th>Blocked Evaluations</th><th>Share of Evaluations</th></tr></thead><tbody id="gateBlockRows"></tbody></table></section>
-<section class="panel"><h2>Orders &amp; Executions</h2><table><thead><tr><th>Time</th><th>Purpose</th><th>Option</th><th>Side</th><th>Qty</th><th>Limit</th><th>Filled</th><th>Avg Fill</th><th>Status</th></tr></thead><tbody id="orders"></tbody></table></section>
-<section class="panel"><h2>Trade Performance</h2><table><thead><tr><th>Entry</th><th>Exit</th><th>Option</th><th>Direction</th><th>Qty</th><th>Entry Px</th><th>Exit Px</th><th>P&amp;L</th><th>Return</th><th>Exit Reason</th><th>Status</th></tr></thead><tbody id="trades"></tbody></table></section>
+<section class="panel"><h2>Orders &amp; Executions</h2><table><thead><tr><th>Time</th><th>Underlying</th><th>Purpose</th><th>Option</th><th>Side</th><th>Qty</th><th>Limit</th><th>Filled</th><th>Avg Fill</th><th>Status</th></tr></thead><tbody id="orders"></tbody></table></section>
+<section class="panel"><h2>Trade Performance</h2><table><thead><tr><th>Entry</th><th>Exit</th><th>Underlying</th><th>Option</th><th>Direction</th><th>Qty</th><th>Entry Px</th><th>Exit Px</th><th>P&amp;L</th><th>Return</th><th>Exit Reason</th><th>Status</th></tr></thead><tbody id="trades"></tbody></table></section>
 </div>
 <div class="tab-panel" id="tuningTab">
 <section class="panel"><h2>Quality Filters</h2><div class="section-note">Compare like-for-like entries before changing thresholds. Small samples are directional evidence, not proof.</div><div class="tune-controls">
@@ -2021,11 +2158,12 @@ export function tradingDashboardHtml(): string {
 <div class="card"><div class="muted">Feature Decisions</div><div class="value" id="featureEvents">0</div></div>
 <div class="card"><div class="muted">Latest Feed Age</div><div class="value" id="feedAge">—</div></div>
 </section>
-<section class="panel"><h2>Entry Evaluations &amp; Decisions</h2><div class="section-note">Every evaluation remains stored, but routine one-second NO SIGNAL rows are hidden by default. Use All evaluations only when diagnosing individual gates.</div><div class="tune-controls"><div class="tune-control"><label for="decisionView">Rows shown</label><select id="decisionView"><option value="ACTIONABLE">Actionable stages only</option><option value="ALL">All evaluations</option><option value="NO_SIGNAL">NO SIGNAL only</option></select></div></div><table><thead><tr><th>Time</th><th>Stage</th><th>Outcome</th><th>Direction</th><th>Option</th><th>Decision</th><th>Gates, Votes &amp; Reasons</th></tr></thead><tbody id="decisions"></tbody></table></section>
+<section class="panel"><h2>Entry Evaluations &amp; Decisions</h2><div class="section-note">Every evaluation remains stored, but routine one-second NO SIGNAL rows are hidden by default. Use All evaluations only when diagnosing individual gates.</div><div class="tune-controls"><div class="tune-control"><label for="decisionView">Rows shown</label><select id="decisionView"><option value="ACTIONABLE">Actionable stages only</option><option value="ALL">All evaluations</option><option value="NO_SIGNAL">NO SIGNAL only</option></select></div></div><table><thead><tr><th>Time</th><th>Underlying</th><th>Stage</th><th>Outcome</th><th>Direction</th><th>Option</th><th>Decision</th><th>Gates, Votes &amp; Reasons</th></tr></thead><tbody id="decisions"></tbody></table></section>
 <section class="panel"><h2>Live Feed Into System</h2><div class="section-note">The UI is sampled for readability. PostgreSQL retains quote baselines, full-resolution quotes for working/open options, and every trade, feature, decision, order, and fill.</div><table><thead><tr><th>Received</th><th>Feed</th><th>Type</th><th>Symbol</th><th>Value</th><th>Provider Latency</th><th>Storage Policy</th></tr></thead><tbody id="feedEventsBody"></tbody></table></section>
 </div>
 <div class="muted" id="updated"></div></main><script>
 const $=id=>document.getElementById(id),money=n=>new Intl.NumberFormat('en-US',{style:'currency',currency:'USD'}).format(n||0),optionalMoney=n=>Number.isFinite(n)?money(n):'—',num=(n,d=2)=>Number.isFinite(n)?n.toFixed(d):'—',count=n=>Number(n||0).toLocaleString(),time=n=>n?new Date(n).toLocaleString('en-US',{timeZone:'America/New_York'}):'—';
+const underlyingFromSymbol=s=>{const value=String(s||'').replaceAll(' ','').toUpperCase();if(value==='SPY'||value==='QQQ')return value;const match=/^([A-Z]{1,6})\d{6}[CP]\d{8}$/.exec(value);return match&&['SPY','QQQ'].includes(match[1])?match[1]:'UNKNOWN'},itemUnderlying=x=>x?.underlying||underlyingFromSymbol(x?.symbol||x?.candidate||x?.closestCandidate);
 function cell(value,cls=''){const td=document.createElement('td');td.textContent=String(value??'—');if(cls)td.className=cls;return td}function rows(id,data,fields,empty=''){const body=$(id);if(data.length===0&&empty){const tr=document.createElement('tr'),td=cell(empty,'muted');td.colSpan=fields.length;tr.append(td);body.replaceChildren(tr);return}body.replaceChildren(...data.map(item=>{const tr=document.createElement('tr');for(const field of fields){const result=field(item);tr.append(cell(result.value,result.cls||''))}return tr}))}
 function node(tag,cls,text){const value=document.createElement(tag);if(cls)value.className=cls;if(text!==undefined)value.textContent=String(text);return value}function field(label,value){const wrap=node('div','live-field'),caption=node('span','',label),content=node('strong','',value);wrap.append(caption,content);return wrap}function duration(ms){if(!Number.isFinite(ms))return '—';const seconds=Math.floor(ms/1000),minutes=Math.floor(seconds/60),hours=Math.floor(minutes/60);return hours>0?hours+'h '+(minutes%60)+'m':minutes>0?minutes+'m '+(seconds%60)+'s':seconds+'s'}
 function orderFullTime(timestamp){return Number.isFinite(timestamp)?new Date(timestamp).toLocaleString('en-US',{timeZone:'America/New_York',month:'2-digit',day:'2-digit',year:'numeric',hour:'2-digit',minute:'2-digit',second:'2-digit',fractionalSecondDigits:3,timeZoneName:'short'}):'—'}
@@ -2036,7 +2174,7 @@ const root=$('orderCards');
 if(!items||items.length===0){root.replaceChildren(node('div','empty','No option orders have been recorded.'));return}
 const cards=items.map(x=>{
 const updates=x.updates||[],latestMonitoredAt=updates.reduce((latest,update)=>Math.max(latest,update.timestamp||0),0)||x.entryTimestamp,pnl=x.totalPnl===undefined?x.unrealizedPnl:x.totalPnl,pnlClass=pnl>0?'positive':pnl<0?'negative':'',card=node('article','live-card '+(x.active?'':'completed ')+(pnl>0?'profit':pnl<0?'loss':'')),head=node('div','live-head'),identity=node('div'),symbol=node('div','live-symbol',x.symbol),badge=node('div','badge',x.stage.replaceAll('_',' ')),pnlBox=node('div'),pnlValue=node('div','live-pnl '+pnlClass,pnl===undefined?'AWAITING FILL':money(pnl)),returnLabel=x.active?' open return':' final return',pnlReturn=node('div','live-return '+pnlClass,x.unrealizedReturnPct===undefined?(x.active?'P&L from executable bid':'Completed order'):num(x.unrealizedReturnPct)+'%'+returnLabel);
-identity.append(symbol,badge);pnlBox.append(pnlValue,pnlReturn);head.append(identity,pnlBox);
+identity.append(symbol,node('div','source',itemUnderlying(x)),badge);pnlBox.append(pnlValue,pnlReturn);head.append(identity,pnlBox);
 const qualityKey=x.entryQuality||'NOT_RATED',qualityClass=qualityKey.toLowerCase().replaceAll('_','-'),quality=node('div','entry-quality '+qualityClass),qualityLabel=node('strong','','ENTRY QUALITY · '+qualityKey.replaceAll('_',' ')),qualityReason=node('span','',x.entryQualityReason||'No quality classification is available.');
 quality.append(qualityLabel,qualityReason);
 const management=node('div','management'),managementHead=node('div','management-head'),managementTitle=node('div','management-title','Order manager'),managementBadges=node('div','management-badges'),lifecycleBadge=node('span','badge',(x.lifecycle||x.stage).replaceAll('_',' ')),tradeState=x.tradeState||(x.stage==='ENTRY_WORKING'?'AWAITING FILL':'STATE NOT RECORDED'),tradeClass=tradeState.startsWith('PROTECTED')?'badge protected':'badge',tradeBadge=node('span',tradeClass,tradeState.replaceAll('_',' ')),decision=x.managementDecision||(x.stage==='ENTRY_WORKING'?'DECISION PENDING':'DECISION NOT RECORDED'),decisionBadge=node('span','badge '+(decision==='EXIT'?'exit':''),decision.replaceAll('_',' '));
@@ -2077,8 +2215,8 @@ function setStatus(valueId,detailId,value,detail,level){$(valueId).textContent=v
 function outcomeClass(value){return ['SIGNAL','SELECTED','ALLOWED','SUBMITTED','REQUESTED','FILLED'].includes(value)?'outcome pass':['NO_SIGNAL','NO_ELIGIBLE_OPTION','BLOCKED','SKIPPED'].includes(value)?'outcome block':value==='RETRYING'?'outcome warn':'outcome'}
 function decisionDetail(item){const details=[...(item.reasons||[])];for(const direction of item.directions||[]){const failedVotes=(direction.votes||[]).filter(v=>!v.passed).map(v=>v.name);const result=direction.passed?'PASS':(direction.reasons||[]).slice(0,6).join(', ');details.push(direction.direction+': '+result+(failedVotes.length?' · failed votes '+failedVotes.join(', '):''))}return details.join(' · ')||'All configured gates passed'}
 let latestDecisions=[];
-function renderDecisionRows(items){latestDecisions=items||[];const view=$('decisionView').value,filtered=view==='ALL'?latestDecisions:view==='NO_SIGNAL'?latestDecisions.filter(x=>x.stage==='ENTRY_EVALUATION'&&x.outcome==='NO_SIGNAL'):latestDecisions.filter(x=>!(x.stage==='ENTRY_EVALUATION'&&x.outcome==='NO_SIGNAL'));rows('decisions',filtered,[x=>({value:time(x.timestamp)}),x=>({value:x.stage.replaceAll('_',' ')}),x=>({value:x.outcome.replaceAll('_',' '),cls:outcomeClass(x.outcome)}),x=>({value:x.direction}),x=>({value:x.symbol}),x=>({value:x.summary}),x=>({value:decisionDetail(x),cls:'decision-reasons'})],view==='ACTIONABLE'?'No actionable signal, option-selection, risk, or order events yet. Routine NO SIGNAL evaluations remain recorded.':'No evaluations match this view.')}
-function renderPotentialMisses(tuning){const summary=tuning?.falseNegativeSummary||{evaluations:0,noSignalEvaluations:0,matureNoSignalEvaluations:0,potentialMisses:0,potentialMissRate:0,horizonSec:5,thresholdBps:2,gateBlocks:[]},misses=tuning?.potentialMisses||[];$('potentialMisses').textContent=count(summary.potentialMisses);$('potentialMisses').className='value '+(summary.potentialMisses>0?'negative':'positive');$('potentialMissDetail').textContent=count(summary.potentialMisses)+' of '+count(summary.matureNoSignalEvaluations)+' mature · '+percent(100*summary.potentialMissRate,2);$('noSignalEvaluations').textContent=count(summary.noSignalEvaluations);$('noSignalDetail').textContent=count(summary.matureNoSignalEvaluations)+' have a +'+summary.horizonSec+'s outcome';rows('potentialMissRows',misses,[x=>({value:time(x.timestamp)}),x=>({value:x.direction,cls:x.direction==='BULLISH'?'positive':'negative'}),x=>({value:String(x.regime).replaceAll('_',' ')}),x=>({value:num(x.price)}),x=>({value:num(x.forwardPrice)}),x=>({value:signedBps(x.forwardMoveBps),cls:x.forwardMoveBps>0?'positive':'negative'}),x=>({value:(x.failedGates||[]).join(' · '),cls:'decision-reasons'}),x=>({value:(x.reasons||[]).join(' · '),cls:'decision-reasons'})],'No potential hindsight misses detected at the '+summary.horizonSec+'-second / '+num(summary.thresholdBps,1)+'-bps review threshold.');rows('gateBlockRows',summary.gateBlocks||[],[x=>({value:String(x.reason).replaceAll('_',' '),cls:'decision-reasons'}),x=>({value:count(x.count)}),x=>({value:percent(summary.evaluations>0?100*x.count/summary.evaluations:0,1)})],'No entry gates have blocked an evaluation.')}
+function renderDecisionRows(items){latestDecisions=items||[];const view=$('decisionView').value,filtered=view==='ALL'?latestDecisions:view==='NO_SIGNAL'?latestDecisions.filter(x=>x.stage==='ENTRY_EVALUATION'&&x.outcome==='NO_SIGNAL'):latestDecisions.filter(x=>!(x.stage==='ENTRY_EVALUATION'&&x.outcome==='NO_SIGNAL'));rows('decisions',filtered,[x=>({value:time(x.timestamp)}),x=>({value:itemUnderlying(x)}),x=>({value:x.stage.replaceAll('_',' ')}),x=>({value:x.outcome.replaceAll('_',' '),cls:outcomeClass(x.outcome)}),x=>({value:x.direction}),x=>({value:x.symbol}),x=>({value:x.summary}),x=>({value:decisionDetail(x),cls:'decision-reasons'})],view==='ACTIONABLE'?'No actionable signal, option-selection, risk, or order events yet. Routine NO SIGNAL evaluations remain recorded.':'No evaluations match this view.')}
+function renderPotentialMisses(tuning){const summary=tuning?.falseNegativeSummary||{evaluations:0,noSignalEvaluations:0,matureNoSignalEvaluations:0,potentialMisses:0,potentialMissRate:0,horizonSec:5,thresholdBps:2,gateBlocks:[]},misses=tuning?.potentialMisses||[];$('potentialMisses').textContent=count(summary.potentialMisses);$('potentialMisses').className='value '+(summary.potentialMisses>0?'negative':'positive');$('potentialMissDetail').textContent=count(summary.potentialMisses)+' of '+count(summary.matureNoSignalEvaluations)+' mature · '+percent(100*summary.potentialMissRate,2);$('noSignalEvaluations').textContent=count(summary.noSignalEvaluations);$('noSignalDetail').textContent=count(summary.matureNoSignalEvaluations)+' have a +'+summary.horizonSec+'s outcome';rows('potentialMissRows',misses,[x=>({value:time(x.timestamp)}),x=>({value:x.underlying||'SPY'}),x=>({value:x.direction,cls:x.direction==='BULLISH'?'positive':'negative'}),x=>({value:String(x.regime).replaceAll('_',' ')}),x=>({value:num(x.price)}),x=>({value:num(x.forwardPrice)}),x=>({value:signedBps(x.forwardMoveBps),cls:x.forwardMoveBps>0?'positive':'negative'}),x=>({value:(x.failedGates||[]).join(' · '),cls:'decision-reasons'}),x=>({value:(x.reasons||[]).join(' · '),cls:'decision-reasons'})],'No potential hindsight misses detected at the '+summary.horizonSec+'-second / '+num(summary.thresholdBps,1)+'-bps review threshold.');rows('gateBlockRows',summary.gateBlocks||[],[x=>({value:String(x.reason).replaceAll('_',' '),cls:'decision-reasons'}),x=>({value:count(x.count)}),x=>({value:percent(summary.evaluations>0?100*x.count/summary.evaluations:0,1)})],'No entry gates have blocked an evaluation.')}
 let scheduledDisplayRolloverAt=0,displayRolloverTimer;
 function scheduleDisplayRollover(timestamp){if(!Number.isFinite(timestamp)||timestamp===scheduledDisplayRolloverAt)return;scheduledDisplayRolloverAt=timestamp;if(displayRolloverTimer)clearTimeout(displayRolloverTimer);const delay=Math.max(0,timestamp-Date.now()+250);displayRolloverTimer=setTimeout(()=>window.location.reload(),Math.min(delay,2147483647))}
 const percent=(value,d=1)=>Number.isFinite(value)?num(value,d)+'%':'—',latency=value=>!Number.isFinite(value)?'—':value<1000?Math.round(value)+' ms':value<60000?num(value/1000,2)+' s':duration(value),signedBps=value=>Number.isFinite(value)?(value>0?'+':'')+num(value,1)+' bps':'—';
@@ -2087,23 +2225,27 @@ function tuneStats(items){const submitted=items.filter(x=>x.orderTimestamp!==und
 function updateSelect(id,values,label){const select=$(id),current=select.value,unique=[...new Set(values.filter(Boolean))].sort(),all=document.createElement('option');all.value='ALL';all.textContent=label;select.replaceChildren(all,...unique.map(value=>{const option=document.createElement('option');option.value=value;option.textContent=value.replaceAll('_',' ');return option}));select.value=unique.includes(current)?current:'ALL'}
 let latestTuning={entries:[]},latestQualityOrders=[];
 function renderTuning(tuning,orders){latestTuning=tuning||{entries:[]};latestQualityOrders=orders||[];const all=latestTuning.entries||[];updateSelect('tuneDirection',all.map(x=>x.direction),'All directions');updateSelect('tuneRegime',all.map(x=>x.regime),'All regimes');updateSelect('tuneOutcome',all.map(x=>x.status),'All outcomes');const direction=$('tuneDirection').value,regime=$('tuneRegime').value,outcome=$('tuneOutcome').value,items=all.filter(x=>(direction==='ALL'||x.direction===direction)&&(regime==='ALL'||x.regime===regime)&&(outcome==='ALL'||x.status===outcome)),stats=tuneStats(items);$('tuneSignals').textContent=count(stats.signals);$('tuneFillRate').textContent=percent(100*stats.fillRate);$('tuneSignalOrder').textContent=latency(stats.avgSignalOrder);$('tuneOrderFill').textContent=latency(stats.avgOrderFill);$('tuneSlippage').textContent=signedBps(stats.avgSlippage);$('tuneSlippage').className='value '+(stats.avgSlippage>0?'negative':Number.isFinite(stats.avgSlippage)?'positive':'');$('tuneReplacements').textContent=percent(100*stats.replacementRate);$('tuneMfe').textContent=percent(stats.avgMfe);$('tuneMfe').className='value '+(stats.avgMfe>0?'positive':'');$('tuneMae').textContent=percent(stats.avgMae);$('tuneMae').className='value '+(stats.avgMae<0?'negative':'');$('tuneCapture').textContent=percent(stats.avgCapture);
-rows('tuningEntries',items,[x=>({value:time(x.signalTimestamp)}),x=>({value:(x.symbol||'No option')+' · '+x.direction+' '+x.kind+' · '+x.regime}),x=>({value:x.status,cls:'quality-status '+x.status}),x=>({value:x.decisionBid===undefined?'—':money(x.decisionBid)+' / '+money(x.decisionAsk)}),x=>({value:x.decisionSpreadPct===undefined?'—':percent(100*x.decisionSpreadPct,2)}),x=>({value:latency(x.signalToOrderMs)}),x=>({value:latency(x.orderToFirstFillMs)}),x=>({value:x.averageFillPrice===undefined?'—':money(x.averageFillPrice)}),x=>({value:signedBps(x.entrySlippageBps),cls:x.entrySlippageBps>0?'negative':Number.isFinite(x.entrySlippageBps)?'positive':''}),x=>({value:x.replacements??'—'}),x=>({value:percent(x.maxFavorableExcursionPct),cls:x.maxFavorableExcursionPct>0?'positive':''}),x=>({value:percent(x.maxAdverseExcursionPct),cls:x.maxAdverseExcursionPct<0?'negative':''}),x=>({value:x.returnPct===undefined?'—':percent(x.returnPct)+' / '+money(x.realizedPnl),cls:x.realizedPnl>0?'positive':x.realizedPnl<0?'negative':''}),x=>({value:(x.exitReason||'—')+(x.holdMs===undefined?'':' · '+duration(x.holdMs))})],'No strategy entries match these filters.');
+rows('tuningEntries',items,[x=>({value:time(x.signalTimestamp)}),x=>({value:itemUnderlying(x)+' · '+(x.symbol||'No option')+' · '+x.direction+' '+x.kind+' · '+x.regime}),x=>({value:x.status,cls:'quality-status '+x.status}),x=>({value:x.decisionBid===undefined?'—':money(x.decisionBid)+' / '+money(x.decisionAsk)}),x=>({value:x.decisionSpreadPct===undefined?'—':percent(100*x.decisionSpreadPct,2)}),x=>({value:latency(x.signalToOrderMs)}),x=>({value:latency(x.orderToFirstFillMs)}),x=>({value:x.averageFillPrice===undefined?'—':money(x.averageFillPrice)}),x=>({value:signedBps(x.entrySlippageBps),cls:x.entrySlippageBps>0?'negative':Number.isFinite(x.entrySlippageBps)?'positive':''}),x=>({value:x.replacements??'—'}),x=>({value:percent(x.maxFavorableExcursionPct),cls:x.maxFavorableExcursionPct>0?'positive':''}),x=>({value:percent(x.maxAdverseExcursionPct),cls:x.maxAdverseExcursionPct<0?'negative':''}),x=>({value:x.returnPct===undefined?'—':percent(x.returnPct)+' / '+money(x.realizedPnl),cls:x.realizedPnl>0?'positive':x.realizedPnl<0?'negative':''}),x=>({value:(x.exitReason||'—')+(x.holdMs===undefined?'':' · '+duration(x.holdMs))})],'No strategy entries match these filters.');
 const ids=new Set(items.map(x=>x.signalId)),filteredOrders=latestQualityOrders.filter(order=>direction==='ALL'&&regime==='ALL'&&outcome==='ALL'||(order.signalId&&ids.has(order.signalId)));rows('tuningOrders',filteredOrders,[x=>({value:time(x.timestamp)}),x=>({value:x.purpose}),x=>({value:x.symbol}),x=>({value:x.filledQuantity+' / '+x.quantity}),x=>({value:money(x.initialLimitPrice)}),x=>({value:money(x.limitPrice)}),x=>({value:x.averageFillPrice===undefined?'—':money(x.averageFillPrice)}),x=>({value:percent(x.fillPercentage)}),x=>({value:latency(x.firstFillLatencyMs)}),x=>({value:latency(x.completionLatencyMs)}),x=>({value:signedBps(x.priceImprovementBps),cls:x.priceImprovementBps>0?'positive':x.priceImprovementBps<0?'negative':''}),x=>({value:x.replacements}),x=>({value:x.status})],'No orders match these filters.');
 const key=$('tuneBreakdown').value,groups=new Map();for(const item of items){const label=item[key]||'UNKNOWN';if(!groups.has(label))groups.set(label,[]);groups.get(label).push(item)}const compared=[...groups.entries()].map(([label,group])=>({label,...tuneStats(group)})).sort((a,b)=>b.signals-a.signals);rows('tuningGroups',compared,[x=>({value:String(x.label).replaceAll('_',' ')}),x=>({value:x.signals}),x=>({value:x.filled}),x=>({value:percent(100*x.fillRate)}),x=>({value:x.closed}),x=>({value:percent(100*x.winRate)}),x=>({value:money(x.avgPnl),cls:x.avgPnl>0?'positive':x.avgPnl<0?'negative':''}),x=>({value:percent(x.avgReturn),cls:x.avgReturn>0?'positive':x.avgReturn<0?'negative':''}),x=>({value:signedBps(x.avgSlippage),cls:x.avgSlippage>0?'negative':x.avgSlippage<0?'positive':''}),x=>({value:latency(x.avgOrderFill)}),x=>({value:percent(x.avgMfe),cls:x.avgMfe>0?'positive':''}),x=>({value:percent(x.avgMae),cls:x.avgMae<0?'negative':''})],'No grouped samples match these filters.')}
 document.querySelectorAll('.tab').forEach(button=>button.addEventListener('click',()=>{document.querySelectorAll('.tab').forEach(tab=>{const active=tab===button;tab.classList.toggle('active',active);tab.setAttribute('aria-selected',String(active))});document.querySelectorAll('.tab-panel').forEach(panel=>panel.classList.toggle('active',panel.id===button.dataset.tab))}));
 ['tuneDirection','tuneRegime','tuneOutcome','tuneBreakdown'].forEach(id=>$(id).addEventListener('change',()=>renderTuning(latestTuning,latestQualityOrders)));
 $('decisionView').addEventListener('change',()=>renderDecisionRows(latestDecisions));
+try{const saved=localStorage.getItem('dashboardUnderlying');if(['ALL','SPY','QQQ'].includes(saved))$('underlyingView').value=saved}catch{}
+$('underlyingView').addEventListener('change',()=>{try{localStorage.setItem('dashboardUnderlying',$('underlyingView').value)}catch{}refresh()});
 async function refresh(){
 try{
 const response=await fetch('/api/dashboard',{cache:'no-store'});if(!response.ok)throw new Error('Dashboard API '+response.status);
-const data=await response.json(),p=data.performance,h=data.health||{},live=data.liveData||{eventCounts:{},recentEvents:[],totalEvents:0,uptimeMs:0,persistenceEnabled:false,quoteSampleIntervalMs:0,retentionDays:0};
+const data=await response.json(),selected=$('underlyingView').value,view=selected==='ALL'?data:(data.underlyingViews||{})[selected]||{performance:{},liveData:{eventCounts:{},recentEvents:[]},tuning:{entries:[]},signals:[],orders:[],trades:[],decisions:[],orderCards:[],activeOrders:[]},p=view.performance||{},aggregateHealth=data.health||{},symbolHealth=(aggregateHealth.underlyingStates||{})[selected],h=selected==='ALL'?aggregateHealth:(symbolHealth||{ready:false,brokerRequired:false,websocketConnected:false,brokerAvailable:false,marketClockState:'disabled',openOrderCount:0,positionsReconciled:true,recorderHealthy:aggregateHealth.recorderHealthy!==false,killSwitch:false}),live=view.liveData||{eventCounts:{},recentEvents:[],totalEvents:0,uptimeMs:0,persistenceEnabled:false,quoteSampleIntervalMs:0,retentionDays:0},readiness=selected==='ALL'?(data.readiness||'degraded'):!symbolHealth?'degraded':h.killSwitch||!h.positionsReconciled||!h.recorderHealthy?'halted':!h.ready||(!h.websocketConnected&&!h.marketDataIdle)||(h.brokerRequired!==false&&!h.brokerAvailable)?'degraded':'ok';
 scheduleDisplayRollover(data.nextDisplayRolloverAt);
-$('stateText').textContent=(data.readiness||'unknown').toUpperCase()+' · '+(h.executionMode||'paper');$('state').className=data.readiness||'degraded';
+$('scopeSummary').textContent=selected==='ALL'?'Showing combined SPY + QQQ portfolio activity':symbolHealth?'Showing isolated '+selected+' strategy, execution, P&L, tuning, feeds, and health':selected+' is not enabled in this process';
+$('stateText').textContent=selected+' · '+readiness.toUpperCase()+' · '+(h.executionMode||aggregateHealth.executionMode||'paper');$('state').className=readiness;
 setStatus('engineState','engineDetail','LIVE','API heartbeat · uptime '+duration(live.uptimeMs),'ok');
 const marketIdle=h.marketDataIdle===true,stockConnected=h.stockWebsocketConnected??h.websocketConnected,sipQuotes=h.receivedStockQuotes??live.eventCounts.stock_quote??0,sipTrades=h.receivedStockTrades??live.eventCounts.stock_trade??0,sipLive=sipQuotes+sipTrades;
 setStatus('sipState','sipDetail',marketIdle?'IDLE':stockConnected?'CONNECTED':'DISCONNECTED',count(sipQuotes)+' live quotes · '+count(sipTrades)+' live trades · quote '+age(h.lastStockQuoteAgeMs),marketIdle||stockConnected?'ok':'halted');
-const subscriptions=h.subscribedOptionContracts||0,opraQuotes=h.receivedOptionQuotes??live.eventCounts.option_quote??0,opraRequired=h.marketClockState==='market-open'&&subscriptions>0,opraStalled=h.optionQuoteStalled===true,opraConnected=h.optionWebsocketConnected===true,opraState=marketIdle?'IDLE':opraStalled?'STALLED':opraConnected?'CONNECTED':opraRequired?'DISCONNECTED':'STANDBY',opraLevel=marketIdle?'ok':opraStalled?'halted':opraConnected?'ok':opraRequired?'halted':'degraded',opraError=opraStalled&&h.lastStreamError?' · '+h.lastStreamError:'';
-setStatus('opraState','opraDetail',opraState,count(opraQuotes)+' live quotes · '+age(h.lastOptionQuoteAgeMs)+' · '+count(subscriptions)+' subscriptions'+opraError,opraLevel);
+const subscriptions=h.subscribedOptionContracts||0,opraQuotes=h.receivedOptionQuotes??live.eventCounts.option_quote??0,opraRequired=h.marketClockState==='market-open'&&subscriptions>0,opraStalled=h.optionQuoteStalled===true,opraPrimed=h.optionQuotePrimed!==false,opraLagged=h.optionQuoteProviderLagged===true,opraConnected=h.optionWebsocketConnected===true,opraState=marketIdle?'IDLE':opraStalled?'STALLED':opraLagged?'STALE':opraConnected&&!opraPrimed?'WARMING':opraConnected?'CONNECTED':opraRequired?'DISCONNECTED':'STANDBY',opraLevel=marketIdle?'ok':opraStalled||opraLagged?'halted':opraConnected&&!opraPrimed?'degraded':opraConnected?'ok':opraRequired?'halted':'degraded',opraError=opraStalled&&h.lastStreamError?' · '+h.lastStreamError:'';
+const restFallback=h.optionRestFallbackEnabled?(' · REST '+age(h.lastOptionRestQuoteProviderAgeMs)+' · '+count(h.optionRestFallbackFreshQuotes)+' fresh/'+count(h.optionRestFallbackRequests)+' requests'+(h.optionRestFallbackInFlight?' (polling)':'')+(h.lastOptionRestFallbackError?' · REST error '+h.lastOptionRestFallbackError:'')):'';
+setStatus('opraState','opraDetail',opraState,count(opraQuotes)+' WS quotes · receive '+age(h.lastOptionQuoteAgeMs)+' · effective provider '+age(h.lastOptionQuoteProviderAgeMs)+' · '+count(subscriptions)+' subscriptions'+restFallback+opraError,opraLevel);
 const dbLevel=!live.persistenceEnabled?'degraded':h.recorderHealthy?'ok':'halted',retentionDetail=(live.quoteSampleIntervalMs===0?'full-resolution quotes':live.quoteSampleIntervalMs+' ms quote baseline')+' · '+live.retentionDays+'d raw retention';
 setStatus('databaseState','databaseDetail',!live.persistenceEnabled?'DISABLED':h.recorderHealthy?'WRITING':'UNHEALTHY',live.persistenceEnabled?retentionDetail:'Persistence is not enabled',dbLevel);
 setStatus('brokerState','brokerDetail',h.brokerAvailable?'CONNECTED':'UNAVAILABLE',(h.executionMode||'paper').toUpperCase()+' · '+count(h.openOrderCount)+' open order(s)',h.brokerAvailable?'ok':'degraded');
@@ -2112,12 +2254,12 @@ const strategyRequired=h.executionEnabled&&h.marketClockState==='market-open',st
 setStatus('strategyState','strategyDetail',strategyLabel,strategyStatus+openingRangeEnd+' · '+count(h.restoredStockEvents)+' SIP / '+count(restoredBars)+' bars restored at startup · '+count(liveBars)+' live bars / '+count(sipLive)+' SIP events',strategyLevel);
 const signalsFired=p.signalsFired??0,optionsSelected=p.optionsSelected??0,latestSelectionVersion=(p.optionSelectionByConfig||[])[0];
 $('signalsFired').textContent=count(signalsFired);$('optionsSelected').textContent=count(optionsSelected);$('optionSelectionDetail').textContent=latestSelectionVersion?percent(100*latestSelectionVersion.selectionRate)+' for '+latestSelectionVersion.configVersion+' · '+count(latestSelectionVersion.pending)+' retrying':percent(signalsFired>0?100*optionsSelected/signalsFired:0)+' of signals';$('riskAllowed').textContent=count(p.riskAllowed);$('riskDetail').textContent=count(p.riskBlocked)+' blocked';$('entryOrders').textContent=p.entryOrders;$('filledEntries').textContent=p.filledEntryOrders;$('closedTrades').textContent=p.closedTrades;$('winRate').textContent=(p.winRate*100).toFixed(1)+'%';$('pnl').textContent=money(p.realizedPnl);$('pnl').className='value '+(p.realizedPnl>0?'positive':p.realizedPnl<0?'negative':'');$('openPnl').textContent=money(p.unrealizedPnl);$('openPnl').className='value '+(p.unrealizedPnl>0?'positive':p.unrealizedPnl<0?'negative':'');$('totalPnl').textContent=money(p.totalPnl);$('totalPnl').className='value '+(p.totalPnl>0?'positive':p.totalPnl<0?'negative':'');$('profitFactor').textContent=p.profitFactor===null?'—':num(p.profitFactor);$('openTrades').textContent=p.openTrades;$('subscriptions').textContent=subscriptions;$('feedEvents').textContent=count(live.totalEvents);$('sipQuotes').textContent=count(live.eventCounts.stock_quote);$('sipTrades').textContent=count(live.eventCounts.stock_trade);$('opraQuotes').textContent=count(live.eventCounts.option_quote);$('featureEvents').textContent=count(live.eventCounts.feature_snapshot);$('feedAge').textContent=live.lastEventAgeMs===undefined?'—':duration(live.lastEventAgeMs);
-renderOrders(data.orderCards||data.activeOrders);
-rows('signals',data.signals,[x=>({value:time(x.timestamp)}),x=>({value:x.configVersion}),x=>({value:x.direction}),x=>({value:x.kind}),x=>({value:x.regime}),x=>({value:num(x.projectedMoveBps)+' bps'}),x=>({value:x.candidate||x.closestCandidate}),x=>({value:x.riskStatus||'—',cls:x.riskStatus==='ALLOWED'?'positive':x.riskStatus==='BLOCKED'?'negative':''}),x=>({value:x.status}),x=>({value:(x.riskReasons||x.reasons||[]).join(', ')})]);
-rows('orders',data.orders,[x=>({value:time(x.timestamp)}),x=>({value:x.purpose}),x=>({value:x.symbol}),x=>({value:x.side}),x=>({value:x.quantity}),x=>({value:money(x.limitPrice)}),x=>({value:x.filledQuantity}),x=>({value:x.averageFillPrice?money(x.averageFillPrice):'—'}),x=>({value:x.status})]);
-renderTuning(data.tuning||{entries:[]},data.orders||[]);renderPotentialMisses(data.tuning);
-rows('trades',data.trades,[x=>({value:time(x.entryTimestamp)}),x=>({value:time(x.exitTimestamp)}),x=>({value:x.symbol}),x=>({value:x.direction}),x=>({value:x.quantity}),x=>({value:money(x.averageEntryPrice)}),x=>({value:x.averageExitPrice?money(x.averageExitPrice):'—'}),x=>({value:money(x.realizedPnl),cls:x.realizedPnl>0?'positive':x.realizedPnl<0?'negative':''}),x=>({value:x.returnPct===undefined?'—':num(x.returnPct)+'%'}),x=>({value:x.exitReason}),x=>({value:x.status})]);
-renderDecisionRows(data.decisions||[]);
+renderOrders(view.orderCards||view.activeOrders);
+rows('signals',view.signals||[],[x=>({value:time(x.timestamp)}),x=>({value:itemUnderlying(x)}),x=>({value:x.configVersion}),x=>({value:x.direction}),x=>({value:x.kind}),x=>({value:x.regime}),x=>({value:num(x.projectedMoveBps)+' bps'}),x=>({value:x.candidate||x.closestCandidate}),x=>({value:x.riskStatus||'—',cls:x.riskStatus==='ALLOWED'?'positive':x.riskStatus==='BLOCKED'?'negative':''}),x=>({value:x.status}),x=>({value:(x.riskReasons||x.reasons||[]).join(', ')})]);
+rows('orders',view.orders||[],[x=>({value:time(x.timestamp)}),x=>({value:itemUnderlying(x)}),x=>({value:x.purpose}),x=>({value:x.symbol}),x=>({value:x.side}),x=>({value:x.quantity}),x=>({value:money(x.limitPrice)}),x=>({value:x.filledQuantity}),x=>({value:x.averageFillPrice?money(x.averageFillPrice):'—'}),x=>({value:x.status})]);
+renderTuning(view.tuning||{entries:[]},view.orders||[]);renderPotentialMisses(view.tuning);
+rows('trades',view.trades||[],[x=>({value:time(x.entryTimestamp)}),x=>({value:time(x.exitTimestamp)}),x=>({value:itemUnderlying(x)}),x=>({value:x.symbol}),x=>({value:x.direction}),x=>({value:x.quantity}),x=>({value:money(x.averageEntryPrice)}),x=>({value:x.averageExitPrice?money(x.averageExitPrice):'—'}),x=>({value:money(x.realizedPnl),cls:x.realizedPnl>0?'positive':x.realizedPnl<0?'negative':''}),x=>({value:x.returnPct===undefined?'—':num(x.returnPct)+'%'}),x=>({value:x.exitReason}),x=>({value:x.status})]);
+renderDecisionRows(view.decisions||[]);
 rows('feedEventsBody',live.recentEvents||[],[x=>({value:time(x.receivedTimestamp)}),x=>({value:x.channel.replaceAll('_',' ')}),x=>({value:x.type.replaceAll('_',' ')}),x=>({value:x.symbol}),x=>({value:x.summary}),x=>({value:x.latencyMs+' ms'}),x=>({value:storagePolicy(x,live),cls:live.persistenceEnabled?'positive':'muted'})],'No market events received yet. Connection cards above continue to show system liveness.');
 $('updated').textContent='Display day '+data.displayDate+' · Updated '+new Date(data.generatedAt).toLocaleString()+' · resets at 10:00 PM Pacific';
 }catch(error){$('stateText').textContent='DASHBOARD ERROR';$('state').className='halted';$('updated').textContent=String(error)}

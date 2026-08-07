@@ -1,7 +1,7 @@
 import type { EngineConfig } from "../config.js";
 import type { AccountState, Direction, PositionState, RiskDecision } from "../types.js";
 import { marketDate } from "../utils/time.js";
-import { sameDaySpyOptionSymbolReasons } from "../options/tradingInvariants.js";
+import { sameDayOptionSymbolReasons } from "../options/tradingInvariants.js";
 import { lateEntryGuardActive } from "../strategy/lateEntryGuard.js";
 
 export interface DailyRiskState {
@@ -77,9 +77,13 @@ export class RiskManager {
     symbol: string, direction: Direction, quantity: number, averageFillPrice: number, timestamp: number,
     underlyingEntryPrice?: number,
   ): PositionState {
-    const invariantReasons = sameDaySpyOptionSymbolReasons(symbol, timestamp, this.#config.timeZone);
+    const invariantReasons = sameDayOptionSymbolReasons(
+      symbol, timestamp, this.#config.timeZone, this.#config.symbol,
+    );
     if (invariantReasons.length > 0) {
-      throw new Error(`Cannot create a non-0DTE SPY option position for ${symbol}: ${invariantReasons.join(",")}`);
+      throw new Error(
+        `Cannot create a non-0DTE ${this.#config.symbol} option position for ${symbol}: ${invariantReasons.join(",")}`,
+      );
     }
     return {
       symbol,

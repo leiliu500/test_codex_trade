@@ -29,7 +29,7 @@ export interface AlpacaOptionStreamConfig {
 export class AlpacaOptionWebSocket implements OptionStream {
   readonly #config: Required<Omit<AlpacaOptionStreamConfig, "url">> & { url: string };
   readonly #symbols = new Set<string>();
-  readonly #pendingQuotes: OptionQuote[] = [];
+  readonly #pendingLatestQuotes = new Map<string, OptionQuote>();
   #socket: WebSocket | undefined;
   #handlers: OptionStreamHandlers | undefined;
   #authenticated = false;
@@ -231,7 +231,12 @@ export class AlpacaOptionWebSocket implements OptionStream {
   }
 
   #enqueueQuotes(quotes: readonly OptionQuote[]): void {
-    this.#pendingQuotes.push(...quotes);
+    for (const quote of quotes) {
+      const pending = this.#pendingLatestQuotes.get(quote.symbol);
+      if (!pending || quote.timestamp >= pending.timestamp) {
+        this.#pendingLatestQuotes.set(quote.symbol, quote);
+      }
+    }
     if (this.#dispatching) return;
     this.#dispatching = true;
     this.#dispatchTail = this.#drainQuotes();
@@ -239,20 +244,27 @@ export class AlpacaOptionWebSocket implements OptionStream {
 
   async #drainQuotes(): Promise<void> {
     try {
-      while (this.#pendingQuotes.length > 0) {
-        const quotes = this.#pendingQuotes.splice(0);
+      while (this.#pendingLatestQuotes.size > 0) {
+        const quotes = [...this.#pendingLatestQuotes.values()]
+          .sort((left, right) => left.timestamp - right.timestamp || left.symbol.localeCompare(right.symbol));
+        this.#pendingLatestQuotes.clear();
         const handlers = this.#handlers;
-        if (!handlers) continue;
-        if (handlers.onQuotes) await handlers.onQuotes(quotes);
-        else for (const quote of quotes) await handlers.onQuote(quote);
+        if (handlers) {
+          if (handlers.onQuotes) await handlers.onQuotes(quotes);
+          else for (const quote of quotes) await handlers.onQuote(quote);
+        }
       }
     } catch (error) {
-      this.#pendingQuotes.length = 0;
+      this.#pendingLatestQuotes.clear();
       this.#handlers?.onError?.(error);
       this.#socket?.close();
     } finally {
       this.#dispatching = false;
-      if (this.#pendingQuotes.length > 0) this.#enqueueQuotes([]);
+      if (this.#pendingLatestQuotes.size > 0) {
+        const quotes = [...this.#pendingLatestQuotes.values()];
+        this.#pendingLatestQuotes.clear();
+        this.#enqueueQuotes(quotes);
+      }
     }
   }
 

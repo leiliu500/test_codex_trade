@@ -1,7 +1,7 @@
 import type { EngineConfig } from "../config.js";
 import type { Direction, OptionContract } from "../types.js";
 import { marketDate, secondsSinceMidnight, parseClock } from "../utils/time.js";
-import { assertSameDaySpyOptionOrder, sameDaySpyOptionContractReasons } from "./tradingInvariants.js";
+import { assertSameDayOptionOrder, sameDayOptionContractReasons } from "./tradingInvariants.js";
 
 export function coarseUniverseFilter(
   contracts: readonly OptionContract[], direction: Direction, spot: number, now: number, config: EngineConfig,
@@ -10,7 +10,8 @@ export function coarseUniverseFilter(
   const neededType = direction === "BULLISH" ? "call" : "put";
   return contracts.filter((contract) => {
     return contract.active && contract.tradable && contract.type === neededType &&
-      contract.expirationDate === date && sameDaySpyOptionContractReasons(contract, now, config.timeZone).length === 0 &&
+      contract.expirationDate === date &&
+      sameDayOptionContractReasons(contract, now, config.timeZone, config.symbol).length === 0 &&
       Math.abs(contract.strike / spot - 1) <= config.options.strikeRangePct &&
       secondsSinceMidnight(now, config.timeZone) <= parseClock(config.options.zeroDteEntryCutoff);
   });
@@ -35,7 +36,7 @@ export class OptionUniverseManager {
   readonly #retained = new Set<string>();
   constructor(config: EngineConfig) { this.#config = config; }
   retainOpenPosition(symbol: string, now: number): void {
-    assertSameDaySpyOptionOrder(symbol, "sell", now, this.#config);
+    assertSameDayOptionOrder(symbol, "sell", now, this.#config);
     this.#retained.add(symbol);
   }
   releaseClosedPosition(symbol: string): void { this.#retained.delete(symbol); }

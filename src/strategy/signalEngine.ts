@@ -562,7 +562,8 @@ export class SignalEngine {
     direction: Direction, kind: "IMPULSE" | "GRIND", projectedMoveBps: number,
     votes: SignalVote[], feature: FeatureSnapshot, regime: RegimeDecision, reasons: string[],
   ): TradeSignal {
-    const id = `sig-${feature.timestamp}-${hashString(stableStringify({ direction, kind, price: feature.price }))}`;
+    const prefix = feature.symbol === "SPY" ? "sig" : `sig-${feature.symbol.toLowerCase()}`;
+    const id = `${prefix}-${feature.timestamp}-${hashString(stableStringify({ direction, kind, price: feature.price }))}`;
     return { id, timestamp: feature.timestamp, direction, kind, regime: regime.regime, projectedMoveBps, votes, reasons, featureSnapshot: feature };
   }
 }

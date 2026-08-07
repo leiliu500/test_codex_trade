@@ -187,7 +187,7 @@ function modelOptionState(
   config: EngineConfig,
 ): ModeledOptionState | undefined {
   const contract = parseOccSymbol(position.symbol);
-  if (!contract || contract.underlying !== "SPY" || !(spot !== undefined && spot > 0)) {
+  if (!contract || contract.underlying !== config.symbol || !(spot !== undefined && spot > 0)) {
     return undefined;
   }
   const expiry = zonedDateTimeToEpoch(

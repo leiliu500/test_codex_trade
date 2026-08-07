@@ -96,6 +96,8 @@ class FakeRuntimeClient implements SpyOptionsRuntimeClient {
   };
   clock = { timestamp: now, isOpen: true };
   latestQuoteCalls = 0;
+  latestOptionQuoteCalls = 0;
+  latestOptionQuotes: OptionQuote[] = [];
   listContractCalls = 0;
   contractListGate: Promise<void> | undefined;
   async getAccount(): Promise<AccountState> { return { ...this.account }; }
@@ -114,6 +116,11 @@ class FakeRuntimeClient implements SpyOptionsRuntimeClient {
       symbol, timestamp: now - 86_400_000, impliedVolatility: 0.22, greeks: { delta: 0.52, gamma: 0.02 },
       dailyVolume: 1_000, openInterest: 5_000,
     }));
+  }
+  async getLatestOptionQuotes(symbols: readonly string[]): Promise<OptionQuote[]> {
+    this.latestOptionQuoteCalls += 1;
+    const requested = new Set(symbols);
+    return this.latestOptionQuotes.filter((quote) => requested.has(quote.symbol)).map((quote) => ({ ...quote }));
   }
   async submitOrder(request: BrokerOrderRequest): Promise<BrokerOrder> {
     this.requests.push({ ...request });
@@ -354,7 +361,13 @@ test("OPRA quote silence fails readiness and reconnects the option stream", asyn
   await waitFor(() => optionStream.connectCalls === 2, 2_000);
   assert.equal(runtime.healthState().optionQuoteStalled, false);
   assert.equal(runtime.healthState().optionWebsocketConnected, true);
-  assert.equal(runtime.healthState().ready, true);
+  assert.equal(runtime.healthState().optionQuotePrimed, false);
+  assert.equal(runtime.healthState().ready, false);
+  await runtime.ingestFeature({ ...bullishFeature(), timestamp: decisionTime });
+  const warmingEvaluation = recorder.events
+    .filter((event) => event.type === "live_entry_evaluation")
+    .at(-1);
+  assert.deepEqual(warmingEvaluation?.data.reasons, ["OPTION_FEED_NOT_READY"]);
   await optionStream.quote({
     symbol: callSymbol,
     timestamp: decisionTime,
@@ -366,18 +379,161 @@ test("OPRA quote silence fails readiness and reconnects the option stream", asyn
   assert.equal(runtime.healthState().receivedOptionQuotes, 1);
   assert.equal(runtime.healthState().lastOptionQuoteAgeMs, 0);
   assert.equal(runtime.healthState().lastOptionQuoteProviderAgeMs, 0);
+  assert.equal(runtime.healthState().optionQuotePrimed, true);
+  assert.equal(runtime.healthState().ready, true);
+  await runtime.close();
+});
+
+test("OPRA provider lag degrades readiness and blocks entries before receive silence", async () => {
+  let decisionTime = now;
+  const client = new FakeRuntimeClient();
+  const optionStream = new FakeOptionStream();
+  const recorder = new MemoryRecorder();
+  const runtime = new SpyOptionsTradingRuntime({
+    config: defaultConfig,
+    client,
+    stockStream: new FakeStockStream(),
+    optionStream,
+    executionEnabled: true,
+    executionMode: "paper",
+    now: () => decisionTime,
+    executionTickMs: 10,
+    recorder,
+  });
+  await runtime.start();
+  await optionStream.quote({
+    symbol: callSymbol,
+    timestamp: decisionTime,
+    bidPrice: 1.995,
+    askPrice: 2.005,
+    bidSize: 100,
+    askSize: 100,
+  });
+
+  client.latestOptionQuotes = [{
+    symbol: callSymbol,
+    timestamp: decisionTime,
+    bidPrice: 1.995,
+    askPrice: 2.005,
+    bidSize: 100,
+    askSize: 100,
+  }];
+  decisionTime += defaultConfig.dataQuality.maxOptionQuoteAgeMs + 1;
+  client.clock.timestamp = decisionTime;
+  const lagged = runtime.healthState();
+  assert.equal(lagged.ready, false);
+  assert.equal(lagged.optionQuoteProviderLagged, true);
+  assert.equal(lagged.optionQuoteStalled, false);
+  assert.equal(lagged.optionWebsocketConnected, true);
+  assert.equal(lagged.lastOptionQuoteAgeMs, defaultConfig.dataQuality.maxOptionQuoteAgeMs + 1);
+  assert.equal(lagged.lastOptionQuoteProviderAgeMs, defaultConfig.dataQuality.maxOptionQuoteAgeMs + 1);
+  assert.equal(lagged.optionQuoteFreshnessThresholdMs, defaultConfig.dataQuality.maxOptionQuoteAgeMs);
+
+  await runtime.ingestFeature({ ...bullishFeature(), timestamp: decisionTime });
+  const blockedEvaluation = recorder.events
+    .filter((event) => event.type === "live_entry_evaluation")
+    .at(-1);
+  assert.deepEqual(blockedEvaluation?.data.reasons, ["OPTION_FEED_PROVIDER_LAGGED"]);
+  await waitFor(() => client.latestOptionQuoteCalls > 0);
+  const staleRestResult = recorder.events
+    .filter((event) => event.type === "option_rest_fallback_result")
+    .at(-1);
+  assert.equal(staleRestResult?.data.freshQuotes, 0);
+  assert.equal(staleRestResult?.data.reconnectScheduled, false);
+  assert.equal(runtime.healthState().optionRestFallbackFreshQuotes, 0);
+  assert.equal(runtime.healthState().optionQuoteProviderLagged, true);
+
+  decisionTime = now + OPTION_QUOTE_STALL_TIMEOUT_MS + 1;
+  client.clock.timestamp = decisionTime;
+  await optionStream.quote({
+    symbol: callSymbol,
+    timestamp: now,
+    bidPrice: 1.995,
+    askPrice: 2.005,
+    bidSize: 100,
+    askSize: 100,
+  });
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  assert.equal(runtime.healthState().optionQuoteProviderLagged, true);
+  assert.equal(runtime.healthState().optionQuoteStalled, false);
+  assert.equal(runtime.healthState().optionWebsocketConnected, true);
+  assert.equal(optionStream.connectCalls, 1);
+  await runtime.close();
+});
+
+test("fresh explicit OPRA REST quotes recover stale WebSocket pricing and trigger a bounded reconnect", async () => {
+  let decisionTime = now;
+  const client = new FakeRuntimeClient();
+  const optionStream = new FakeOptionStream();
+  const recorder = new MemoryRecorder();
+  const runtime = new SpyOptionsTradingRuntime({
+    config: immediateRuntimeConfig,
+    client,
+    stockStream: new FakeStockStream(),
+    optionStream,
+    executionEnabled: true,
+    executionMode: "paper",
+    now: () => decisionTime,
+    executionTickMs: 10,
+    recorder,
+  });
+  await runtime.start();
+  await optionStream.quote({
+    symbol: callSymbol,
+    timestamp: decisionTime,
+    bidPrice: 1.80,
+    askPrice: 1.82,
+    bidSize: 100,
+    askSize: 100,
+  });
+
+  decisionTime += immediateRuntimeConfig.dataQuality.maxOptionQuoteAgeMs + 1;
+  client.clock.timestamp = decisionTime;
+  client.latestOptionQuotes = [{
+    symbol: callSymbol,
+    timestamp: decisionTime,
+    bidPrice: 1.995,
+    askPrice: 2.005,
+    bidSize: 100,
+    askSize: 100,
+  }];
+  await waitFor(() => (runtime.healthState().optionRestFallbackFreshQuotes ?? 0) > 0);
+
+  const recovered = runtime.healthState();
+  assert.equal(recovered.optionQuoteProviderLagged, false);
+  assert.equal(recovered.ready, true);
+  assert.equal(recovered.lastOptionRestQuoteProviderAgeMs, 0);
+  assert.equal(recovered.optionRestFallbackRequests, 1);
+  const restResult = recorder.events
+    .filter((event) => event.type === "option_rest_fallback_result")
+    .at(-1);
+  assert.equal(restResult?.data.requestedContracts, 1);
+  assert.equal(restResult?.data.freshQuotes, 1);
+  assert.equal(restResult?.data.reconnectScheduled, true);
+  assert.equal(runtime.healthState().reconnectAttempt, 1);
+
+  await runtime.ingestFeature({ ...bullishFeature(), timestamp: decisionTime });
+  assert.equal(client.requests.length, 1);
+  assert.equal(client.requests[0]?.symbol, callSymbol);
+  const selection = recorder.events.filter((event) => event.type === "live_signal_selection").at(-1);
+  assert.deepEqual(selection?.data.candidateQuote, {
+    timestamp: decisionTime,
+    bidPrice: 1.995,
+    askPrice: 2.005,
+  });
   await runtime.close();
 });
 
 test("entry evaluation fails closed when the live stock feed is disconnected", async () => {
   const client = new FakeRuntimeClient();
   const stockStream = new FakeStockStream();
+  const optionStream = new FakeOptionStream();
   const recorder = new MemoryRecorder();
   const runtime = new SpyOptionsTradingRuntime({
     config: immediateRuntimeConfig,
     client,
     stockStream,
-    optionStream: new FakeOptionStream(),
+    optionStream,
     executionEnabled: true,
     executionMode: "paper",
     now: () => now,
@@ -385,6 +541,14 @@ test("entry evaluation fails closed when the live stock feed is disconnected", a
     recorder,
   });
   await runtime.start();
+  await optionStream.quote({
+    symbol: callSymbol,
+    timestamp: now,
+    bidPrice: 1.995,
+    askPrice: 2.005,
+    bidSize: 100,
+    askSize: 100,
+  });
   stockStream.handlers?.onState?.(false);
   assert.equal(runtime.healthState().ready, false);
 
@@ -408,13 +572,16 @@ test("end-to-end paper runtime arms SIP/OPRA and routes an eligible signal to a 
     executionMode: "paper", now: () => now, executionTickMs: 60_000, history, recorder,
   });
   await runtime.start();
-  assert.equal(runtime.healthState().ready, true);
+  assert.equal(runtime.healthState().optionQuotePrimed, false);
+  assert.equal(runtime.healthState().ready, false);
   assert.equal(runtime.healthState().accountOptionsApproved, true);
   assert.deepEqual([...optionStream.subscribed], [callSymbol]);
 
   await optionStream.quote({
     symbol: callSymbol, timestamp: now, bidPrice: 1.995, askPrice: 2.005, bidSize: 100, askSize: 100,
   });
+  assert.equal(runtime.healthState().optionQuotePrimed, true);
+  assert.equal(runtime.healthState().ready, true);
   await runtime.ingestFeature(bullishFeature());
 
   assert.equal(client.requests.length, 1);
@@ -877,12 +1044,13 @@ test("late-session audit preserves an unguarded baseline while active follow-thr
   const decisionTime = zonedDateTimeToEpoch(date, "12:10:00");
   const client = new FakeRuntimeClient();
   client.clock.timestamp = decisionTime;
+  const optionStream = new FakeOptionStream();
   const recorder = new MemoryRecorder();
   const runtime = new SpyOptionsTradingRuntime({
     config: defaultConfig,
     client,
     stockStream: new FakeStockStream(),
-    optionStream: new FakeOptionStream(),
+    optionStream,
     executionEnabled: true,
     executionMode: "paper",
     now: () => decisionTime,
@@ -890,6 +1058,14 @@ test("late-session audit preserves an unguarded baseline while active follow-thr
     recorder,
   });
   await runtime.start();
+  await optionStream.quote({
+    symbol: callSymbol,
+    timestamp: decisionTime,
+    bidPrice: 1.995,
+    askPrice: 2.005,
+    bidSize: 100,
+    askSize: 100,
+  });
   await runtime.ingestFeature({ ...bullishFeature(), timestamp: decisionTime });
 
   const evaluation = recorder.events.find((event) => event.type === "live_entry_evaluation");

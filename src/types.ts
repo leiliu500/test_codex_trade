@@ -1,9 +1,10 @@
 export type Direction = "BULLISH" | "BEARISH";
 export type SignalKind = "IMPULSE" | "GRIND";
 export type OptionType = "call" | "put";
+export type UnderlyingSymbol = "SPY" | "QQQ";
 
 export interface StockQuote {
-  symbol: "SPY";
+  symbol: UnderlyingSymbol;
   timestamp: number;
   bidPrice: number;
   askPrice: number;
@@ -15,7 +16,7 @@ export interface StockQuote {
 }
 
 export interface StockTrade {
-  symbol: "SPY";
+  symbol: UnderlyingSymbol;
   timestamp: number;
   price: number;
   size: number;
@@ -48,7 +49,7 @@ export interface OptionSnapshot {
 
 export interface OptionContract {
   symbol: string;
-  underlying: "SPY";
+  underlying: UnderlyingSymbol;
   expirationDate: string;
   strike: number;
   type: OptionType;
@@ -140,7 +141,7 @@ export interface ThresholdProfile {
 }
 
 export interface FeatureSnapshot {
-  symbol: "SPY";
+  symbol: UnderlyingSymbol;
   timestamp: number;
   marketDate: string;
   price: number;
@@ -379,4 +380,4 @@ export type ReplayEvent =
   | { type: "option_contract"; timestamp: number; data: OptionContract }
   | { type: "option_quote"; timestamp: number; data: OptionQuote }
   | { type: "option_snapshot"; timestamp: number; data: OptionSnapshot }
-  | { type: "prior_close"; timestamp: number; data: { symbol: "SPY"; close: number } };
+  | { type: "prior_close"; timestamp: number; data: { symbol: UnderlyingSymbol; close: number } };

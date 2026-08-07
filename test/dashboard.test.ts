@@ -47,6 +47,11 @@ test("dashboard exposes liveness and feed tabs before any entries, orders, or hi
   assert.match(html, /Potential Missed Entry Review/);
   assert.match(html, /Entry Gate Blocks/);
   assert.match(html, /Strategy state/);
+  assert.match(html, /Dashboard scope/);
+  assert.match(html, /SPY only/);
+  assert.match(html, /QQQ only/);
+  assert.match(html, /underlyingViews/);
+  assert.match(html, /Showing isolated/);
   assert.match(html, /Order manager/);
   assert.match(html, /Executable P&L/);
   assert.match(html, /Profit floor/);
@@ -77,6 +82,12 @@ test("dashboard exposes liveness and feed tabs before any entries, orders, or hi
   assert.match(html, /resets at 10:00 PM Pacific/);
   assert.match(html, /h\.receivedOptionQuotes/);
   assert.match(html, /h\.lastOptionQuoteAgeMs/);
+  assert.match(html, /h\.lastOptionQuoteProviderAgeMs/);
+  assert.match(html, /h\.lastOptionRestQuoteProviderAgeMs/);
+  assert.match(html, /h\.optionRestFallbackRequests/);
+  assert.match(html, /h\.optionRestFallbackFreshQuotes/);
+  assert.match(html, /h\.optionQuotePrimed/);
+  assert.match(html, /h\.optionQuoteProviderLagged/);
   assert.match(html, /h\.optionQuoteStalled/);
   assert.match(html, /h\.stockWebsocketConnected/);
   assert.match(html, /strategyBuilding\?'BUILDING'/);

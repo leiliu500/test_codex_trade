@@ -106,6 +106,7 @@ test("replay results identify the exact strategy, fill, calibration, and fee ass
     feesPerContractRoundTrip: 1.3,
   });
   assert.deepEqual(result.metadata, {
+    underlying: "SPY",
     configVersion: defaultConfig.version,
     fillModel: "queue",
     calibrationVersion: null,
