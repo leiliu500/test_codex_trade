@@ -826,8 +826,10 @@ export class SpyOptionsTradingRuntime {
     const streamsConnected = stock.websocketConnected && this.#optionConnected;
     const streamsReady = this.#marketDataIdle || streamsConnected;
     const hasOptionExposure = this.#execution.position !== undefined || this.#execution.pending !== undefined;
-    const universeReady = this.#subscribedSymbols.size > 0 ||
-      !optionUniverseRequired(now, this.#marketOpen, hasOptionExposure, this.#config);
+    const optionSubscriptionsRequired = optionUniverseRequired(
+      now, this.#marketOpen, hasOptionExposure, this.#config,
+    );
+    const universeReady = this.#subscribedSymbols.size > 0 || !optionSubscriptionsRequired;
     const strategyReady = !this.#executionEnabled || !this.#marketOpen || this.#strategyStateReady;
     const optionQuoteSilenceAgeMs = this.#optionQuoteSilenceAgeMs(now);
     const optionQuoteProviderAgeMs = this.#optionQuoteProviderAgeMs(now);
@@ -854,6 +856,7 @@ export class SpyOptionsTradingRuntime {
       optionQuoteFreshnessThresholdMs: this.#config.dataQuality.maxOptionQuoteAgeMs,
       optionQuoteStalled,
       optionQuoteStallThresholdMs: OPTION_QUOTE_STALL_TIMEOUT_MS,
+      optionSubscriptionsRequired,
       optionRestFallbackEnabled: this.#client.getLatestOptionQuotes !== undefined,
       optionRestFallbackInFlight: this.#optionRestRecoveryInFlight !== undefined,
       optionRestFallbackRequests: this.#optionRestFallbackRequests,

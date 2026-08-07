@@ -89,6 +89,10 @@ test("dashboard exposes liveness and feed tabs before any entries, orders, or hi
   assert.match(html, /h\.optionQuotePrimed/);
   assert.match(html, /h\.optionQuoteProviderLagged/);
   assert.match(html, /h\.optionQuoteStalled/);
+  assert.match(html, /h\.optionSubscriptionsRequired/);
+  assert.match(html, /opraSubscriptionIdle/);
+  assert.match(html, /ENTRY CUTOFF · NO ACTIVE EXPOSURE/);
+  assert.match(html, /session WS quotes/);
   assert.match(html, /h\.stockWebsocketConnected/);
   assert.match(html, /strategyBuilding\?'BUILDING'/);
   assert.match(html, /h\.strategyOpeningRangeEnd/);

@@ -18,6 +18,7 @@ export interface HealthState {
   optionQuoteFreshnessThresholdMs?: number;
   optionQuoteStalled?: boolean;
   optionQuoteStallThresholdMs?: number;
+  optionSubscriptionsRequired?: boolean;
   optionRestFallbackEnabled?: boolean;
   optionRestFallbackInFlight?: boolean;
   optionRestFallbackRequests?: number;
@@ -103,6 +104,7 @@ export function combineHealthStates(states: Readonly<Record<string, HealthState>
     ...(optionQuoteFreshnessThresholdMs !== undefined ? { optionQuoteFreshnessThresholdMs } : {}),
     optionQuoteStalled: values.some((state) => state.optionQuoteStalled === true),
     ...(optionQuoteStallThresholdMs !== undefined ? { optionQuoteStallThresholdMs } : {}),
+    optionSubscriptionsRequired: values.some((state) => state.optionSubscriptionsRequired === true),
     optionRestFallbackEnabled: values.some((state) => state.optionRestFallbackEnabled === true),
     optionRestFallbackInFlight: values.some((state) => state.optionRestFallbackInFlight === true),
     optionRestFallbackRequests: sum("optionRestFallbackRequests"),

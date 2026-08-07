@@ -115,6 +115,7 @@ test("combined health exposes the worst per-symbol OPRA provider lag", () => {
       optionQuoteFreshnessThresholdMs: 2_000,
       optionQuoteStalled: false,
       optionQuoteStallThresholdMs: 10_000,
+      optionSubscriptionsRequired: true,
       optionRestFallbackEnabled: true,
       optionRestFallbackInFlight: false,
       optionRestFallbackRequests: 2,
@@ -132,6 +133,7 @@ test("combined health exposes the worst per-symbol OPRA provider lag", () => {
       optionQuoteFreshnessThresholdMs: 2_000,
       optionQuoteStalled: false,
       optionQuoteStallThresholdMs: 10_000,
+      optionSubscriptionsRequired: false,
       optionRestFallbackEnabled: true,
       optionRestFallbackInFlight: true,
       optionRestFallbackRequests: 3,
@@ -148,6 +150,7 @@ test("combined health exposes the worst per-symbol OPRA provider lag", () => {
   assert.equal(combined.optionQuoteProviderLagged, true);
   assert.equal(combined.optionQuoteFreshnessThresholdMs, 2_000);
   assert.equal(combined.optionQuoteStalled, false);
+  assert.equal(combined.optionSubscriptionsRequired, true);
   assert.equal(combined.optionRestFallbackEnabled, true);
   assert.equal(combined.optionRestFallbackInFlight, true);
   assert.equal(combined.optionRestFallbackRequests, 5);
