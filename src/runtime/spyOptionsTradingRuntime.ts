@@ -153,6 +153,8 @@ export class SpyOptionsTradingRuntime {
   #retainedPositionSymbol: string | undefined;
   #lastError: string | undefined;
   #lastClockCheck = -Infinity;
+  #marketClockAvailable = false;
+  #lastMarketClockError: string | undefined;
   #strategyStateReady = false;
   #strategyStateStatus = "NOT_RESTORED";
   #strategyStateMarketDate: string | undefined;
@@ -260,6 +262,8 @@ export class SpyOptionsTradingRuntime {
       this.#account = account;
       this.#marketOpen = clock.isOpen;
       this.#lastClockCheck = this.#now();
+      this.#marketClockAvailable = true;
+      this.#lastMarketClockError = undefined;
       if (!account.active) throw new Error("Paper broker account is inactive or blocked");
       if (!account.optionsApproved) throw new Error("Paper broker account is not approved for options");
       if (clock.isOpen) {
@@ -841,7 +845,7 @@ export class SpyOptionsTradingRuntime {
       ...stock,
       ready: streamsReady && brokerReady && universeReady && strategyReady && recorderHealthy &&
         optionQuotePrimed && !optionQuoteProviderLagged && !optionQuoteStalled &&
-        !this.#execution.halted && !this.#queue.halted,
+        this.#marketClockAvailable && !this.#execution.halted && !this.#queue.halted,
       brokerRequired: this.#executionEnabled,
       optionDataFeed: "opra",
       receivedOptionQuotes: this.#optionQuoteCount,
@@ -886,6 +890,8 @@ export class SpyOptionsTradingRuntime {
       brokerAvailable: this.#brokerAvailable,
       marketClockState: this.#marketOpen ? "market-open" :
         this.#marketDataIdle ? "market-closed-idle" : "market-closed",
+      marketClockAvailable: this.#marketClockAvailable,
+      ...(this.#lastMarketClockError ? { lastMarketClockError: this.#lastMarketClockError } : {}),
       openOrderCount: this.#execution.pending ? 1 : 0,
       positionsReconciled: this.#positionsReconciled,
       recorderHealthy,
@@ -907,6 +913,7 @@ export class SpyOptionsTradingRuntime {
     if (this.#execution.safeMode) reasons.push("EXECUTION_SAFE_MODE");
     if (this.#executionEnabled && !this.#brokerAvailable) reasons.push("BROKER_UNAVAILABLE");
     if (this.#executionEnabled && !this.#positionsReconciled) reasons.push("POSITIONS_NOT_RECONCILED");
+    if (this.#executionEnabled && !this.#marketClockAvailable) reasons.push("MARKET_CLOCK_UNAVAILABLE");
     if (this.#executionEnabled &&
         (this.#account?.active !== true || this.#account.optionsApproved !== true)) {
       reasons.push("ACCOUNT_NOT_READY");
@@ -1161,7 +1168,12 @@ export class SpyOptionsTradingRuntime {
     if (this.#marketDataIdle && timestamp - this.#lastClockCheck < CLOSED_MARKET_CLOCK_POLL_MS) return;
     this.#scheduleOptionRestRecovery(timestamp);
     void this.#queue.enqueue(async () => {
-      await this.#refreshMarketSession(timestamp);
+      try {
+        await this.#refreshMarketSession(timestamp);
+      } catch (error) {
+        this.#recordError(error);
+        return;
+      }
       if (!this.#marketDataIdle && this.#marketOpen) {
         await this.#checkOptionQuoteLiveness(timestamp);
         if (this.#pendingOptionSelection) {
@@ -1404,8 +1416,17 @@ export class SpyOptionsTradingRuntime {
   async #refreshMarketSession(timestamp: number): Promise<void> {
     const interval = this.#marketDataIdle ? CLOSED_MARKET_CLOCK_POLL_MS : OPEN_MARKET_CLOCK_POLL_MS;
     if (timestamp - this.#lastClockCheck < interval) return;
-    const clock = await this.#client.getMarketClock();
     this.#lastClockCheck = timestamp;
+    let clock: Awaited<ReturnType<SpyOptionsRuntimeClient["getMarketClock"]>>;
+    try {
+      clock = await this.#client.getMarketClock();
+    } catch (error) {
+      this.#marketClockAvailable = false;
+      this.#lastMarketClockError = error instanceof Error ? error.message : String(error);
+      throw error;
+    }
+    this.#marketClockAvailable = true;
+    this.#lastMarketClockError = undefined;
     this.#marketOpen = clock.isOpen;
     if (!clock.isOpen && !this.#marketDataIdle) {
       await this.#enterMarketClosedIdle(clock.timestamp);

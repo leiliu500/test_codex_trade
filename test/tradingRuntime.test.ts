@@ -95,13 +95,19 @@ class FakeRuntimeClient implements SpyOptionsRuntimeClient {
     equity: 100_000, optionBuyingPower: 25_000, active: true, optionsApproved: true, killSwitch: false,
   };
   clock = { timestamp: now, isOpen: true };
+  marketClockCalls = 0;
+  marketClockError: Error | undefined;
   latestQuoteCalls = 0;
   latestOptionQuoteCalls = 0;
   latestOptionQuotes: OptionQuote[] = [];
   listContractCalls = 0;
   contractListGate: Promise<void> | undefined;
   async getAccount(): Promise<AccountState> { return { ...this.account }; }
-  async getMarketClock(): Promise<{ timestamp: number; isOpen: boolean }> { return { ...this.clock }; }
+  async getMarketClock(): Promise<{ timestamp: number; isOpen: boolean }> {
+    this.marketClockCalls += 1;
+    if (this.marketClockError) throw this.marketClockError;
+    return { ...this.clock };
+  }
   async getLatestSpySipQuote(): Promise<StockQuote> {
     this.latestQuoteCalls += 1;
     return { symbol: "SPY", timestamp: now, bidPrice: 500.99, askPrice: 501.01, bidSize: 100, askSize: 100 };
@@ -279,6 +285,48 @@ test("market-closed startup remains idle without SIP, OPRA, universe, or strateg
   await runtime.ingestFeature({ ...bullishFeature(), timestamp: closedAt });
   assert.equal(recorder.events.length, eventCount);
   assert.ok(recorder.events.some((event) => event.type === "market_session_idle"));
+  await runtime.close();
+});
+
+test("transient closed-market clock failures degrade safely and recover without halting the decision queue", async () => {
+  let decisionTime = zonedDateTimeToEpoch(date, "16:30:00");
+  const client = new FakeRuntimeClient();
+  client.clock = { timestamp: decisionTime, isOpen: false };
+  const errors: unknown[] = [];
+  const runtime = new SpyOptionsTradingRuntime({
+    config: defaultConfig,
+    client,
+    stockStream: new FakeStockStream(),
+    optionStream: new FakeOptionStream(),
+    executionEnabled: true,
+    executionMode: "paper",
+    now: () => decisionTime,
+    executionTickMs: 10,
+    recorder: new MemoryRecorder(),
+    onError: (error) => errors.push(error),
+  });
+  await runtime.start();
+  assert.equal(client.marketClockCalls, 1);
+  assert.equal(runtime.healthState().marketClockAvailable, true);
+  assert.equal(runtime.healthState().ready, true);
+
+  client.marketClockError = new Error("transient market clock failure");
+  decisionTime += 30_001;
+  await waitFor(() => client.marketClockCalls === 2);
+  assert.equal(runtime.healthState().marketClockAvailable, false);
+  assert.equal(runtime.healthState().lastMarketClockError, "transient market clock failure");
+  assert.equal(runtime.healthState().ready, false);
+  assert.equal(errors.length, 1);
+  await new Promise<void>((resolve) => setTimeout(resolve, 25));
+  assert.equal(client.marketClockCalls, 2);
+  assert.equal(errors.length, 1);
+
+  client.marketClockError = undefined;
+  decisionTime += 30_001;
+  await waitFor(() => client.marketClockCalls === 3);
+  assert.equal(runtime.healthState().marketClockAvailable, true);
+  assert.equal(runtime.healthState().lastMarketClockError, undefined);
+  assert.equal(runtime.healthState().ready, true);
   await runtime.close();
 });
 

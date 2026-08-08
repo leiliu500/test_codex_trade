@@ -47,6 +47,8 @@ export interface HealthState {
   websocketConnected: boolean;
   brokerAvailable: boolean;
   marketClockState: string;
+  marketClockAvailable?: boolean;
+  lastMarketClockError?: string;
   openOrderCount: number;
   positionsReconciled: boolean;
   recorderHealthy: boolean;
@@ -135,6 +137,10 @@ export function combineHealthStates(states: Readonly<Record<string, HealthState>
     subscribedOptionContracts: sum("subscribedOptionContracts"),
     brokerAvailable: values.filter((state) => state.brokerRequired !== false).every((state) => state.brokerAvailable),
     marketClockState: marketStates.size === 1 ? values[0]!.marketClockState : "mixed",
+    marketClockAvailable: values.every((state) => state.marketClockAvailable !== false),
+    ...(values.find((state) => state.lastMarketClockError)?.lastMarketClockError
+      ? { lastMarketClockError: values.find((state) => state.lastMarketClockError)!.lastMarketClockError }
+      : {}),
     openOrderCount: sum("openOrderCount"),
     positionsReconciled: values.every((state) => state.positionsReconciled),
     recorderHealthy: values.every((state) => state.recorderHealthy),
