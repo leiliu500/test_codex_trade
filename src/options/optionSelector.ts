@@ -5,7 +5,7 @@ import { validateOptionQuote } from "../features/quoteSanitizer.js";
 import { blackScholes, impliedVolatility } from "./blackScholes.js";
 import { evaluateOptionCost, gammaAwareProjectedOptionMove } from "./costGate.js";
 import type { OptionBook, OptionBookEntry } from "./optionBook.js";
-import { sameDaySpyOptionContractReasons } from "./tradingInvariants.js";
+import { sameDayOptionContractReasons } from "./tradingInvariants.js";
 import {
   activeStaticEntryGuard, projectedMoveContinuationGuard,
 } from "../strategy/lateEntryGuard.js";
@@ -86,7 +86,9 @@ export class OptionSelector {
     const date = marketDate(signal.timestamp, this.#config.timeZone);
     if (!contract.active || !contract.tradable) rejectionReasons.push("INACTIVE_OR_NOT_TRADABLE");
     if (contract.type !== expectedType) rejectionReasons.push("WRONG_OPTION_TYPE");
-    rejectionReasons.push(...sameDaySpyOptionContractReasons(contract, signal.timestamp, this.#config.timeZone));
+    rejectionReasons.push(...sameDayOptionContractReasons(
+      contract, signal.timestamp, this.#config.timeZone, this.#config.symbol,
+    ));
     if (contract.expirationDate !== date) rejectionReasons.push("NOT_SAME_DAY_EXPIRATION");
     if (secondsSinceMidnight(signal.timestamp, this.#config.timeZone) > parseClock(this.#config.options.zeroDteEntryCutoff)) rejectionReasons.push("ZERO_DTE_CUTOFF");
     if (Math.abs(contract.strike / signal.featureSnapshot.price - 1) > this.#config.options.strikeRangePct) rejectionReasons.push("STRIKE_OUTSIDE_RANGE");

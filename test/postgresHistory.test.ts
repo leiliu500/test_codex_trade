@@ -12,6 +12,18 @@ class FakeDatabaseClient implements DatabaseClient {
   }
 }
 
+test("PostgreSQL replay export scopes stock and option history to one underlying", async () => {
+  const client = new FakeDatabaseClient();
+  const store = new PostgresHistoryStore({ connectionString: "postgresql://unused", client });
+  await store.initialize();
+  await store.loadReplayEvents("2026-07-22", "QQQ");
+  const replayQuery = client.queries.find((query) => query.text.includes("SELECT event_type, received_timestamp"));
+  assert.deepEqual(replayQuery?.values, ["2026-07-22", "QQQ"]);
+  assert.match(replayQuery?.text ?? "", /symbol = \$2/);
+  assert.match(replayQuery?.text ?? "", /symbol LIKE \(\$2 \|\| '%'\)/);
+  await store.close();
+});
+
 test("PostgreSQL history creates schema, batches market data, and durably inserts audit events", async () => {
   const client = new FakeDatabaseClient();
   const store = new PostgresHistoryStore({

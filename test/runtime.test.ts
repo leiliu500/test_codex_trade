@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import type { AddressInfo } from "node:net";
 import { readEnvironment } from "../src/utils/env.js";
-import { healthReadiness, startHealthServer, type HealthState } from "../src/ops/healthServer.js";
+import { combineHealthStates, healthReadiness, startHealthServer, type HealthState } from "../src/ops/healthServer.js";
 import type { StockStream, StockStreamEvent, StockStreamHandlers } from "../src/alpaca/stockStream.js";
 import type { StockQuote, StockTrade } from "../src/types.js";
 import { SpySipReceiver } from "../src/runtime/spySipReceiver.js";
@@ -18,6 +18,7 @@ test("runtime environment is paper-safe and validates the health listener", () =
     marketDataEnabled: false,
     stockDataFeed: "sip",
     optionDataFeed: "opra",
+    tradingSymbols: ["SPY"],
     historyDatabaseEnabled: false,
     historyQuoteSampleMs: 250,
     historyRetentionDays: 7,
@@ -68,7 +69,7 @@ test("health server exposes liveness while paper-idle readiness is degraded", as
   assert.equal(ready.status, 503);
   assert.equal((await ready.json() as { status: string }).status, "degraded");
   assert.equal(dashboardPage.status, 200);
-  assert.match(await dashboardPage.text(), /SPY 0DTE Option Day-Trade Dashboard/);
+  assert.match(await dashboardPage.text(), /0DTE Option Day-Trade Dashboard/);
   assert.equal(dashboardApi.status, 200);
   assert.equal((await dashboardApi.json() as { readiness: string }).readiness, "degraded");
 });
@@ -88,6 +89,110 @@ test("market-closed idle is healthy without connected market-data sockets", () =
     killSwitch: false,
   };
   assert.equal(healthReadiness(state).status, "ok");
+});
+
+test("combined health exposes the worst per-symbol OPRA provider lag", () => {
+  const base: HealthState = {
+    ready: true,
+    optionDataFeed: "opra",
+    subscribedOptionContracts: 24,
+    websocketConnected: true,
+    optionWebsocketConnected: true,
+    brokerAvailable: true,
+    marketClockState: "market-open",
+    openOrderCount: 0,
+    positionsReconciled: true,
+    recorderHealthy: true,
+    killSwitch: false,
+  };
+  const combined = combineHealthStates({
+    SPY: {
+      ...base,
+      lastOptionQuoteAgeMs: 50,
+      lastOptionQuoteProviderAgeMs: 500,
+      optionQuotePrimed: true,
+      optionQuoteProviderLagged: false,
+      optionQuoteDiagnosis: "HEALTHY",
+      optionTransportAgeMs: 50,
+      optionExactSymbolReceiveAgeMs: 75,
+      optionObservedContracts: 20,
+      optionActiveContracts: 12,
+      optionFreshContracts: 10,
+      optionDiagnosableContracts: 8,
+      optionDelayedContracts: 0,
+      optionQuoteFreshnessThresholdMs: 2_000,
+      optionQuoteStalled: false,
+      optionQuoteStallThresholdMs: 10_000,
+      optionSubscriptionsRequired: true,
+      optionRestFallbackEnabled: true,
+      optionRestFallbackInFlight: false,
+      optionRestFallbackRequests: 2,
+      optionRestFallbackFreshQuotes: 1,
+      optionRestRepeatedQuotes: 0,
+      optionRestCircuitState: "CLOSED",
+      optionRestCircuitFailures: 0,
+      optionRestCircuitRetryAfterMs: 0,
+      lastOptionRestFallbackAgeMs: 250,
+      lastOptionRestQuoteProviderAgeMs: 750,
+    },
+    QQQ: {
+      ...base,
+      ready: false,
+      lastOptionQuoteAgeMs: 75,
+      lastOptionQuoteProviderAgeMs: 2_500,
+      optionQuotePrimed: true,
+      optionQuoteProviderLagged: true,
+      optionQuoteDiagnosis: "PROVIDER_DELAYED",
+      optionTransportAgeMs: 75,
+      optionExactSymbolReceiveAgeMs: 100,
+      optionObservedContracts: 18,
+      optionActiveContracts: 10,
+      optionFreshContracts: 0,
+      optionDiagnosableContracts: 10,
+      optionDelayedContracts: 8,
+      optionQuoteFreshnessThresholdMs: 2_000,
+      optionQuoteStalled: false,
+      optionQuoteStallThresholdMs: 10_000,
+      optionSubscriptionsRequired: false,
+      optionRestFallbackEnabled: true,
+      optionRestFallbackInFlight: true,
+      optionRestFallbackRequests: 3,
+      optionRestFallbackFreshQuotes: 0,
+      optionRestRepeatedQuotes: 2,
+      optionRestCircuitState: "OPEN",
+      optionRestCircuitFailures: 3,
+      optionRestCircuitRetryAfterMs: 12_000,
+      lastOptionRestFallbackAgeMs: 500,
+      lastOptionRestQuoteProviderAgeMs: 2_750,
+      lastOptionRestFallbackError: "upstream timeout",
+    },
+  });
+  assert.equal(combined.ready, false);
+  assert.equal(combined.lastOptionQuoteAgeMs, 75);
+  assert.equal(combined.lastOptionQuoteProviderAgeMs, 2_500);
+  assert.equal(combined.optionQuotePrimed, true);
+  assert.equal(combined.optionQuoteProviderLagged, true);
+  assert.equal(combined.optionQuoteDiagnosis, "PROVIDER_DELAYED");
+  assert.equal(combined.optionTransportAgeMs, 75);
+  assert.equal(combined.optionObservedContracts, 38);
+  assert.equal(combined.optionFreshContracts, 10);
+  assert.equal(combined.optionDelayedContracts, 8);
+  assert.equal(combined.optionDelayedContractFraction, 8 / 18);
+  assert.equal(combined.optionQuoteFreshnessThresholdMs, 2_000);
+  assert.equal(combined.optionQuoteStalled, false);
+  assert.equal(combined.optionSubscriptionsRequired, true);
+  assert.equal(combined.optionRestFallbackEnabled, true);
+  assert.equal(combined.optionRestFallbackInFlight, true);
+  assert.equal(combined.optionRestFallbackRequests, 5);
+  assert.equal(combined.optionRestFallbackFreshQuotes, 1);
+  assert.equal(combined.optionRestRepeatedQuotes, 2);
+  assert.equal(combined.optionRestCircuitState, "OPEN");
+  assert.equal(combined.optionRestCircuitFailures, 3);
+  assert.equal(combined.optionRestCircuitRetryAfterMs, 12_000);
+  assert.equal(combined.lastOptionRestFallbackAgeMs, 500);
+  assert.equal(combined.lastOptionRestQuoteProviderAgeMs, 2_750);
+  assert.equal(combined.lastOptionRestFallbackError, "upstream timeout");
+  assert.equal(healthReadiness(combined).status, "degraded");
 });
 
 class FakeStockStream implements StockStream {

@@ -34,7 +34,7 @@ export interface SpySipRestorationSummary {
 }
 
 /**
- * Serialized SPY SIP ingestion boundary. It authenticates/subscribes through the
+ * Serialized single-underlying SIP ingestion boundary. It authenticates/subscribes through the
  * supplied stream, aggregates quotes/trades causally, and never submits orders.
  */
 export class SpySipReceiver {
@@ -101,7 +101,9 @@ export class SpySipReceiver {
   }
 
   async activate(): Promise<SpySipRestorationSummary> {
-    if (!this.#started || !this.#buffering) throw new Error("SPY SIP receiver is not buffering live events");
+    if (!this.#started || !this.#buffering) {
+      throw new Error(`${this.#config.symbol} SIP receiver is not buffering live events`);
+    }
     const firstProviderTimestamp = this.#bufferedEvents[0]?.value.timestamp;
     let quotes = 0;
     let trades = 0;
@@ -133,7 +135,7 @@ export class SpySipReceiver {
   }
 
   async #start(buffering: boolean): Promise<void> {
-    if (this.#started) throw new Error("SPY SIP receiver is already started");
+    if (this.#started) throw new Error(`${this.#config.symbol} SIP receiver is already started`);
     this.#stopping = false;
     this.#buffering = buffering;
     this.#started = true;
@@ -152,7 +154,9 @@ export class SpySipReceiver {
     source: AsyncIterable<HistoricalMarketEvent | readonly HistoricalMarketEvent[]> |
       Iterable<HistoricalMarketEvent | readonly HistoricalMarketEvent[]>,
   ): Promise<SpySipRestorationSummary> {
-    if (this.#started && !this.#buffering) throw new Error("Cannot restore SPY SIP state after live ingestion has started");
+    if (this.#started && !this.#buffering) {
+      throw new Error(`Cannot restore ${this.#config.symbol} SIP state after live ingestion has started`);
+    }
     let quotes = 0;
     let trades = 0;
     let bars = 0;
@@ -161,18 +165,19 @@ export class SpySipReceiver {
     let lastProviderTimestamp: number | undefined;
     const processItem = (item: HistoricalMarketEvent | readonly HistoricalMarketEvent[]): void => {
       for (const event of Array.isArray(item) ? item : [item]) {
-        if (event.symbol !== "SPY" || (event.type !== "stock_quote" && event.type !== "stock_trade")) continue;
+        if (event.symbol !== this.#config.symbol ||
+            (event.type !== "stock_quote" && event.type !== "stock_trade")) continue;
         const providerTimestamp = finiteNumber(event.data.timestamp) ?? event.providerTimestamp;
         firstProviderTimestamp = Math.min(firstProviderTimestamp ?? Number.POSITIVE_INFINITY, providerTimestamp);
         lastProviderTimestamp = Math.max(lastProviderTimestamp ?? -Infinity, providerTimestamp);
         let result;
         if (event.type === "stock_quote") {
-          const quote = stockQuoteFromHistory(event);
+          const quote = stockQuoteFromHistory(event, this.#config.symbol);
           if (!quote) { rejectedEvents += 1; continue; }
           quotes += 1;
           result = this.#aggregator.ingestQuote(quote);
         } else {
-          const trade = stockTradeFromHistory(event);
+          const trade = stockTradeFromHistory(event, this.#config.symbol);
           if (!trade) { rejectedEvents += 1; continue; }
           trades += 1;
           result = this.#aggregator.ingestTrade(trade);
@@ -251,7 +256,9 @@ export class SpySipReceiver {
       subscribedOptionContracts: 0,
       websocketConnected: this.#connected,
       brokerAvailable: false,
-      marketClockState: this.#connected ? "spy-sip-subscribed" : "spy-sip-disconnected",
+      marketClockState: this.#connected
+        ? `${this.#config.symbol.toLowerCase()}-sip-subscribed`
+        : `${this.#config.symbol.toLowerCase()}-sip-disconnected`,
       openOrderCount: 0,
       positionsReconciled: true,
       recorderHealthy: true,
@@ -261,7 +268,7 @@ export class SpySipReceiver {
 
   async #connect(): Promise<void> {
     await this.#stream.connect(this.#handlers());
-    if (!this.#connected) throw new Error("SPY SIP stream did not confirm its subscription");
+    if (!this.#connected) throw new Error(`${this.#config.symbol} SIP stream did not confirm its subscription`);
   }
 
   #handlers(): StockStreamHandlers {
@@ -284,7 +291,7 @@ export class SpySipReceiver {
           this.#reconnectAttempt = 0;
           this.#lastStreamError = undefined;
         } else if (this.#started && !this.#stopping) {
-          this.#lastStreamError = "SPY SIP stream disconnected";
+          this.#lastStreamError = `${this.#config.symbol} SIP stream disconnected`;
           this.#scheduleReconnect();
         }
       },
@@ -327,6 +334,11 @@ export class SpySipReceiver {
           }
         };
         for (const event of events) {
+          if (event.value.symbol !== this.#config.symbol) {
+            this.#rejectedCount += 1;
+            rejectedEvents += 1;
+            continue;
+          }
           let result;
           if (event.type === "quote") {
             quotes += 1;
@@ -417,22 +429,26 @@ export class SpySipReceiver {
   }
 }
 
-function stockQuoteFromHistory(event: HistoricalMarketEvent): StockQuote | undefined {
+function stockQuoteFromHistory(
+  event: HistoricalMarketEvent, symbol: StockQuote["symbol"],
+): StockQuote | undefined {
   const timestamp = finiteNumber(event.data.timestamp) ?? event.providerTimestamp;
   const bidPrice = finiteNumber(event.data.bidPrice);
   const askPrice = finiteNumber(event.data.askPrice);
   const bidSize = finiteNumber(event.data.bidSize);
   const askSize = finiteNumber(event.data.askSize);
   if (bidPrice === undefined || askPrice === undefined || bidSize === undefined || askSize === undefined) return undefined;
-  return { symbol: "SPY", timestamp, bidPrice, askPrice, bidSize, askSize };
+  return { symbol, timestamp, bidPrice, askPrice, bidSize, askSize };
 }
 
-function stockTradeFromHistory(event: HistoricalMarketEvent): StockTrade | undefined {
+function stockTradeFromHistory(
+  event: HistoricalMarketEvent, symbol: StockTrade["symbol"],
+): StockTrade | undefined {
   const timestamp = finiteNumber(event.data.timestamp) ?? event.providerTimestamp;
   const price = finiteNumber(event.data.price);
   const size = finiteNumber(event.data.size);
   if (price === undefined || size === undefined) return undefined;
-  return { symbol: "SPY", timestamp, price, size };
+  return { symbol, timestamp, price, size };
 }
 
 function finiteNumber(value: unknown): number | undefined {

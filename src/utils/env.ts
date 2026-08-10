@@ -1,9 +1,12 @@
+import type { UnderlyingSymbol } from "../types.js";
+
 export interface RuntimeEnvironment {
   tradingMode: "paper" | "live";
   liveOrdersEnabled: boolean;
   marketDataEnabled: boolean;
   stockDataFeed: "sip";
   optionDataFeed: "opra";
+  tradingSymbols: readonly UnderlyingSymbol[];
   historyDatabaseEnabled: boolean;
   historyQuoteSampleMs: number;
   historyRetentionDays: number;
@@ -21,6 +24,7 @@ export function readEnvironment(env: NodeJS.ProcessEnv = process.env): RuntimeEn
   const marketDataEnabled = env.MARKET_DATA_ENABLED === "true";
   const stockDataFeed = env.STOCK_DATA_FEED ?? "sip";
   const optionDataFeed = env.OPTION_DATA_FEED ?? "opra";
+  const tradingSymbols = parseTradingSymbols(env.TRADING_SYMBOLS ?? "SPY");
   const historyDatabaseEnabled = env.HISTORY_DATABASE_ENABLED === "true";
   const historyQuoteSampleMs = Number(env.MARKET_HISTORY_QUOTE_SAMPLE_MS ?? "250");
   const historyRetentionDays = Number(env.MARKET_HISTORY_RETENTION_DAYS ?? "7");
@@ -35,7 +39,7 @@ export function readEnvironment(env: NodeJS.ProcessEnv = process.env): RuntimeEn
   if (!Number.isInteger(historyRetentionDays) || historyRetentionDays < 0 || historyRetentionDays > 3_650) {
     throw new Error("MARKET_HISTORY_RETENTION_DAYS must be an integer between 0 and 3650");
   }
-  if (stockDataFeed !== "sip") throw new Error("This runtime is hard-limited to the SPY SIP stock-data feed");
+  if (stockDataFeed !== "sip") throw new Error("This runtime is hard-limited to the SIP stock-data feed");
   if (optionDataFeed !== "opra") throw new Error("Executable option trading requires the real-time OPRA option-data feed");
   if (liveOrdersEnabled && !marketDataEnabled) {
     throw new Error("Broker order execution requires MARKET_DATA_ENABLED=true");
@@ -50,7 +54,7 @@ export function readEnvironment(env: NodeJS.ProcessEnv = process.env): RuntimeEn
     throw new Error("Live mode requires broker credentials");
   }
   if (marketDataEnabled && (!env.ALPACA_API_KEY || !env.ALPACA_API_SECRET)) {
-    throw new Error("SPY SIP market data requires ALPACA_API_KEY and ALPACA_API_SECRET");
+    throw new Error("SPY/QQQ SIP market data requires ALPACA_API_KEY and ALPACA_API_SECRET");
   }
   return {
     tradingMode,
@@ -58,6 +62,7 @@ export function readEnvironment(env: NodeJS.ProcessEnv = process.env): RuntimeEn
     marketDataEnabled,
     stockDataFeed,
     optionDataFeed,
+    tradingSymbols,
     historyDatabaseEnabled,
     historyQuoteSampleMs,
     historyRetentionDays,
@@ -68,6 +73,14 @@ export function readEnvironment(env: NodeJS.ProcessEnv = process.env): RuntimeEn
     ...(env.ALPACA_API_SECRET ? { alpacaApiSecret: env.ALPACA_API_SECRET } : {}),
     ...(env.DATABASE_URL ? { databaseUrl: env.DATABASE_URL } : {}),
   };
+}
+
+function parseTradingSymbols(value: string): UnderlyingSymbol[] {
+  const symbols = [...new Set(value.split(",").map((symbol) => symbol.trim().toUpperCase()).filter(Boolean))];
+  if (symbols.length === 0 || symbols.some((symbol) => symbol !== "SPY" && symbol !== "QQQ")) {
+    throw new Error("TRADING_SYMBOLS must be a comma-separated subset of SPY,QQQ");
+  }
+  return symbols as UnderlyingSymbol[];
 }
 
 export function redactSecrets(value: unknown, secrets: readonly string[]): unknown {

@@ -6,10 +6,11 @@ import type {
 import type { BrokerOrder, BrokerPosition, TradingRestClient } from "../alpaca/restClient.js";
 import { reconcileBrokerState } from "../alpaca/restClient.js";
 import { validateOptionQuote } from "../features/quoteSanitizer.js";
-import { sameDaySpyOptionContractReasons } from "../options/tradingInvariants.js";
+import { sameDayOptionContractReasons } from "../options/tradingInvariants.js";
 import { ExitManager } from "../risk/exitManager.js";
 import { RiskManager } from "../risk/riskManager.js";
 import type { DailyRiskState } from "../risk/riskManager.js";
+import type { PortfolioRiskCoordinator } from "../risk/portfolioRiskCoordinator.js";
 import type { AuditRecorder } from "../ops/recorder.js";
 import { MemoryRecorder } from "../ops/recorder.js";
 import {
@@ -118,6 +119,7 @@ export interface LiveOrderManagerOptions {
   restoredPosition?: PositionState;
   knownClientOrderIds?: ReadonlySet<string>;
   restoredRiskState?: DailyRiskState;
+  portfolioRisk?: PortfolioRiskCoordinator;
 }
 
 export interface CompletedLiveExit {
@@ -134,7 +136,7 @@ const ACTIVE_BROKER_STATUSES = new Set([
 const CANCELED_BROKER_STATUSES = new Set(["canceled", "expired", "done_for_day", "replaced", "calculated"]);
 
 /**
- * Broker-backed, serialized lifecycle coordinator for long 0DTE SPY options.
+ * Broker-backed, serialized lifecycle coordinator for long 0DTE options on one configured underlying.
  * It never infers a fill from a timeout: cumulative broker state is authoritative.
  */
 export class LiveOrderManager {
@@ -146,6 +148,7 @@ export class LiveOrderManager {
   readonly #exits: ExitManager;
   readonly #knownClientOrderIds: Set<string>;
   readonly #onCompletedExit: ((exit: CompletedLiveExit) => void) | undefined;
+  readonly #portfolioRisk: PortfolioRiskCoordinator | undefined;
   #position: PositionState | undefined;
   #pending: PendingBrokerExecution | undefined;
   #exitIntent: LogicalExitIntent | undefined;
@@ -165,6 +168,7 @@ export class LiveOrderManager {
     this.#risk = new RiskManager(options.config);
     this.#exits = new ExitManager(options.config);
     this.#onCompletedExit = options.onCompletedExit;
+    this.#portfolioRisk = options.portfolioRisk;
     if (options.restoredRiskState) {
       this.#risk.restoreState(options.restoredRiskState);
     }
@@ -204,6 +208,7 @@ export class LiveOrderManager {
           brokerPosition,
           exitIntent: this.#exitIntent,
         });
+        await this.#adoptPortfolioExposure(timestamp);
         return this.snapshot();
       }
       if (!reconciliation.matched || reconciliation.openOrders.length > 0) {
@@ -212,6 +217,7 @@ export class LiveOrderManager {
         await this.#halt(timestamp, `BROKER_RECONCILIATION_FAILED:${[...new Set(reasons)].join(",")}`);
       }
       this.#lifecycle = this.#position ? this.#position.tradeState : "FLAT";
+      if (this.#position) await this.#adoptPortfolioExposure(timestamp);
       return this.snapshot();
     });
   }
@@ -230,12 +236,14 @@ export class LiveOrderManager {
       if (request.optionSnapshot && request.optionSnapshot.symbol !== request.candidate.symbol) {
         reasons.push("CANDIDATE_SNAPSHOT_SYMBOL_MISMATCH");
       }
-      if (request.candidate.symbol === "SPY") reasons.push("UNDERLYING_ORDER_FORBIDDEN");
+      if (request.candidate.symbol === this.#config.symbol) reasons.push("UNDERLYING_ORDER_FORBIDDEN");
 
       const clock = await this.#client.getMarketClock();
       if (!clock.isOpen) reasons.push("MARKET_CLOSED");
       if (request.candidate.contract) {
-        reasons.push(...sameDaySpyOptionContractReasons(request.candidate.contract, clock.timestamp, this.#config.timeZone));
+        reasons.push(...sameDayOptionContractReasons(
+          request.candidate.contract, clock.timestamp, this.#config.timeZone, this.#config.symbol,
+        ));
       }
       const quoteValidation = validateOptionQuote(request.quote, clock.timestamp, this.#config.dataQuality);
       if (!quoteValidation.usable) reasons.push(...quoteValidation.reasons.map((reason) => `QUOTE_${reason}`));
@@ -263,6 +271,23 @@ export class LiveOrderManager {
         risk,
       });
       if (!risk.allowed) return { submitted: false, reasons: risk.reasons, risk };
+
+      if (this.#portfolioRisk) {
+        const portfolio = await this.#portfolioRisk.reserveEntry({
+          underlying: this.#config.symbol,
+          timestamp: clock.timestamp,
+          riskDollars: risk.maxLossPerContract * risk.quantity,
+          premiumDollars: 100 * optionMid * risk.quantity,
+          optionBuyingPowerDollars: guardedAccount.optionBuyingPower,
+        });
+        await this.#audit(clock.timestamp, "portfolio_risk_decision", {
+          signalId: request.signal.id,
+          portfolio,
+        });
+        if (!portfolio.allowed) {
+          return { submitted: false, reasons: portfolio.reasons, risk };
+        }
+      }
 
       const clientOrderId = this.#clientOrderId("entry", request.signal.id, clock.timestamp);
       let state = this.#orders.propose({
@@ -674,6 +699,9 @@ export class LiveOrderManager {
           remainingQuantity: this.#position.quantity,
         });
         if (this.#position.quantity === 0) {
+          await this.#portfolioRisk?.recordCompletedExit(
+            this.#config.symbol, timestamp, realizedPnl,
+          );
           this.#onCompletedExit?.({
             timestamp,
             entryTimestamp: exitingPosition.entryTimestamp,
@@ -697,7 +725,10 @@ export class LiveOrderManager {
         await this.#halt(timestamp, "BROKER_FILLED_STATUS_WITH_INCOMPLETE_QUANTITY", { broker, pending });
       }
       this.#pending = undefined;
-      if (pending.purpose === "ENTRY" && !this.#position) this.#lifecycle = "FLAT";
+      if (pending.purpose === "ENTRY" && !this.#position) {
+        await this.#portfolioRisk?.releaseExposure(this.#config.symbol);
+        this.#lifecycle = "FLAT";
+      }
       return;
     }
     if (status === "rejected") {
@@ -705,6 +736,7 @@ export class LiveOrderManager {
       this.#pending = undefined;
       await this.#reconcilePositionTruth(timestamp, `${pending.purpose}_ORDER_REJECTED`);
       if (pending.purpose === "ENTRY") {
+        if (!this.#position) await this.#portfolioRisk?.releaseExposure(this.#config.symbol);
         this.#lifecycle = this.#position?.tradeState ?? "FLAT";
       } else if (this.#position) {
         this.#lifecycle = this.#safeMode ? "SAFE_MODE" : "EXIT_PENDING";
@@ -722,6 +754,7 @@ export class LiveOrderManager {
       this.#pending = undefined;
       await this.#reconcilePositionTruth(timestamp, `${pending.purpose}_ORDER_CANCELED`);
       if (pending.purpose === "ENTRY") {
+        if (!this.#position) await this.#portfolioRisk?.releaseExposure(this.#config.symbol);
         this.#lifecycle = this.#position?.tradeState ?? "FLAT";
       } else if (this.#position) {
         this.#lifecycle = this.#safeMode ? "SAFE_MODE" : "EXIT_PENDING";
@@ -818,6 +851,7 @@ export class LiveOrderManager {
         });
       }
       this.#position = undefined;
+      await this.#portfolioRisk?.releaseExposure(this.#config.symbol);
       this.#lastAuditedManagementState = undefined;
       this.#exitIntent = undefined;
       this.#safeMode = false;
@@ -849,6 +883,7 @@ export class LiveOrderManager {
         triggers: ["BROKER_OR_POSITION_RISK"],
         updatedPosition: this.#position,
       });
+      await this.#adoptPortfolioExposure(timestamp);
       return;
     }
     if (this.#position.quantity !== brokerPosition.quantity ||
@@ -880,7 +915,18 @@ export class LiveOrderManager {
         brokerPosition,
         updatedPosition: this.#position,
       });
+      await this.#adoptPortfolioExposure(timestamp);
     }
+  }
+
+  async #adoptPortfolioExposure(timestamp: number): Promise<void> {
+    if (!this.#portfolioRisk || !this.#position) return;
+    await this.#portfolioRisk.adoptExposure(
+      this.#config.symbol,
+      100 * this.#position.quantity * this.#position.averageEntryPrice * this.#config.risk.hardOptionStopPct,
+      100 * this.#position.quantity * this.#position.averageEntryPrice,
+      timestamp,
+    );
   }
 
   #createExitIntent(timestamp: number, decision: ExitDecision): void {
@@ -948,7 +994,7 @@ export class LiveOrderManager {
 
   #clientOrderId(purpose: "entry" | "exit", discriminator: string, timestamp: number): string {
     const safe = discriminator.replace(/[^A-Za-z0-9_-]/g, "-");
-    return `spy0dte-${purpose}-${timestamp}-${safe}`.slice(0, 128);
+    return `${this.#config.symbol.toLowerCase()}0dte-${purpose}-${timestamp}-${safe}`.slice(0, 128);
   }
 
   async #audit(timestamp: number, type: string, data: Record<string, unknown>): Promise<void> {
@@ -958,7 +1004,7 @@ export class LiveOrderManager {
         marketDate: marketDate(timestamp, this.#config.timeZone),
         type,
         configVersion: this.#config.version,
-        data,
+        data: { underlying: this.#config.symbol, ...data },
       });
       if (!this.#recorder.healthy()) throw new Error("audit recorder unhealthy");
     } catch (error) {
@@ -981,7 +1027,7 @@ export class LiveOrderManager {
         marketDate: marketDate(timestamp, this.#config.timeZone),
         type: "execution_halted",
         configVersion: this.#config.version,
-        data: { reason, ...detail },
+        data: { underlying: this.#config.symbol, reason, ...detail },
       });
     } catch {
       // Preserve the first operational failure even when the recorder is also unavailable.

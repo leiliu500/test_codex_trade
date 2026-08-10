@@ -1,30 +1,37 @@
 import { loadDotEnv } from "./utils/loadDotEnv.js";
 import { readEnvironment } from "./utils/env.js";
-import { defaultConfig, validateConfig } from "./config.js";
-import { startHealthServer, type HealthState } from "./ops/healthServer.js";
+import { defaultConfig, qqqConfig, validateConfig, type EngineConfig } from "./config.js";
+import { combineHealthStates, startHealthServer, type HealthState } from "./ops/healthServer.js";
 import { AlpacaStockWebSocket } from "./alpaca/stockStream.js";
 import { AlpacaOptionWebSocket } from "./alpaca/optionStream.js";
-import { AlpacaTradingRestClient } from "./alpaca/restClient.js";
+import { AlpacaTradingRestClient, UnderlyingTradingRestClient } from "./alpaca/restClient.js";
 import { SpySipReceiver } from "./runtime/spySipReceiver.js";
 import { SpyOptionsTradingRuntime } from "./runtime/spyOptionsTradingRuntime.js";
+import { SharedOptionStreamHub, SharedStockStreamHub } from "./runtime/sharedStreams.js";
+import { PortfolioRiskCoordinator } from "./risk/portfolioRiskCoordinator.js";
 import { CompositeRecorder, JsonLineRecorder, type AuditEvent } from "./ops/recorder.js";
 import { TradingDashboardStore } from "./ops/tradingDashboard.js";
 import { PostgresHistoryStore } from "./history/postgresHistory.js";
-import { CompositeMarketHistorySink } from "./history/types.js";
+import { CompositeMarketHistorySink, SharedPriorityMarketHistoryHub } from "./history/types.js";
 import { JsonLogger } from "./utils/logger.js";
 import { marketDate } from "./utils/time.js";
-import type { FeatureSnapshot } from "./types.js";
+import type { FeatureSnapshot, UnderlyingSymbol } from "./types.js";
 import {
   mergeOrderCardQuoteDynamics,
   type DashboardOrderCard,
 } from "./ops/orderCards.js";
 
 loadDotEnv();
-validateConfig(defaultConfig);
 const environment = readEnvironment();
+const configCatalog: Readonly<Record<UnderlyingSymbol, EngineConfig>> = {
+  SPY: defaultConfig,
+  QQQ: qqqConfig,
+};
+const configs = environment.tradingSymbols.map((symbol) => configCatalog[symbol]);
+for (const config of configs) validateConfig(config);
 
 if (environment.tradingMode === "live") {
-  throw new Error("Live mode needs an explicitly supplied TradingRestClient and stream adapters; refusing implicit live startup");
+  throw new Error("Live mode needs explicitly promoted multi-underlying adapters; refusing implicit live startup");
 }
 
 const logger = new JsonLogger([
@@ -46,15 +53,20 @@ const history = environment.historyDatabaseEnabled ? new PostgresHistoryStore({
 }) : undefined;
 let restoredEvents: AuditEvent[] = [];
 let restoredOrderCards: DashboardOrderCard[] = [];
-let restoredFeatureCheckpoint: FeatureSnapshot | undefined;
+const restoredFeatureCheckpoints = new Map<UnderlyingSymbol, FeatureSnapshot>();
 if (history) {
   await history.initialize();
   [restoredEvents, restoredOrderCards] = await Promise.all([
     history.loadAuditEvents(),
     history.loadOrderCards(),
   ]);
+  const checkpoints = await Promise.all(configs.map((config) =>
+    history.loadLatestRecoveredFeature(marketDate(Date.now(), config.timeZone), config.symbol)));
+  for (let index = 0; index < configs.length; index += 1) {
+    const checkpoint = checkpoints[index];
+    if (checkpoint) restoredFeatureCheckpoints.set(configs[index]!.symbol, checkpoint);
+  }
   dashboard.restoreOrderCards(restoredOrderCards);
-  restoredFeatureCheckpoint = await history.loadLatestRecoveredFeature(marketDate(Date.now(), defaultConfig.timeZone));
   for (const event of restoredEvents) dashboard.record(event);
   const restoredCardIds = new Set(restoredOrderCards.map((card) => card.id));
   const completedOrderCards = dashboard.snapshot().orderCards.filter((card) => !card.active);
@@ -74,7 +86,7 @@ if (history) {
     restoredOrderCards: restoredOrderCards.length,
     backfilledOrderCards: backfilledOrderCards.length,
     backfilledPnlUpdates,
-    recoveredFeatureCheckpoint: restoredFeatureCheckpoint !== undefined,
+    recoveredFeatureCheckpoints: [...restoredFeatureCheckpoints.keys()],
   });
 }
 const auditRecorder = new CompositeRecorder([
@@ -82,10 +94,11 @@ const auditRecorder = new CompositeRecorder([
   dashboard,
   ...(history ? [history] : []),
 ]);
-const marketHistory = new CompositeMarketHistorySink([
+const baseMarketHistory = new CompositeMarketHistorySink([
   dashboard,
   ...(history ? [history] : []),
 ]);
+const priorityHistory = new SharedPriorityMarketHistoryHub(baseMarketHistory, environment.tradingSymbols);
 const idleHealthState: HealthState = {
   ready: false,
   brokerRequired: false,
@@ -98,53 +111,96 @@ const idleHealthState: HealthState = {
   recorderHealthy: history?.healthy() ?? true,
   killSwitch: environment.killSwitch,
 };
-const stockStream = environment.marketDataEnabled ? new AlpacaStockWebSocket({
+
+const physicalStockStream = environment.marketDataEnabled ? new AlpacaStockWebSocket({
   apiKey: environment.alpacaApiKey!,
   apiSecret: environment.alpacaApiSecret!,
   feed: environment.stockDataFeed,
-  symbol: "SPY",
+  symbols: environment.tradingSymbols,
 }) : undefined;
-const tradingRuntime = environment.liveOrdersEnabled && stockStream ? new SpyOptionsTradingRuntime({
-  config: defaultConfig,
-  client: new AlpacaTradingRestClient({
-    apiKey: environment.alpacaApiKey!,
-    apiSecret: environment.alpacaApiSecret!,
-    paper: true,
-    optionFeed: environment.optionDataFeed,
-  }),
-  stockStream,
-  optionStream: new AlpacaOptionWebSocket({
-    apiKey: environment.alpacaApiKey!,
-    apiSecret: environment.alpacaApiSecret!,
-    feed: environment.optionDataFeed,
-  }),
-  executionEnabled: true,
-  executionMode: "paper",
-  killSwitch: environment.killSwitch,
-  recorder: auditRecorder,
-  history: marketHistory,
-  requireStrategyRecovery: true,
-  restoredAuditEvents: restoredEvents,
-  ...(restoredFeatureCheckpoint ? { restoredFeatureCheckpoint } : {}),
-  ...(history ? {
-    loadStockHistory: (date: string, start: number, end: number, quoteStart?: number) =>
-      history.streamStockEvents(date, start, end, quoteStart),
-  } : {}),
-  onEvent: (type, data) => logger.log("info", type, data),
-  onError: (error) => logger.log("error", "spy_options_runtime_error", {
-    error: error instanceof Error ? error.message : String(error),
-  }),
+const stockHub = physicalStockStream
+  ? new SharedStockStreamHub(physicalStockStream, environment.tradingSymbols)
+  : undefined;
+const physicalOptionStream = environment.liveOrdersEnabled ? new AlpacaOptionWebSocket({
+  apiKey: environment.alpacaApiKey!,
+  apiSecret: environment.alpacaApiSecret!,
+  feed: environment.optionDataFeed,
 }) : undefined;
-const sipReceiver = environment.marketDataEnabled && stockStream && !tradingRuntime ? new SpySipReceiver({
-  config: defaultConfig,
-  stream: stockStream,
-  onError: (error) => logger.log("warn", "spy_sip_stream_error", {
-    error: error instanceof Error ? error.message : String(error),
-  }),
+const optionHub = physicalOptionStream
+  ? new SharedOptionStreamHub(physicalOptionStream, environment.tradingSymbols)
+  : undefined;
+const broker = environment.liveOrdersEnabled ? new AlpacaTradingRestClient({
+  apiKey: environment.alpacaApiKey!,
+  apiSecret: environment.alpacaApiSecret!,
+  paper: true,
+  optionFeed: environment.optionDataFeed,
+  underlyings: environment.tradingSymbols,
 }) : undefined;
+const portfolioRisk = broker ? new PortfolioRiskCoordinator({
+  timeZone: defaultConfig.timeZone,
+  maxConcurrentUnderlyings: configs.length,
+  maxAggregateRiskDollars: configs.reduce((total, config) => total + config.risk.maxRiskDollarsPerTrade, 0),
+  maxAggregatePremiumDollars: configs.reduce((total, config) => total + config.risk.maxPremiumDollarsPerTrade, 0),
+  maxDailyLossDollars: Math.min(...configs.map((config) => config.risk.maxDailyLossDollars)),
+}, Date.now(), restoredPortfolioPnl(restoredEvents, Date.now(), defaultConfig.timeZone)) : undefined;
+
+const tradingRuntimes = broker && stockHub && optionHub ? configs.map((config) => {
+  const symbol = config.symbol;
+  return new SpyOptionsTradingRuntime({
+    config,
+    client: new UnderlyingTradingRestClient(broker, symbol),
+    stockStream: stockHub.channel(symbol),
+    optionStream: optionHub.channel(symbol),
+    executionEnabled: true,
+    executionMode: "paper",
+    killSwitch: environment.killSwitch,
+    recorder: auditRecorder,
+    history: priorityHistory.channel(symbol),
+    requireStrategyRecovery: true,
+    restoredAuditEvents: restoredEvents,
+    portfolioRisk: portfolioRisk!,
+    ...(restoredFeatureCheckpoints.has(symbol)
+      ? { restoredFeatureCheckpoint: restoredFeatureCheckpoints.get(symbol)! }
+      : {}),
+    ...(history ? {
+      loadStockHistory: (date: string, start: number, end: number, quoteStart?: number) =>
+        history.streamStockEvents(date, start, end, quoteStart),
+    } : {}),
+    onEvent: (type, data) => logger.log("info", type, { underlying: symbol, ...data }),
+    onError: (error) => logger.log("error", "options_runtime_error", {
+      underlying: symbol,
+      error: error instanceof Error ? error.message : String(error),
+    }),
+  });
+}) : [];
+
+const sipReceivers = environment.marketDataEnabled && stockHub && tradingRuntimes.length === 0
+  ? configs.map((config) => new SpySipReceiver({
+      config,
+      stream: stockHub.channel(config.symbol),
+      onError: (error) => logger.log("warn", "sip_stream_error", {
+        underlying: config.symbol,
+        error: error instanceof Error ? error.message : String(error),
+      }),
+    }))
+  : [];
+
+const getHealth = (): HealthState => {
+  if (tradingRuntimes.length > 0) {
+    return combineHealthStates(Object.fromEntries(configs.map((config, index) => [
+      config.symbol, tradingRuntimes[index]!.healthState(),
+    ])));
+  }
+  if (sipReceivers.length > 0) {
+    return combineHealthStates(Object.fromEntries(configs.map((config, index) => [
+      config.symbol, sipReceivers[index]!.healthState(environment.killSwitch),
+    ])));
+  }
+  return idleHealthState;
+};
 
 const server = startHealthServer(
-  () => tradingRuntime?.healthState() ?? sipReceiver?.healthState(environment.killSwitch) ?? idleHealthState,
+  getHealth,
   environment.healthPort,
   environment.healthHost,
   () => dashboard.snapshot(),
@@ -154,18 +210,18 @@ server.on("listening", () => {
   process.stdout.write(`${JSON.stringify({
     status: "running",
     mode: "paper",
-    symbol: defaultConfig.symbol,
-    marketData: tradingRuntime ? "spy-sip-and-opra-connecting"
-      : environment.marketDataEnabled ? "spy-sip-connecting" : "disabled",
-    orderSubmission: tradingRuntime ? "alpaca-paper-enabled" : "disabled",
-    configVersion: defaultConfig.version,
+    symbols: environment.tradingSymbols,
+    marketData: tradingRuntimes.length > 0 ? "sip-and-opra-connecting"
+      : environment.marketDataEnabled ? "sip-connecting" : "disabled",
+    orderSubmission: tradingRuntimes.length > 0 ? "alpaca-paper-enabled" : "disabled",
+    configVersions: Object.fromEntries(configs.map((config) => [config.symbol, config.version])),
     health: `http://${environment.healthHost}:${environment.healthPort}`,
     dashboard: `http://${environment.healthHost}:${environment.healthPort}/dashboard`,
     historyDatabase: history ? "postgres-ready" : "disabled",
-    message: tradingRuntime
-      ? "Paper execution runtime is connecting SPY SIP signals, OPRA option quotes, and the Alpaca paper broker."
+    message: tradingRuntimes.length > 0
+      ? "Paper runtimes are connecting isolated SIP signals and option state through shared market-data and broker boundaries."
       : environment.marketDataEnabled
-      ? "Paper-safe runtime is connecting to SPY SIP quotes and trades."
+      ? "Paper-safe SIP receivers are connecting."
       : "Paper-safe runtime is alive with market data disabled.",
   })}\n`);
 });
@@ -175,25 +231,27 @@ server.on("error", (error) => {
   process.exitCode = 1;
 });
 
-if (tradingRuntime) {
-  void tradingRuntime.start().then(() => {
-    logger.log("info", "spy_options_paper_runtime_started", {
-      underlying: "SPY",
+if (tradingRuntimes.length > 0) {
+  void Promise.all(tradingRuntimes.map((runtime) => runtime.start())).then(() => {
+    logger.log("info", "multi_underlying_paper_runtime_started", {
+      underlyings: environment.tradingSymbols,
       underlyingOrdersAllowed: false,
       expiration: "current-market-day-only",
       stockFeed: "sip",
       optionFeed: "opra",
     });
   }).catch((error: unknown) => {
-    logger.log("error", "spy_options_runtime_startup_failed", {
+    logger.log("error", "multi_underlying_runtime_startup_failed", {
       error: error instanceof Error ? error.message : String(error),
     });
   });
-} else if (sipReceiver) {
-  void sipReceiver.start().then(() => {
-    logger.log("info", "spy_sip_subscription_ready", { symbol: "SPY", feed: "sip", orderSubmission: "disabled" });
+} else if (sipReceivers.length > 0) {
+  void Promise.all(sipReceivers.map((receiver) => receiver.start())).then(() => {
+    logger.log("info", "sip_subscriptions_ready", {
+      symbols: environment.tradingSymbols, feed: "sip", orderSubmission: "disabled",
+    });
   }).catch((error: unknown) => {
-    logger.log("error", "spy_sip_initial_connection_failed_retrying", {
+    logger.log("error", "sip_initial_connection_failed_retrying", {
       error: error instanceof Error ? error.message : String(error),
     });
   });
@@ -207,8 +265,10 @@ async function shutdown(signal: NodeJS.Signals): Promise<void> {
   const forcedExit = setTimeout(() => process.exit(1), 9_000);
   forcedExit.unref();
   try {
-    await tradingRuntime?.close();
-    await sipReceiver?.close();
+    await Promise.allSettled([
+      ...tradingRuntimes.map((runtime) => runtime.close()),
+      ...sipReceivers.map((receiver) => receiver.close()),
+    ]);
     await history?.close();
     await new Promise<void>((resolve, reject) => {
       server.close((error) => error ? reject(error) : resolve());
@@ -223,3 +283,12 @@ async function shutdown(signal: NodeJS.Signals): Promise<void> {
 
 process.once("SIGINT", (signal) => void shutdown(signal));
 process.once("SIGTERM", (signal) => void shutdown(signal));
+
+function restoredPortfolioPnl(events: readonly AuditEvent[], timestamp: number, timeZone: string): number {
+  const date = marketDate(timestamp, timeZone);
+  return events.reduce((total, event) => {
+    const eventDate = event.marketDate ?? marketDate(event.timestamp, timeZone);
+    const pnl = event.type === "exit_fill" && eventDate === date ? event.data.realizedPnl : undefined;
+    return total + (typeof pnl === "number" && Number.isFinite(pnl) ? pnl : 0);
+  }, 0);
+}

@@ -1,5 +1,6 @@
 import { createServer, type Server } from "node:http";
 import { tradingDashboardHtml, type TradingDashboardSnapshot } from "./tradingDashboard.js";
+import type { CircuitState, OpraQuoteDiagnosis } from "../marketData/opraQuoteHealth.js";
 
 export interface HealthState {
   ready: boolean;
@@ -13,8 +14,37 @@ export interface HealthState {
   receivedOptionQuotes?: number;
   lastOptionQuoteAgeMs?: number;
   lastOptionQuoteProviderAgeMs?: number;
+  optionQuotePrimed?: boolean;
+  optionQuoteProviderLagged?: boolean;
+  optionQuoteDiagnosis?: OpraQuoteDiagnosis;
+  optionTransportAgeMs?: number;
+  optionExactSymbolReceiveAgeMs?: number;
+  optionObservedContracts?: number;
+  optionActiveContracts?: number;
+  optionFreshContracts?: number;
+  optionDiagnosableContracts?: number;
+  optionDelayedContracts?: number;
+  optionDelayedContractFraction?: number;
+  optionFreshContractFraction?: number;
+  optionMedianArrivalLagMs?: number;
+  optionMedianAbsoluteDeviationMs?: number;
+  optionProviderAdvanceRatio?: number;
+  optionProviderTimeVelocity?: number;
+  optionQuoteFreshnessThresholdMs?: number;
   optionQuoteStalled?: boolean;
   optionQuoteStallThresholdMs?: number;
+  optionSubscriptionsRequired?: boolean;
+  optionRestFallbackEnabled?: boolean;
+  optionRestFallbackInFlight?: boolean;
+  optionRestFallbackRequests?: number;
+  optionRestFallbackFreshQuotes?: number;
+  optionRestRepeatedQuotes?: number;
+  optionRestCircuitState?: CircuitState;
+  optionRestCircuitFailures?: number;
+  optionRestCircuitRetryAfterMs?: number;
+  lastOptionRestFallbackAgeMs?: number;
+  lastOptionRestQuoteProviderAgeMs?: number;
+  lastOptionRestFallbackError?: string;
   completedBars?: number;
   restoredStockEvents?: number;
   restoredBars?: number;
@@ -36,6 +66,8 @@ export interface HealthState {
   websocketConnected: boolean;
   brokerAvailable: boolean;
   marketClockState: string;
+  marketClockAvailable?: boolean;
+  lastMarketClockError?: string;
   openOrderCount: number;
   positionsReconciled: boolean;
   recorderHealthy: boolean;
@@ -46,6 +78,140 @@ export interface HealthState {
   strategyOpeningRangeEnd?: string;
   restoredFeatureBars?: number;
   strategyRecoveryError?: string;
+  underlyingStates?: Record<string, HealthState>;
+}
+
+export function combineHealthStates(states: Readonly<Record<string, HealthState>>): HealthState {
+  const entries = Object.entries(states);
+  if (entries.length === 0) {
+    return {
+      ready: false, brokerRequired: false, subscribedOptionContracts: 0,
+      websocketConnected: false, brokerAvailable: false, marketClockState: "idle",
+      openOrderCount: 0, positionsReconciled: true, recorderHealthy: true, killSwitch: false,
+    };
+  }
+  const values = entries.map(([, state]) => state);
+  const sum = (key: keyof HealthState): number => values.reduce((total, state) => {
+    const value = state[key];
+    return total + (typeof value === "number" ? value : 0);
+  }, 0);
+  const marketStates = new Set(values.map((state) => state.marketClockState));
+  const maximum = (key: keyof HealthState): number | undefined => {
+    const numbers = values.flatMap((state) => typeof state[key] === "number" ? [state[key] as number] : []);
+    return numbers.length > 0 ? Math.max(...numbers) : undefined;
+  };
+  const minimum = (key: keyof HealthState): number | undefined => {
+    const numbers = values.flatMap((state) => typeof state[key] === "number" ? [state[key] as number] : []);
+    return numbers.length > 0 ? Math.min(...numbers) : undefined;
+  };
+  const lastOptionQuoteAgeMs = maximum("lastOptionQuoteAgeMs");
+  const lastOptionQuoteProviderAgeMs = maximum("lastOptionQuoteProviderAgeMs");
+  const lastOptionRestFallbackAgeMs = maximum("lastOptionRestFallbackAgeMs");
+  const lastOptionRestQuoteProviderAgeMs = maximum("lastOptionRestQuoteProviderAgeMs");
+  const optionQuoteFreshnessThresholdMs = minimum("optionQuoteFreshnessThresholdMs");
+  const optionQuoteStallThresholdMs = minimum("optionQuoteStallThresholdMs");
+  const diagnosisPriority: OpraQuoteDiagnosis[] = [
+    "HEALTHY", "NO_DATA", "CONTRACT_IDLE", "OLD_EVENT_ARRIVED", "PROVIDER_DELAYED", "TRANSPORT_DISCONNECTED",
+  ];
+  const optionQuoteDiagnosis = values
+    .flatMap((state) => state.optionQuoteDiagnosis ? [state.optionQuoteDiagnosis] : [])
+    .sort((left, right) => diagnosisPriority.indexOf(right) - diagnosisPriority.indexOf(left))[0];
+  const optionDiagnosableContracts = sum("optionDiagnosableContracts");
+  const optionDelayedContracts = sum("optionDelayedContracts");
+  const optionFreshContracts = sum("optionFreshContracts");
+  const subscribedOptionContracts = sum("subscribedOptionContracts");
+  const circuitPriority: CircuitState[] = ["CLOSED", "HALF_OPEN", "OPEN"];
+  const optionRestCircuitState = values
+    .flatMap((state) => state.optionRestCircuitState ? [state.optionRestCircuitState] : [])
+    .sort((left, right) => circuitPriority.indexOf(right) - circuitPriority.indexOf(left))[0];
+  const optionTransportAgeMs = maximum("optionTransportAgeMs");
+  const optionExactSymbolReceiveAgeMs = maximum("optionExactSymbolReceiveAgeMs");
+  const optionMedianArrivalLagMs = maximum("optionMedianArrivalLagMs");
+  const optionMedianAbsoluteDeviationMs = maximum("optionMedianAbsoluteDeviationMs");
+  const optionProviderAdvanceRatio = minimum("optionProviderAdvanceRatio");
+  const optionProviderTimeVelocity = minimum("optionProviderTimeVelocity");
+  const optionRestCircuitRetryAfterMs = maximum("optionRestCircuitRetryAfterMs");
+  return {
+    ready: values.every((state) => state.ready),
+    brokerRequired: values.some((state) => state.brokerRequired !== false),
+    marketDataFeed: "sip",
+    ...(values.some((state) => state.optionDataFeed === "opra") ? { optionDataFeed: "opra" } : {}),
+    receivedStockQuotes: sum("receivedStockQuotes"),
+    receivedStockTrades: sum("receivedStockTrades"),
+    receivedOptionQuotes: sum("receivedOptionQuotes"),
+    ...(lastOptionQuoteAgeMs !== undefined ? { lastOptionQuoteAgeMs } : {}),
+    ...(lastOptionQuoteProviderAgeMs !== undefined ? { lastOptionQuoteProviderAgeMs } : {}),
+    optionQuotePrimed: values.every((state) => state.optionQuotePrimed !== false),
+    optionQuoteProviderLagged: values.some((state) => state.optionQuoteProviderLagged === true),
+    ...(optionQuoteDiagnosis ? { optionQuoteDiagnosis } : {}),
+    ...(optionTransportAgeMs !== undefined ? { optionTransportAgeMs } : {}),
+    ...(optionExactSymbolReceiveAgeMs !== undefined ? { optionExactSymbolReceiveAgeMs } : {}),
+    optionObservedContracts: sum("optionObservedContracts"),
+    optionActiveContracts: sum("optionActiveContracts"),
+    optionFreshContracts,
+    optionDiagnosableContracts,
+    optionDelayedContracts,
+    optionDelayedContractFraction: optionDiagnosableContracts === 0
+      ? 0 : optionDelayedContracts / optionDiagnosableContracts,
+    optionFreshContractFraction: subscribedOptionContracts === 0
+      ? 0 : optionFreshContracts / subscribedOptionContracts,
+    ...(optionMedianArrivalLagMs !== undefined ? { optionMedianArrivalLagMs } : {}),
+    ...(optionMedianAbsoluteDeviationMs !== undefined ? { optionMedianAbsoluteDeviationMs } : {}),
+    ...(optionProviderAdvanceRatio !== undefined ? { optionProviderAdvanceRatio } : {}),
+    ...(optionProviderTimeVelocity !== undefined ? { optionProviderTimeVelocity } : {}),
+    ...(optionQuoteFreshnessThresholdMs !== undefined ? { optionQuoteFreshnessThresholdMs } : {}),
+    optionQuoteStalled: values.some((state) => state.optionQuoteStalled === true),
+    ...(optionQuoteStallThresholdMs !== undefined ? { optionQuoteStallThresholdMs } : {}),
+    optionSubscriptionsRequired: values.some((state) => state.optionSubscriptionsRequired === true),
+    optionRestFallbackEnabled: values.some((state) => state.optionRestFallbackEnabled === true),
+    optionRestFallbackInFlight: values.some((state) => state.optionRestFallbackInFlight === true),
+    optionRestFallbackRequests: sum("optionRestFallbackRequests"),
+    optionRestFallbackFreshQuotes: sum("optionRestFallbackFreshQuotes"),
+    optionRestRepeatedQuotes: sum("optionRestRepeatedQuotes"),
+    ...(optionRestCircuitState ? { optionRestCircuitState } : {}),
+    optionRestCircuitFailures: sum("optionRestCircuitFailures"),
+    ...(optionRestCircuitRetryAfterMs !== undefined ? { optionRestCircuitRetryAfterMs } : {}),
+    ...(lastOptionRestFallbackAgeMs !== undefined ? { lastOptionRestFallbackAgeMs } : {}),
+    ...(lastOptionRestQuoteProviderAgeMs !== undefined ? { lastOptionRestQuoteProviderAgeMs } : {}),
+    ...(values.find((state) => state.lastOptionRestFallbackError)?.lastOptionRestFallbackError
+      ? { lastOptionRestFallbackError: values.find((state) => state.lastOptionRestFallbackError)!.lastOptionRestFallbackError }
+      : {}),
+    completedBars: sum("completedBars"),
+    rejectedMarketEvents: sum("rejectedMarketEvents"),
+    restoredStockEvents: sum("restoredStockEvents"),
+    restoredFeatureBars: sum("restoredFeatureBars"),
+    reconnectAttempt: Math.max(...values.map((state) => state.reconnectAttempt ?? 0)),
+    stockWebsocketConnected: values.every((state) => state.stockWebsocketConnected !== false),
+    optionWebsocketConnected: values
+      .filter((state) => state.optionDataFeed === "opra")
+      .every((state) => state.optionWebsocketConnected === true),
+    websocketConnected: values.every((state) => state.websocketConnected),
+    marketDataIdle: values.every((state) => state.marketDataIdle === true),
+    executionEnabled: values.some((state) => state.executionEnabled === true),
+    ...(values.find((state) => state.executionMode)?.executionMode
+      ? { executionMode: values.find((state) => state.executionMode)!.executionMode }
+      : {}),
+    accountOptionsApproved: values.every((state) => state.accountOptionsApproved !== false),
+    positionOpen: values.some((state) => state.positionOpen === true),
+    pendingOrder: values.some((state) => state.pendingOrder === true),
+    subscribedOptionContracts,
+    brokerAvailable: values.filter((state) => state.brokerRequired !== false).every((state) => state.brokerAvailable),
+    marketClockState: marketStates.size === 1 ? values[0]!.marketClockState : "mixed",
+    marketClockAvailable: values.every((state) => state.marketClockAvailable !== false),
+    ...(values.find((state) => state.lastMarketClockError)?.lastMarketClockError
+      ? { lastMarketClockError: values.find((state) => state.lastMarketClockError)!.lastMarketClockError }
+      : {}),
+    openOrderCount: sum("openOrderCount"),
+    positionsReconciled: values.every((state) => state.positionsReconciled),
+    recorderHealthy: values.every((state) => state.recorderHealthy),
+    killSwitch: values.some((state) => state.killSwitch),
+    strategyStateReady: values.every((state) => state.strategyStateReady !== false),
+    ...(values.every((state) => state.strategyStateStatus === values[0]!.strategyStateStatus) &&
+        values[0]!.strategyStateStatus !== undefined
+      ? { strategyStateStatus: values[0]!.strategyStateStatus }
+      : { strategyStateStatus: "MIXED" }),
+    underlyingStates: Object.fromEntries(entries),
+  };
 }
 
 export function healthReadiness(state: HealthState): { status: "ok" | "degraded" | "halted"; checks: HealthState } {

@@ -2,7 +2,7 @@ import type { EngineConfig } from "../config.js";
 import type { OptionQuote } from "../types.js";
 import type { Direction, PositionState } from "../types.js";
 import type { RiskManager } from "../risk/riskManager.js";
-import { assertSameDaySpyOptionOrder } from "../options/tradingInvariants.js";
+import { assertSameDayOptionOrder } from "../options/tradingInvariants.js";
 
 export type OrderSide = "buy" | "sell";
 export type OrderStatus = "PROPOSED" | "SUBMITTED" | "PARTIAL" | "REPLACE_PENDING" | "CANCEL_PENDING" | "FILLED" | "CANCELED" | "REJECTED";
@@ -68,7 +68,7 @@ export class OrderExecutor {
   constructor(config: EngineConfig) { this.#config = config; }
 
   propose(proposal: OrderProposal): OrderState {
-    assertSameDaySpyOptionOrder(proposal.symbol, proposal.side, proposal.timestamp, this.#config);
+    assertSameDayOptionOrder(proposal.symbol, proposal.side, proposal.timestamp, this.#config);
     if (proposal.quote.symbol !== proposal.symbol) throw new Error("Option-only order rejected: quote symbol mismatch");
     if (!Number.isInteger(proposal.quantity) || proposal.quantity < 1) throw new Error("Option quantity must be a positive whole number");
     const fraction = proposal.marketable ? 1 : proposal.side === "buy"
@@ -122,7 +122,7 @@ export class OrderExecutor {
   }
 
   submit(state: OrderState, timestamp: number): OrderState {
-    assertSameDaySpyOptionOrder(state.symbol, state.side, timestamp, this.#config);
+    assertSameDayOptionOrder(state.symbol, state.side, timestamp, this.#config);
     return this.#transition(state, "SUBMITTED", timestamp, "accepted for submission");
   }
 

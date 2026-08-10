@@ -4,7 +4,7 @@ import type {
   DashboardOrderQuote,
   OrderCardPersistence,
 } from "../ops/orderCards.js";
-import type { FeatureSnapshot } from "../types.js";
+import type { FeatureSnapshot, UnderlyingSymbol } from "../types.js";
 
 export type HistoricalMarketEventType =
   | "stock_quote"
@@ -54,13 +54,41 @@ export class CompositeMarketHistorySink implements MarketHistorySink {
   healthy(): boolean { return this.#sinks.every((sink) => sink.healthy()); }
 }
 
+/** Unions per-runtime priority sets so one symbol cannot de-prioritize another's open option. */
+export class SharedPriorityMarketHistoryHub {
+  readonly #sink: MarketHistorySink;
+  readonly #priorities = new Map<UnderlyingSymbol, Set<string>>();
+
+  constructor(sink: MarketHistorySink, underlyings: readonly UnderlyingSymbol[]) {
+    this.#sink = sink;
+    for (const underlying of underlyings) this.#priorities.set(underlying, new Set());
+  }
+
+  channel(underlying: UnderlyingSymbol): MarketHistorySink {
+    if (!this.#priorities.has(underlying)) throw new Error(`${underlying} has no market-history channel`);
+    return {
+      recordMarketEvent: (event) => this.#sink.recordMarketEvent(event),
+      ...(this.#sink.recordMarketEvents
+        ? { recordMarketEvents: (events: readonly HistoricalMarketEvent[]) => this.#sink.recordMarketEvents!(events) }
+        : {}),
+      setPrioritySymbols: (symbols) => {
+        this.#priorities.set(underlying, new Set(symbols));
+        const union = new Set<string>();
+        for (const values of this.#priorities.values()) for (const symbol of values) union.add(symbol);
+        this.#sink.setPrioritySymbols?.(union);
+      },
+      healthy: () => this.#sink.healthy(),
+    };
+  }
+}
+
 export interface HistoryStore extends MarketHistorySink, OrderCardPersistence {
   initialize(): Promise<void>;
   record(event: AuditEvent): void | Promise<void>;
   loadAuditEvents(limit?: number): Promise<AuditEvent[]>;
   loadOrderCards(limit?: number): Promise<DashboardOrderCard[]>;
   loadOrderCardQuotes(cards: readonly DashboardOrderCard[]): Promise<Map<string, DashboardOrderQuote[]>>;
-  loadReplayEvents(marketDate: string): Promise<Array<{
+  loadReplayEvents(marketDate: string, underlying?: UnderlyingSymbol): Promise<Array<{
     type: Exclude<HistoricalMarketEventType, "feature_snapshot">;
     timestamp: number;
     data: Record<string, unknown>;
@@ -69,7 +97,9 @@ export interface HistoryStore extends MarketHistorySink, OrderCardPersistence {
     marketDate: string, startReceivedTimestamp: number, endReceivedTimestamp: number,
     quoteStartReceivedTimestamp?: number,
   ): AsyncIterable<readonly HistoricalMarketEvent[]>;
-  loadLatestRecoveredFeature(marketDate: string): Promise<FeatureSnapshot | undefined>;
+  loadLatestRecoveredFeature(
+    marketDate: string, underlying?: UnderlyingSymbol,
+  ): Promise<FeatureSnapshot | undefined>;
   flush(): Promise<void>;
   close(): Promise<void>;
 }

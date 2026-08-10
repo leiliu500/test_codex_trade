@@ -5,7 +5,7 @@ import type { StockStreamEvent } from "../alpaca/stockStream.js";
 import type { TradingRestClient } from "../alpaca/restClient.js";
 import type {
   AccountState, FeatureSnapshot, OptionCandidateEvaluation, OptionContract, OptionQuote, RegimeDecision,
-  StockQuote, TradeSignal,
+  StockQuote, TradeSignal, UnderlyingSymbol,
 } from "../types.js";
 import type { HealthState } from "../ops/healthServer.js";
 import type { AuditEvent, AuditRecorder } from "../ops/recorder.js";
@@ -25,15 +25,29 @@ import { classifyRegime } from "../strategy/regimeClassifier.js";
 import { SpySipReceiver } from "./spySipReceiver.js";
 import { isAtOrAfter, marketDate, parseClock, secondsSinceMidnight, zonedDateTimeToEpoch } from "../utils/time.js";
 import type { DailyRiskState } from "../risk/riskManager.js";
+import type { PortfolioRiskCoordinator } from "../risk/portfolioRiskCoordinator.js";
 import { lateEntryGuardAudit, morningEntryGuardAudit } from "../strategy/lateEntryGuard.js";
 import { validateOptionQuote } from "../features/quoteSanitizer.js";
+import { parseOccSymbol } from "../options/occSymbol.js";
 import {
   currentBullishProjectionBps, evaluateLateBullishGrindOptionConfirmation,
   requiresLateBullishGrindOptionConfirmation,
 } from "../strategy/lateBullishGrindConfirmation.js";
+import { performance } from "node:perf_hooks";
+import {
+  assessRestQuote,
+  OpraQuoteHealthMonitor,
+  optionQuoteFingerprint,
+  StaleQuoteCircuitBreaker,
+  type OpraChainHealth,
+  type OpraQuoteDiagnosis,
+  type OpraQuoteObservation,
+} from "../marketData/opraQuoteHealth.js";
 
 export interface SpyOptionsRuntimeClient extends TradingRestClient {
-  getLatestSpySipQuote(): Promise<StockQuote>;
+  getLatestUnderlyingSipQuote?(underlying: UnderlyingSymbol): Promise<StockQuote>;
+  /** Legacy SPY-only adapter compatibility. */
+  getLatestSpySipQuote?(): Promise<StockQuote>;
 }
 
 export interface SpyOptionsTradingRuntimeOptions {
@@ -47,6 +61,7 @@ export interface SpyOptionsTradingRuntimeOptions {
   recorder?: AuditRecorder;
   history?: MarketHistorySink;
   now?: () => number;
+  monotonicNow?: () => number;
   executionTickMs?: number;
   onEvent?: (type: string, data: Record<string, unknown>) => void;
   onError?: (error: unknown) => void;
@@ -57,6 +72,7 @@ export interface SpyOptionsTradingRuntimeOptions {
     quoteStartReceivedTimestamp?: number,
   ) => AsyncIterable<readonly HistoricalMarketEvent[]>;
   restoredFeatureCheckpoint?: FeatureSnapshot;
+  portfolioRisk?: PortfolioRiskCoordinator;
 }
 
 export function optionUniverseRequired(
@@ -71,6 +87,7 @@ export function optionUniverseRequired(
 const OPEN_MARKET_CLOCK_POLL_MS = 5_000;
 const CLOSED_MARKET_CLOCK_POLL_MS = 30_000;
 export const OPTION_QUOTE_STALL_TIMEOUT_MS = 10_000;
+const OPTION_REST_RECOVERY_INTERVAL_MS = 1_000;
 
 interface PendingLateBullishGrindConfirmation {
   signal: TradeSignal;
@@ -87,7 +104,7 @@ interface PendingOptionSelection {
   lastSelection: SelectionResult;
 }
 
-/** End-to-end, serialized SPY 0DTE option execution runtime. */
+/** End-to-end, serialized single-underlying 0DTE option execution runtime. */
 export class SpyOptionsTradingRuntime {
   readonly #config: EngineConfig;
   readonly #client: SpyOptionsRuntimeClient;
@@ -98,6 +115,7 @@ export class SpyOptionsTradingRuntime {
   readonly #executionMode: "paper" | "live";
   readonly #killSwitch: boolean;
   readonly #now: () => number;
+  readonly #monotonicNow: () => number;
   readonly #executionTickMs: number;
   readonly #onEvent: ((type: string, data: Record<string, unknown>) => void) | undefined;
   readonly #onError: ((error: unknown) => void) | undefined;
@@ -113,6 +131,10 @@ export class SpyOptionsTradingRuntime {
   readonly #orders: LiveOrderManager;
   readonly #stockReceiver: SpySipReceiver;
   readonly #restoredRuntimeState: RestoredRuntimeState;
+  readonly #optionHealth: OpraQuoteHealthMonitor;
+  readonly #optionRestCircuit = new StaleQuoteCircuitBreaker();
+  readonly #rawObservedQuotes = new WeakMap<OptionQuote, OpraQuoteObservation>();
+  readonly #lastOptionRestFingerprints = new Map<string, string>();
   #contracts: OptionContract[] = [];
   #subscribedSymbols = new Set<string>();
   #optionConnected = false;
@@ -126,18 +148,27 @@ export class SpyOptionsTradingRuntime {
   #lastSpot: number | undefined;
   #lastFeature: FeatureSnapshot | undefined;
   #lastRegime: RegimeDecision | undefined;
-  #lastOptionQuoteTimestamp: number | undefined;
-  #lastOptionQuoteReceivedAt: number | undefined;
-  #optionQuoteExpectedSince: number | undefined;
   #optionQuoteCount = 0;
   #rejectedOptionQuotes = 0;
   #optionQuoteStalled = false;
+  #optionRestRecoveryInFlight: Promise<void> | undefined;
+  #lastOptionRestFallbackAt: number | undefined;
+  #lastOptionRestFallbackMonotonicTimestamp = -Infinity;
+  #lastOptionRestQuoteTimestamp: number | undefined;
+  #optionRestFallbackRequests = 0;
+  #optionRestFallbackFreshQuotes = 0;
+  #optionRestRepeatedQuotes = 0;
+  #lastOptionRestFallbackError: string | undefined;
+  #lastOptionDiagnosis: OpraQuoteDiagnosis | undefined;
+  #providerDelayDiagnosticReconnectAttempted = false;
   #execution: LiveExecutionSnapshot = { halted: false, lifecycle: "FLAT", safeMode: false };
   #pendingOptionSelection: PendingOptionSelection | undefined;
   #pendingLateBullishGrindConfirmation: PendingLateBullishGrindConfirmation | undefined;
   #retainedPositionSymbol: string | undefined;
   #lastError: string | undefined;
   #lastClockCheck = -Infinity;
+  #marketClockAvailable = false;
+  #lastMarketClockError: string | undefined;
   #strategyStateReady = false;
   #strategyStateStatus = "NOT_RESTORED";
   #strategyStateMarketDate: string | undefined;
@@ -160,6 +191,11 @@ export class SpyOptionsTradingRuntime {
     this.#executionMode = options.executionMode ?? "paper";
     this.#killSwitch = options.killSwitch === true;
     this.#now = options.now ?? Date.now;
+    this.#monotonicNow = options.monotonicNow ?? performance.now.bind(performance);
+    this.#optionHealth = new OpraQuoteHealthMonitor({
+      executionMaxQuoteAgeMs: options.config.dataQuality.maxOptionQuoteAgeMs,
+      transportTimeoutMs: OPTION_QUOTE_STALL_TIMEOUT_MS,
+    });
     this.#executionTickMs = options.executionTickMs ?? 250;
     this.#onEvent = options.onEvent;
     this.#onError = options.onError;
@@ -185,11 +221,18 @@ export class SpyOptionsTradingRuntime {
       }
     }
     if (options.restoredFeatureCheckpoint) {
+      if (options.restoredFeatureCheckpoint.symbol !== options.config.symbol) {
+        throw new Error(
+          `${options.config.symbol} runtime received a ${options.restoredFeatureCheckpoint.symbol} feature checkpoint`,
+        );
+      }
       this.#lastFeature = options.restoredFeatureCheckpoint;
       this.#lastSpot = options.restoredFeatureCheckpoint.price;
       this.#lastRegime = classifyRegime(options.restoredFeatureCheckpoint, options.config.regimes);
     }
-    const restored = restoreRuntimeState(options.restoredAuditEvents ?? [], this.#now(), options.config.timeZone);
+    const restored = restoreRuntimeState(
+      options.restoredAuditEvents ?? [], this.#now(), options.config.timeZone, options.config.symbol,
+    );
     this.#restoredRuntimeState = restored;
     this.#signals.restoreState(restored.signal);
     this.#lateEntryBaselineSignals?.restoreState(restored.signal);
@@ -213,6 +256,7 @@ export class SpyOptionsTradingRuntime {
       },
       restoredRiskState: restored.risk,
       knownClientOrderIds: restored.knownClientOrderIds,
+      ...(options.portfolioRisk ? { portfolioRisk: options.portfolioRisk } : {}),
     });
     this.#stockReceiver = new SpySipReceiver({
       config: options.config,
@@ -226,7 +270,7 @@ export class SpyOptionsTradingRuntime {
   }
 
   async start(): Promise<void> {
-    if (this.#started) throw new Error("SPY options trading runtime is already started");
+    if (this.#started) throw new Error(`${this.#config.symbol} options trading runtime is already started`);
     this.#started = true;
     this.#stopping = false;
     try {
@@ -237,6 +281,8 @@ export class SpyOptionsTradingRuntime {
       this.#account = account;
       this.#marketOpen = clock.isOpen;
       this.#lastClockCheck = this.#now();
+      this.#marketClockAvailable = true;
+      this.#lastMarketClockError = undefined;
       if (!account.active) throw new Error("Paper broker account is inactive or blocked");
       if (!account.optionsApproved) throw new Error("Paper broker account is not approved for options");
       if (clock.isOpen) {
@@ -273,7 +319,7 @@ export class SpyOptionsTradingRuntime {
       this.#positionsReconciled = true;
       this.#brokerAvailable = true;
       if (clock.isOpen) {
-        const latestQuote = await this.#client.getLatestSpySipQuote();
+        const latestQuote = await this.#getLatestSipQuote();
         this.#lastSpot = (latestQuote.bidPrice + latestQuote.askPrice) / 2;
         await this.#startUniverseRefresh(this.#lastSpot, clock.timestamp, true);
         const streamStarts = await Promise.allSettled([this.#connectOptionStream()]);
@@ -351,6 +397,9 @@ export class SpyOptionsTradingRuntime {
   async ingestFeature(feature: FeatureSnapshot): Promise<void> {
     try {
       await this.#queue.enqueue(async () => {
+        if (feature.symbol !== this.#config.symbol) {
+          throw new Error(`${this.#config.symbol} runtime rejected ${feature.symbol} feature state`);
+        }
         if (this.#marketDataIdle || !this.#marketOpen) return;
         this.#recordHistory("feature_snapshot", feature.timestamp, feature.symbol, { ...feature });
         this.#lastFeature = feature;
@@ -800,27 +849,84 @@ export class SpyOptionsTradingRuntime {
     const streamsConnected = stock.websocketConnected && this.#optionConnected;
     const streamsReady = this.#marketDataIdle || streamsConnected;
     const hasOptionExposure = this.#execution.position !== undefined || this.#execution.pending !== undefined;
-    const universeReady = this.#subscribedSymbols.size > 0 ||
-      !optionUniverseRequired(now, this.#marketOpen, hasOptionExposure, this.#config);
+    const optionSubscriptionsRequired = optionUniverseRequired(
+      now, this.#marketOpen, hasOptionExposure, this.#config,
+    );
+    const universeReady = this.#subscribedSymbols.size > 0 || !optionSubscriptionsRequired;
     const strategyReady = !this.#executionEnabled || !this.#marketOpen || this.#strategyStateReady;
-    const optionQuoteSilenceAgeMs = this.#optionQuoteSilenceAgeMs(now);
+    const optionChainHealth = this.#optionChainHealth(now);
+    const optionQuoteSilenceAgeMs = this.#subscribedSymbols.size > 0
+      ? optionChainHealth.transportAgeMs : undefined;
+    const optionQuoteProviderAgeMs = optionChainHealth.latestProviderAgeMs;
+    const optionQuotePrimed = this.#marketDataIdle || this.#subscribedSymbols.size === 0 ||
+      optionChainHealth.observedSymbolCount > 0;
+    const optionQuoteProviderLagged = optionChainHealth.diagnosis === "PROVIDER_DELAYED";
     const optionQuoteStalled = this.#isOptionQuoteStalled(now);
+    const activeSymbol = this.#execution.position?.symbol ?? this.#execution.pending?.order.symbol;
+    const activeHealth = activeSymbol
+      ? this.#optionHealth.diagnose(activeSymbol, now, this.#monotonicNow())
+      : undefined;
+    const optionDataReady = !optionSubscriptionsRequired || (
+      optionQuotePrimed && optionChainHealth.entryEligible && !optionQuoteStalled &&
+      (!activeHealth || activeHealth.entryEligible)
+    );
+    const restCircuit = this.#optionRestCircuit.snapshot(this.#monotonicNow());
     return {
       ...stock,
       ready: streamsReady && brokerReady && universeReady && strategyReady && recorderHealthy &&
-        !optionQuoteStalled &&
-        !this.#execution.halted && !this.#queue.halted,
+        optionDataReady &&
+        this.#marketClockAvailable && !this.#execution.halted && !this.#queue.halted,
       brokerRequired: this.#executionEnabled,
       optionDataFeed: "opra",
       receivedOptionQuotes: this.#optionQuoteCount,
       ...(optionQuoteSilenceAgeMs !== undefined
         ? { lastOptionQuoteAgeMs: optionQuoteSilenceAgeMs }
         : {}),
-      ...(this.#lastOptionQuoteTimestamp !== undefined
-        ? { lastOptionQuoteProviderAgeMs: Math.max(0, now - this.#lastOptionQuoteTimestamp) }
+      ...(optionQuoteProviderAgeMs !== undefined
+        ? { lastOptionQuoteProviderAgeMs: optionQuoteProviderAgeMs }
         : {}),
+      optionQuotePrimed,
+      optionQuoteProviderLagged,
+      optionQuoteDiagnosis: optionChainHealth.diagnosis,
+      optionTransportAgeMs: optionChainHealth.transportAgeMs,
+      ...(optionChainHealth.exactSymbolReceiveAgeMs !== undefined
+        ? { optionExactSymbolReceiveAgeMs: optionChainHealth.exactSymbolReceiveAgeMs } : {}),
+      optionObservedContracts: optionChainHealth.observedSymbolCount,
+      optionActiveContracts: optionChainHealth.activeSymbolCount,
+      optionFreshContracts: optionChainHealth.freshSymbolCount,
+      optionDiagnosableContracts: optionChainHealth.diagnosableSymbolCount,
+      optionDelayedContracts: optionChainHealth.delayedSymbolCount,
+      optionDelayedContractFraction: optionChainHealth.delayedSymbolFraction,
+      optionFreshContractFraction: optionChainHealth.freshSymbolFraction,
+      ...(optionChainHealth.medianArrivalLagMs !== undefined
+        ? { optionMedianArrivalLagMs: optionChainHealth.medianArrivalLagMs } : {}),
+      ...(optionChainHealth.medianAbsoluteDeviationMs !== undefined
+        ? { optionMedianAbsoluteDeviationMs: optionChainHealth.medianAbsoluteDeviationMs } : {}),
+      ...(optionChainHealth.providerAdvanceRatio !== undefined
+        ? { optionProviderAdvanceRatio: optionChainHealth.providerAdvanceRatio } : {}),
+      ...(optionChainHealth.providerTimeVelocity !== undefined
+        ? { optionProviderTimeVelocity: optionChainHealth.providerTimeVelocity } : {}),
+      optionQuoteFreshnessThresholdMs: this.#config.dataQuality.maxOptionQuoteAgeMs,
       optionQuoteStalled,
       optionQuoteStallThresholdMs: OPTION_QUOTE_STALL_TIMEOUT_MS,
+      optionSubscriptionsRequired,
+      optionRestFallbackEnabled: this.#client.getLatestOptionQuotes !== undefined,
+      optionRestFallbackInFlight: this.#optionRestRecoveryInFlight !== undefined,
+      optionRestFallbackRequests: this.#optionRestFallbackRequests,
+      optionRestFallbackFreshQuotes: this.#optionRestFallbackFreshQuotes,
+      optionRestRepeatedQuotes: this.#optionRestRepeatedQuotes,
+      optionRestCircuitState: restCircuit.state,
+      optionRestCircuitFailures: restCircuit.consecutiveFailures,
+      optionRestCircuitRetryAfterMs: restCircuit.retryAfterMs,
+      ...(this.#lastOptionRestFallbackAt !== undefined
+        ? { lastOptionRestFallbackAgeMs: Math.max(0, now - this.#lastOptionRestFallbackAt) }
+        : {}),
+      ...(this.#lastOptionRestQuoteTimestamp !== undefined
+        ? { lastOptionRestQuoteProviderAgeMs: Math.max(0, now - this.#lastOptionRestQuoteTimestamp) }
+        : {}),
+      ...(this.#lastOptionRestFallbackError
+        ? { lastOptionRestFallbackError: this.#lastOptionRestFallbackError }
+        : {}),
       rejectedMarketEvents: (stock.rejectedMarketEvents ?? 0) + this.#rejectedOptionQuotes,
       reconnectAttempt: Math.max(stock.reconnectAttempt ?? 0, this.#optionReconnectAttempt),
       ...(this.#lastError ? { lastStreamError: this.#lastError } : {}),
@@ -834,9 +940,13 @@ export class SpyOptionsTradingRuntime {
       positionOpen: this.#execution.position !== undefined,
       pendingOrder: this.#execution.pending !== undefined,
       subscribedOptionContracts: this.#subscribedSymbols.size,
+      ...(activeHealth && Number.isFinite(activeHealth.latestProviderAgeMs)
+        ? { openPositionOptionQuoteAgeMs: activeHealth.latestProviderAgeMs } : {}),
       brokerAvailable: this.#brokerAvailable,
       marketClockState: this.#marketOpen ? "market-open" :
         this.#marketDataIdle ? "market-closed-idle" : "market-closed",
+      marketClockAvailable: this.#marketClockAvailable,
+      ...(this.#lastMarketClockError ? { lastMarketClockError: this.#lastMarketClockError } : {}),
       openOrderCount: this.#execution.pending ? 1 : 0,
       positionsReconciled: this.#positionsReconciled,
       recorderHealthy,
@@ -858,6 +968,7 @@ export class SpyOptionsTradingRuntime {
     if (this.#execution.safeMode) reasons.push("EXECUTION_SAFE_MODE");
     if (this.#executionEnabled && !this.#brokerAvailable) reasons.push("BROKER_UNAVAILABLE");
     if (this.#executionEnabled && !this.#positionsReconciled) reasons.push("POSITIONS_NOT_RECONCILED");
+    if (this.#executionEnabled && !this.#marketClockAvailable) reasons.push("MARKET_CLOCK_UNAVAILABLE");
     if (this.#executionEnabled &&
         (this.#account?.active !== true || this.#account.optionsApproved !== true)) {
       reasons.push("ACCOUNT_NOT_READY");
@@ -867,11 +978,23 @@ export class SpyOptionsTradingRuntime {
     if (this.#executionEnabled && !this.#stockReceiver.healthState(this.#killSwitch).websocketConnected) {
       reasons.push("STOCK_FEED_DISCONNECTED");
     }
+    const optionHealth = this.#optionChainHealth(timestamp);
     if (this.#executionEnabled && this.#isOptionQuoteStalled(timestamp)) {
       reasons.push("OPTION_FEED_STALLED");
     } else if (this.#executionEnabled && !this.#optionConnected &&
         optionUniverseRequired(timestamp, this.#marketOpen, false, this.#config)) {
       reasons.push("OPTION_FEED_DISCONNECTED");
+    } else if (this.#executionEnabled && this.#subscribedSymbols.size > 0 &&
+        optionHealth.diagnosis === "NO_DATA") {
+      reasons.push("OPTION_FEED_NOT_READY");
+    } else if (this.#executionEnabled && optionHealth.diagnosis === "PROVIDER_DELAYED") {
+      reasons.push("OPTION_FEED_PROVIDER_DELAYED");
+    } else if (this.#executionEnabled && this.#subscribedSymbols.size > 0 &&
+        !optionHealth.entryEligible && optionHealth.diagnosis === "OLD_EVENT_ARRIVED") {
+      reasons.push("OPTION_FEED_OLD_EVENT_ARRIVED");
+    } else if (this.#executionEnabled && this.#subscribedSymbols.size > 0 &&
+        !optionHealth.entryEligible && optionHealth.diagnosis === "CONTRACT_IDLE") {
+      reasons.push("OPTION_FEED_CONTRACT_IDLE");
     }
     if (this.#execution.position) reasons.push("POSITION_ALREADY_OPEN");
     if (this.#execution.pending) reasons.push("ORDER_ALREADY_PENDING");
@@ -972,7 +1095,11 @@ export class SpyOptionsTradingRuntime {
     try {
       await this.#queue.enqueue(async () => {
         if (this.#marketDataIdle || !this.#marketOpen) return;
-        this.#recordStockHistory(events);
+        const scopedEvents = events.filter((event) => event.value.symbol === this.#config.symbol);
+        if (scopedEvents.length !== events.length) {
+          throw new Error(`${this.#config.symbol} runtime received cross-underlying stock events`);
+        }
+        this.#recordStockHistory(scopedEvents);
         let latestQuote: Extract<StockStreamEvent, { type: "quote" }> | undefined;
         for (let index = events.length - 1; index >= 0; index -= 1) {
           const event = events[index]!;
@@ -993,20 +1120,28 @@ export class SpyOptionsTradingRuntime {
   }
 
   async #onOptionQuotes(quotes: readonly OptionQuote[]): Promise<void> {
+    const receiveWallTimestamp = this.#now();
+    const receiveMonotonicTimestamp = this.#monotonicNow();
+    for (const quote of quotes) {
+      if (this.#rawObservedQuotes.has(quote) ||
+          parseOccSymbol(quote.symbol)?.underlying !== this.#config.symbol) continue;
+      const observation = { quote, receiveWallTimestamp, receiveMonotonicTimestamp };
+      this.#rawObservedQuotes.set(quote, observation);
+      this.#optionHealth.onWebSocketQuote(observation);
+    }
     try {
       await this.#queue.enqueue(async () => {
         if (this.#marketDataIdle || !this.#marketOpen) return;
-        if (quotes.length > 0) {
-          this.#lastOptionQuoteReceivedAt = this.#now();
-          this.#optionQuoteStalled = false;
-        }
         this.#recordOptionHistory(quotes);
         const decisionTimestamp = this.#now();
         const activeSymbol = this.#execution.position?.symbol ?? this.#execution.pending?.order.symbol;
         let latestActiveQuote: OptionQuote | undefined;
         for (const quote of quotes) {
+          if (parseOccSymbol(quote.symbol)?.underlying !== this.#config.symbol) {
+            this.#rejectedOptionQuotes += 1;
+            continue;
+          }
           this.#optionQuoteCount += 1;
-          this.#lastOptionQuoteTimestamp = Math.max(this.#lastOptionQuoteTimestamp ?? -Infinity, quote.timestamp);
           const validation = validateOptionQuote(
             quote,
             decisionTimestamp,
@@ -1050,7 +1185,7 @@ export class SpyOptionsTradingRuntime {
 
   async #refreshUniverse(spot: number, timestamp: number): Promise<void> {
     if (this.#marketDataIdle || !this.#marketOpen) return;
-    const contracts = await this.#client.listOptionContracts();
+    const contracts = await this.#client.listOptionContracts(this.#config.symbol);
     if (this.#stopping || this.#marketDataIdle || !this.#marketOpen) return;
     const nextSymbols = new Set(this.#universe.plan(contracts, spot, timestamp));
     const snapshots = nextSymbols.size > 0
@@ -1071,12 +1206,10 @@ export class SpyOptionsTradingRuntime {
     }
     this.#universe.commitRefresh(this.#now());
     if (nextSymbols.size === 0) {
-      this.#optionQuoteExpectedSince = undefined;
       this.#optionQuoteStalled = false;
-    } else if (add.length > 0 || remove.length > 0 || this.#optionQuoteExpectedSince === undefined) {
-      this.#optionQuoteExpectedSince = this.#now();
     }
     this.#subscribedSymbols = nextSymbols;
+    this.#optionHealth.retainSymbols(nextSymbols);
     for (const snapshot of snapshots) {
       this.#book.updateSnapshot(snapshot);
       this.#recordHistory("option_snapshot", snapshot.timestamp ?? timestamp, snapshot.symbol, { ...snapshot });
@@ -1095,9 +1228,15 @@ export class SpyOptionsTradingRuntime {
     const timestamp = this.#now();
     if (this.#marketDataIdle && timestamp - this.#lastClockCheck < CLOSED_MARKET_CLOCK_POLL_MS) return;
     void this.#queue.enqueue(async () => {
-      await this.#refreshMarketSession(timestamp);
+      try {
+        await this.#refreshMarketSession(timestamp);
+      } catch (error) {
+        this.#recordError(error);
+        return;
+      }
       if (!this.#marketDataIdle && this.#marketOpen) {
         await this.#checkOptionQuoteLiveness(timestamp);
+        this.#scheduleOptionRestRecovery(timestamp);
         if (this.#pendingOptionSelection) {
           await this.#advancePendingOptionSelection(timestamp);
         }
@@ -1107,10 +1246,119 @@ export class SpyOptionsTradingRuntime {
       .catch((error: unknown) => this.#recordError(error));
   }
 
+  #scheduleOptionRestRecovery(timestamp: number): void {
+    const getLatestOptionQuotes = this.#client.getLatestOptionQuotes;
+    const nowMonotonicTimestamp = this.#monotonicNow();
+    const websocketHealth = this.#optionChainHealth(timestamp, nowMonotonicTimestamp);
+    if (websocketHealth.diagnosis === "PROVIDER_DELAYED") {
+      this.#optionRestCircuit.trip(nowMonotonicTimestamp);
+      return;
+    }
+    if (!getLatestOptionQuotes || this.#stopping || this.#marketDataIdle || !this.#marketOpen ||
+        this.#subscribedSymbols.size === 0 ||
+        websocketHealth.diagnosis === "HEALTHY" ||
+        websocketHealth.diagnosis === "TRANSPORT_DISCONNECTED" ||
+        this.#optionRestRecoveryInFlight ||
+        nowMonotonicTimestamp - this.#lastOptionRestFallbackMonotonicTimestamp < OPTION_REST_RECOVERY_INTERVAL_MS ||
+        !this.#optionRestCircuit.canRequest(nowMonotonicTimestamp)) return;
+
+    const symbols = [...this.#subscribedSymbols];
+    this.#lastOptionRestFallbackAt = timestamp;
+    this.#lastOptionRestFallbackMonotonicTimestamp = nowMonotonicTimestamp;
+    this.#optionRestFallbackRequests += 1;
+    const recovery = getLatestOptionQuotes.call(this.#client, symbols)
+      .then(async (quotes) => {
+        await this.#queue.enqueue(async () => {
+          if (this.#stopping || this.#marketDataIdle || !this.#marketOpen) return;
+          const observedAt = this.#now();
+          const observedAtMonotonic = this.#monotonicNow();
+          let freshestProviderTimestamp: number | undefined;
+          let freshQuotes = 0;
+          let staleQuotes = 0;
+          let repeatedQuotes = 0;
+          for (const quote of quotes) {
+            if (!this.#subscribedSymbols.has(quote.symbol) ||
+                parseOccSymbol(quote.symbol)?.underlying !== this.#config.symbol) continue;
+            freshestProviderTimestamp = Math.max(freshestProviderTimestamp ?? -Infinity, quote.timestamp);
+            const assessment = assessRestQuote(
+              quote, observedAt, this.#config.dataQuality.maxOptionQuoteAgeMs,
+            );
+            if (assessment.fresh) freshQuotes += 1;
+            else staleQuotes += 1;
+            if (!assessment.fresh && this.#lastOptionRestFingerprints.get(quote.symbol) === assessment.fingerprint) {
+              repeatedQuotes += 1;
+            }
+            this.#lastOptionRestFingerprints.set(quote.symbol, assessment.fingerprint);
+          }
+          if (freshestProviderTimestamp !== undefined) {
+            this.#lastOptionRestQuoteTimestamp = Math.max(
+              this.#lastOptionRestQuoteTimestamp ?? -Infinity,
+              freshestProviderTimestamp,
+            );
+          }
+          this.#optionRestFallbackFreshQuotes += freshQuotes;
+          this.#optionRestRepeatedQuotes += repeatedQuotes;
+          this.#lastOptionRestFallbackError = undefined;
+          if (freshQuotes > 0) this.#optionRestCircuit.recordSuccess();
+          else this.#optionRestCircuit.recordStaleOrRepeated(observedAtMonotonic);
+
+          const reconnectScheduled = freshQuotes > 0 &&
+            websocketHealth.diagnosis !== "HEALTHY" &&
+            !this.#providerDelayDiagnosticReconnectAttempted;
+          if (reconnectScheduled) {
+            this.#providerDelayDiagnosticReconnectAttempted = true;
+            this.#scheduleOptionReconnect();
+          }
+          const circuit = this.#optionRestCircuit.snapshot(observedAtMonotonic);
+          const result = {
+            purpose: "SAME_PROVIDER_DIAGNOSTIC",
+            appliedToExecution: false,
+            requestedContracts: symbols.length,
+            returnedQuotes: quotes.length,
+            freshQuotes,
+            staleQuotes,
+            repeatedQuotes,
+            freshestProviderAgeMs: freshestProviderTimestamp === undefined
+              ? null : Math.max(0, observedAt - freshestProviderTimestamp),
+            freshnessThresholdMs: this.#config.dataQuality.maxOptionQuoteAgeMs,
+            websocketDiagnosis: websocketHealth.diagnosis,
+            circuitState: circuit.state,
+            circuitFailures: circuit.consecutiveFailures,
+            circuitRetryAfterMs: circuit.retryAfterMs,
+            reconnectScheduled,
+          };
+          this.#emit("option_rest_fallback_result", result);
+          await this.#auditRuntime(observedAt, "option_rest_fallback_result", result);
+        });
+      })
+      .catch((error: unknown) => {
+        this.#lastOptionRestFallbackError = error instanceof Error ? error.message : String(error);
+        this.#optionRestCircuit.recordStaleOrRepeated(this.#monotonicNow());
+        this.#emit("option_rest_fallback_failed", {
+          purpose: "SAME_PROVIDER_DIAGNOSTIC",
+          requestedContracts: symbols.length,
+          error: this.#lastOptionRestFallbackError,
+          circuitState: this.#optionRestCircuit.snapshot(this.#monotonicNow()).state,
+        });
+      })
+      .finally(() => {
+        if (this.#optionRestRecoveryInFlight === recovery) this.#optionRestRecoveryInFlight = undefined;
+      });
+    this.#optionRestRecoveryInFlight = recovery;
+  }
+
   async #connectOptionStream(): Promise<void> {
     await this.#optionStream.connect({
       onQuote: (quote) => this.#onOptionQuote(quote),
       onQuotes: (quotes) => this.#onOptionQuotes(quotes),
+      onActivity: (activity) => this.#optionHealth.onAnyFrame(activity.receiveMonotonicTimestamp),
+      onQuoteObservations: (observations) => {
+        for (const observation of observations) {
+          if (parseOccSymbol(observation.quote.symbol)?.underlying !== this.#config.symbol) continue;
+          this.#rawObservedQuotes.set(observation.quote, observation);
+          this.#optionHealth.onWebSocketQuote(observation);
+        }
+      },
       onState: (connected) => {
         this.#optionConnected = connected;
         if (connected) {
@@ -1118,7 +1366,8 @@ export class SpyOptionsTradingRuntime {
           this.#optionReconnectTimer = undefined;
           this.#optionReconnectAttempt = 0;
           this.#optionQuoteStalled = false;
-          this.#optionQuoteExpectedSince = this.#now();
+          this.#optionHealth.reset(this.#monotonicNow());
+          this.#lastOptionDiagnosis = undefined;
           this.#lastError = undefined;
         } else if (this.#started && !this.#stopping && !this.#marketDataIdle &&
             !this.#optionReconnectInProgress) {
@@ -1155,20 +1404,15 @@ export class SpyOptionsTradingRuntime {
     }, delay);
   }
 
-  #optionQuoteSilenceAgeMs(timestamp: number): number | undefined {
-    const reference = Math.max(
-      this.#lastOptionQuoteReceivedAt ?? -Infinity,
-      this.#optionQuoteExpectedSince ?? -Infinity,
-    );
-    return Number.isFinite(reference) ? Math.max(0, timestamp - reference) : undefined;
+  #optionChainHealth(timestamp: number, monotonicTimestamp = this.#monotonicNow()): OpraChainHealth {
+    return this.#optionHealth.summarize(this.#subscribedSymbols, timestamp, monotonicTimestamp);
   }
 
   #isOptionQuoteStalled(timestamp: number): boolean {
     if (this.#optionQuoteStalled) return true;
-    const silenceAgeMs = this.#optionQuoteSilenceAgeMs(timestamp);
     return this.#marketOpen && !this.#marketDataIdle && this.#optionConnected &&
-      this.#subscribedSymbols.size > 0 && silenceAgeMs !== undefined &&
-      silenceAgeMs > OPTION_QUOTE_STALL_TIMEOUT_MS;
+      this.#subscribedSymbols.size > 0 &&
+      this.#optionChainHealth(timestamp).diagnosis === "TRANSPORT_DISCONNECTED";
   }
 
   async #checkOptionQuoteLiveness(timestamp: number): Promise<void> {
@@ -1177,24 +1421,43 @@ export class SpyOptionsTradingRuntime {
       if (this.#subscribedSymbols.size === 0 || this.#marketDataIdle) this.#optionQuoteStalled = false;
       return;
     }
-    const silenceAgeMs = this.#optionQuoteSilenceAgeMs(timestamp);
-    if (silenceAgeMs === undefined || silenceAgeMs <= OPTION_QUOTE_STALL_TIMEOUT_MS ||
-        this.#optionQuoteStalled) return;
+    const health = this.#optionChainHealth(timestamp);
+    if (health.diagnosis !== this.#lastOptionDiagnosis) {
+      this.#lastOptionDiagnosis = health.diagnosis;
+      const diagnosisEvent = { ...health, freshnessThresholdMs: this.#config.dataQuality.maxOptionQuoteAgeMs };
+      this.#emit("option_feed_diagnosis", diagnosisEvent);
+      await this.#auditRuntime(timestamp, "option_feed_diagnosis", diagnosisEvent);
+      if (health.diagnosis === "HEALTHY") this.#optionRestCircuit.recordSuccess();
+    }
+    if (health.diagnosis === "PROVIDER_DELAYED") {
+      this.#optionRestCircuit.trip(this.#monotonicNow());
+      if (!this.#providerDelayDiagnosticReconnectAttempted) {
+        this.#providerDelayDiagnosticReconnectAttempted = true;
+        this.#scheduleOptionReconnect();
+      }
+    }
+    if (health.diagnosis !== "TRANSPORT_DISCONNECTED" || this.#optionQuoteStalled) return;
     this.#optionQuoteStalled = true;
     this.#optionConnected = false;
+    const stallReason = "RECEIVE_SILENCE";
+    const stalledForMs = health.transportAgeMs;
     const error = new Error(
-      `OPRA option quote stream stalled for ${silenceAgeMs} ms with ` +
+      `OPRA option quote stream stalled (${stallReason}) for ${stalledForMs} ms with ` +
       `${this.#subscribedSymbols.size} active subscriptions`,
     );
     this.#recordError(error);
     this.#scheduleOptionReconnect();
     this.#emit("option_stream_stalled", {
-      silenceAgeMs,
+      stallReason,
+      silenceAgeMs: health.transportAgeMs,
+      providerAgeMs: health.latestProviderAgeMs ?? null,
       stallThresholdMs: OPTION_QUOTE_STALL_TIMEOUT_MS,
       subscribedOptionContracts: this.#subscribedSymbols.size,
     });
     await this.#auditRuntime(timestamp, "option_stream_stalled", {
-      silenceAgeMs,
+      stallReason,
+      silenceAgeMs: health.transportAgeMs,
+      providerAgeMs: health.latestProviderAgeMs ?? null,
       stallThresholdMs: OPTION_QUOTE_STALL_TIMEOUT_MS,
       subscribedOptionContracts: this.#subscribedSymbols.size,
       reconnectAttempt: this.#optionReconnectAttempt,
@@ -1220,8 +1483,17 @@ export class SpyOptionsTradingRuntime {
   async #refreshMarketSession(timestamp: number): Promise<void> {
     const interval = this.#marketDataIdle ? CLOSED_MARKET_CLOCK_POLL_MS : OPEN_MARKET_CLOCK_POLL_MS;
     if (timestamp - this.#lastClockCheck < interval) return;
-    const clock = await this.#client.getMarketClock();
     this.#lastClockCheck = timestamp;
+    let clock: Awaited<ReturnType<SpyOptionsRuntimeClient["getMarketClock"]>>;
+    try {
+      clock = await this.#client.getMarketClock();
+    } catch (error) {
+      this.#marketClockAvailable = false;
+      this.#lastMarketClockError = error instanceof Error ? error.message : String(error);
+      throw error;
+    }
+    this.#marketClockAvailable = true;
+    this.#lastMarketClockError = undefined;
     this.#marketOpen = clock.isOpen;
     if (!clock.isOpen && !this.#marketDataIdle) {
       await this.#enterMarketClosedIdle(clock.timestamp);
@@ -1236,7 +1508,7 @@ export class SpyOptionsTradingRuntime {
     this.#marketDataIdle = true;
     this.#optionConnected = false;
     this.#optionQuoteStalled = false;
-    this.#optionQuoteExpectedSince = undefined;
+    this.#providerDelayDiagnosticReconnectAttempted = false;
     if (this.#optionReconnectTimer) clearTimeout(this.#optionReconnectTimer);
     this.#optionReconnectTimer = undefined;
     const subscribedSymbols = [...this.#subscribedSymbols];
@@ -1269,7 +1541,7 @@ export class SpyOptionsTradingRuntime {
     if (this.#stopping || !this.#marketOpen || !this.#marketDataIdle) return;
     this.#marketDataIdle = false;
     this.#optionQuoteStalled = false;
-    const latestQuote = await this.#client.getLatestSpySipQuote();
+    const latestQuote = await this.#getLatestSipQuote();
     this.#lastSpot = (latestQuote.bidPrice + latestQuote.askPrice) / 2;
     await this.#stockReceiver.start();
     await this.#startUniverseRefresh(this.#lastSpot, timestamp, true);
@@ -1333,7 +1605,7 @@ export class SpyOptionsTradingRuntime {
       marketDate: marketDate(timestamp, this.#config.timeZone),
       type,
       configVersion: this.#config.version,
-      data,
+      data: { underlying: this.#config.symbol, ...data },
     });
     if (!this.#recorder.healthy()) throw new Error("Runtime audit recorder is unhealthy");
   }
@@ -1369,21 +1641,51 @@ export class SpyOptionsTradingRuntime {
 
   #recordOptionHistory(quotes: readonly OptionQuote[]): void {
     if (!this.#history || quotes.length === 0) return;
-    const receivedTimestamp = this.#now();
-    const date = marketDate(receivedTimestamp, this.#config.timeZone);
-    const historyEvents: HistoricalMarketEvent[] = quotes.map((quote) => ({
-      type: "option_quote",
-      providerTimestamp: quote.timestamp,
-      receivedTimestamp,
-      marketDate: date,
-      symbol: quote.symbol,
-      data: { ...quote },
-    }));
+    const historyEvents: HistoricalMarketEvent[] = quotes.map((quote) => {
+      const observation = this.#rawObservedQuotes.get(quote);
+      const receivedTimestamp = observation?.receiveWallTimestamp ?? this.#now();
+      return {
+        type: "option_quote",
+        providerTimestamp: quote.timestamp,
+        receivedTimestamp,
+        marketDate: marketDate(receivedTimestamp, this.#config.timeZone),
+        symbol: quote.symbol,
+        data: {
+          ...quote,
+          ...(observation
+            ? {
+                receiveMonotonicTimestamp: observation.receiveMonotonicTimestamp,
+                ...(observation.websocketConnectionId !== undefined
+                  ? { websocketConnectionId: observation.websocketConnectionId } : {}),
+                ...(observation.subscriptionSymbols
+                  ? { subscriptionSymbols: observation.subscriptionSymbols } : {}),
+                correctedProviderAgeMs: receivedTimestamp - quote.timestamp,
+                messageFingerprint: optionQuoteFingerprint(quote),
+              }
+            : {}),
+        },
+      };
+    });
     if (this.#history.recordMarketEvents) this.#history.recordMarketEvents(historyEvents);
     else for (const event of historyEvents) this.#history.recordMarketEvent(event);
   }
 
-  #emit(type: string, data: Record<string, unknown>): void { this.#onEvent?.(type, data); }
+  #emit(type: string, data: Record<string, unknown>): void {
+    this.#onEvent?.(type, { underlying: this.#config.symbol, ...data });
+  }
+
+  async #getLatestSipQuote(): Promise<StockQuote> {
+    const quote = this.#client.getLatestUnderlyingSipQuote
+      ? await this.#client.getLatestUnderlyingSipQuote(this.#config.symbol)
+      : this.#config.symbol === "SPY" && this.#client.getLatestSpySipQuote
+      ? await this.#client.getLatestSpySipQuote()
+      : undefined;
+    if (!quote) throw new Error(`${this.#config.symbol} runtime client cannot fetch its latest SIP quote`);
+    if (quote.symbol !== this.#config.symbol) {
+      throw new Error(`${this.#config.symbol} runtime received latest quote for ${quote.symbol}`);
+    }
+    return quote;
+  }
 }
 
 function entryFeatureSummary(feature: FeatureSnapshot): Record<string, unknown> {
@@ -1449,7 +1751,7 @@ export interface RestoredRuntimeState {
 }
 
 export function restoreRuntimeState(
-  events: readonly AuditEvent[], timestamp: number, timeZone: string,
+  events: readonly AuditEvent[], timestamp: number, timeZone: string, underlying: UnderlyingSymbol = "SPY",
 ): RestoredRuntimeState {
   const date = marketDate(timestamp, timeZone);
   const knownClientOrderIds = new Set<string>();
@@ -1460,6 +1762,7 @@ export function restoreRuntimeState(
   let realizedPnl = 0;
 
   for (const event of events) {
+    if (!auditEventBelongsToUnderlying(event, underlying)) continue;
     if (event.type === "broker_order_request") {
       const order = objectValue(event.data.order);
       const clientOrderId = stringValue(order.clientOrderId);
@@ -1499,6 +1802,24 @@ export function restoreRuntimeState(
     risk: { marketDate: date, entries: filledEntries.size, realizedPnl },
     knownClientOrderIds,
   };
+}
+
+function auditEventBelongsToUnderlying(event: AuditEvent, underlying: UnderlyingSymbol): boolean {
+  const tagged = stringValue(event.data.underlying);
+  if (tagged) return tagged === underlying;
+  const candidates = [
+    stringValue(event.data.symbol),
+    stringValue(objectValue(event.data.order).symbol),
+    stringValue(objectValue(event.data.position).symbol),
+    stringValue(objectValue(event.data.localOrder).symbol),
+  ];
+  for (const symbol of candidates) {
+    const parsed = symbol ? parseOccSymbol(symbol) : undefined;
+    if (parsed) return parsed.underlying === underlying;
+    if (symbol === "SPY" || symbol === "QQQ") return symbol === underlying;
+  }
+  // Untagged historical audit events predate multi-underlying support and are SPY-only.
+  return underlying === "SPY";
 }
 
 function objectValue(value: unknown): Record<string, unknown> {

@@ -2,7 +2,7 @@ import type { EngineConfig } from "../config.js";
 import { defaultConfig } from "../config.js";
 import type {
   AccountState, CalibrationProfile, FeatureSnapshot, OptionCandidateEvaluation, OptionQuote, PositionState,
-  RegimeDecision, ReplayEvent, RiskDecision, SecondBar, TradeSignal,
+  RegimeDecision, ReplayEvent, RiskDecision, SecondBar, TradeSignal, UnderlyingSymbol,
 } from "../types.js";
 import { SecondAggregator } from "../features/secondAggregator.js";
 import { FeatureEngine } from "../features/featureEngine.js";
@@ -23,6 +23,7 @@ import { SerializedDecisionQueue } from "../execution/tradingEngine.js";
 import { MemoryRecorder, type AuditRecorder } from "../ops/recorder.js";
 import { computeStrategyMetrics, type CompletedTrade, type StrategyMetrics } from "./metrics.js";
 import { businessDaysBetween, marketDate } from "../utils/time.js";
+import { parseOccSymbol } from "../options/occSymbol.js";
 
 export type FillModel = "conservative" | "midpoint-touch" | "queue";
 
@@ -68,6 +69,7 @@ export interface ReplayFunnel {
 
 export interface ReplayResult {
   metadata: {
+    underlying: UnderlyingSymbol;
     configVersion: string;
     fillModel: FillModel;
     calibrationVersion: string | null;
@@ -157,22 +159,28 @@ export class ReplayEngine {
       await this.#handleBars(this.#aggregator.flushThrough(event.timestamp));
       switch (event.type) {
         case "stock_quote": {
+          this.#assertUnderlying(event.data.symbol);
           const result = this.#aggregator.ingestQuote(event.data);
           if (result.rejected) this.#audit(event.timestamp, "stock_quote_rejected", { reasons: result.rejected.reasons });
           await this.#handleBars(result.bars);
           break;
         }
         case "stock_trade": {
+          this.#assertUnderlying(event.data.symbol);
           const result = this.#aggregator.ingestTrade(event.data);
           if (result.rejected) this.#audit(event.timestamp, "stock_trade_rejected", { reasons: result.rejected.reasons });
           await this.#handleBars(result.bars);
           break;
         }
         case "option_contract":
+          if (event.data.underlying !== this.#config.symbol) {
+            throw new Error(`${this.#config.symbol} replay rejected ${event.data.underlying} option contract`);
+          }
           this.#book.upsertContract(event.data);
           this.#contracts.set(event.data.symbol, event as ReplayEvent & { type: "option_contract" });
           break;
         case "option_quote":
+          this.#assertOptionUnderlying(event.data.symbol);
           if (!this.#book.updateQuote(event.data)) {
             this.#audit(event.timestamp, "option_quote_rejected", { reason: "OUT_OF_ORDER", symbol: event.data.symbol });
           } else if (this.#pendingOptionSelection) {
@@ -180,9 +188,11 @@ export class ReplayEngine {
           }
           break;
         case "option_snapshot":
+          this.#assertOptionUnderlying(event.data.symbol);
           if (!this.#book.updateSnapshot(event.data)) this.#audit(event.timestamp, "option_snapshot_rejected", { reason: "OUT_OF_ORDER", symbol: event.data.symbol });
           break;
         case "prior_close":
+          this.#assertUnderlying(event.data.symbol);
           this.#features.setPriorClose(event.data.close);
           break;
       }
@@ -197,8 +207,21 @@ export class ReplayEngine {
     if (receivedTimestamp < this.#lastTimestamp) {
       throw new Error(`Replay timestamp decreased: ${receivedTimestamp} < ${this.#lastTimestamp}`);
     }
+    this.#assertUnderlying(feature.symbol);
     this.#lastTimestamp = receivedTimestamp;
     await this.#queue.enqueue(() => this.#handleFeature(feature));
+  }
+
+  #assertUnderlying(symbol: string): void {
+    if (symbol !== this.#config.symbol) {
+      throw new Error(`${this.#config.symbol} replay rejected ${symbol} underlying data`);
+    }
+  }
+
+  #assertOptionUnderlying(symbol: string): void {
+    if (parseOccSymbol(symbol)?.underlying !== this.#config.symbol) {
+      throw new Error(`${this.#config.symbol} replay rejected cross-underlying option ${symbol}`);
+    }
   }
 
   async finish(): Promise<ReplayResult> {
@@ -211,6 +234,7 @@ export class ReplayEngine {
     const auditEvents = this.#recorder === this.#memoryRecorder ? this.#memoryRecorder.events.slice() : [];
     return {
       metadata: {
+        underlying: this.#config.symbol,
         configVersion: this.#config.version,
         fillModel: this.#fillModel,
         calibrationVersion: this.#calibration?.version ?? null,

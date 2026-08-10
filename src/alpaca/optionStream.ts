@@ -1,10 +1,23 @@
 import type { OptionQuote } from "../types.js";
+import { performance } from "node:perf_hooks";
 import WebSocket, { type RawData } from "ws";
 import { decode, encode } from "@msgpack/msgpack";
+import {
+  parseRfc3339ToMs, type OpraQuoteObservation,
+} from "../marketData/opraQuoteHealth.js";
+
+export interface OptionStreamActivity {
+  receiveWallTimestamp: number;
+  receiveMonotonicTimestamp: number;
+}
 
 export interface OptionStreamHandlers {
   onQuote(quote: OptionQuote): void | Promise<void>;
   onQuotes?(quotes: readonly OptionQuote[]): void | Promise<void>;
+  /** Synchronous raw-arrival observation, before coalescing or asynchronous consumers. */
+  onQuoteObservations?(observations: readonly OpraQuoteObservation[]): void;
+  /** Any OPRA frame, including control frames and frames for other subscribed symbols. */
+  onActivity?(activity: OptionStreamActivity): void;
   onState?(connected: boolean): void;
   onSubscriptions?(symbols: readonly string[]): void;
   onError?(error: unknown): void;
@@ -24,16 +37,20 @@ export interface AlpacaOptionStreamConfig {
   sandbox?: boolean;
   url?: string;
   connectTimeoutMs?: number;
+  now?: () => number;
+  monotonicNow?: () => number;
 }
 
 export class AlpacaOptionWebSocket implements OptionStream {
   readonly #config: Required<Omit<AlpacaOptionStreamConfig, "url">> & { url: string };
   readonly #symbols = new Set<string>();
-  readonly #pendingQuotes: OptionQuote[] = [];
+  readonly #pendingLatestQuotes = new Map<string, OptionQuote>();
   #socket: WebSocket | undefined;
   #handlers: OptionStreamHandlers | undefined;
   #authenticated = false;
   #dispatching = false;
+  #connectionSequence = 0;
+  #activeConnectionId = 0;
   #dispatchTail: Promise<void> = Promise.resolve();
   #subscriptionTail: Promise<void> = Promise.resolve();
   #subscriptionWaiter: {
@@ -54,6 +71,8 @@ export class AlpacaOptionWebSocket implements OptionStream {
       sandbox,
       url: config.url ?? `wss://${host}/v1beta1/${feed}`,
       connectTimeoutMs: config.connectTimeoutMs ?? 10_000,
+      now: config.now ?? Date.now,
+      monotonicNow: config.monotonicNow ?? performance.now.bind(performance),
     };
   }
 
@@ -68,6 +87,7 @@ export class AlpacaOptionWebSocket implements OptionStream {
   connect(handlers: OptionStreamHandlers): Promise<void> {
     if (this.#socket) throw new Error("Option stream is already connected");
     this.#handlers = handlers;
+    this.#activeConnectionId = ++this.#connectionSequence;
     return new Promise((resolve, reject) => {
       let settled = false;
       const socket = new WebSocket(this.#config.url, {
@@ -96,7 +116,10 @@ export class AlpacaOptionWebSocket implements OptionStream {
       };
       socket.on("open", () => this.#send({ action: "auth", key: this.#config.apiKey, secret: this.#config.apiSecret }));
       socket.on("message", (data: RawData) => {
+        const receiveWallTimestamp = this.#config.now();
+        const receiveMonotonicTimestamp = this.#config.monotonicNow();
         try {
+          handlers.onActivity?.({ receiveWallTimestamp, receiveMonotonicTimestamp });
           const binary = data instanceof ArrayBuffer ? new Uint8Array(data) : new Uint8Array(data as Buffer);
           const decoded = decode(binary) as Array<Record<string, unknown>>;
           const quotes: OptionQuote[] = [];
@@ -119,7 +142,16 @@ export class AlpacaOptionWebSocket implements OptionStream {
             } else if (message.T === "q") quotes.push(adaptAlpacaOptionQuote(message));
             else if (message.T === "error") throw new Error(`Alpaca option stream error ${String(message.code)}: ${String(message.msg)}`);
           }
-          if (quotes.length > 0) this.#enqueueQuotes(quotes);
+          if (quotes.length > 0) {
+            handlers.onQuoteObservations?.(quotes.map((quote) => ({
+              quote,
+              receiveWallTimestamp,
+              receiveMonotonicTimestamp,
+              websocketConnectionId: this.#activeConnectionId,
+              subscriptionSymbols: [...this.#symbols],
+            })));
+            this.#enqueueQuotes(quotes);
+          }
         } catch (error) {
           this.#failSubscriptionWaiter(error);
           rejectOnce(error);
@@ -231,7 +263,12 @@ export class AlpacaOptionWebSocket implements OptionStream {
   }
 
   #enqueueQuotes(quotes: readonly OptionQuote[]): void {
-    this.#pendingQuotes.push(...quotes);
+    for (const quote of quotes) {
+      const pending = this.#pendingLatestQuotes.get(quote.symbol);
+      if (!pending || quote.timestamp >= pending.timestamp) {
+        this.#pendingLatestQuotes.set(quote.symbol, quote);
+      }
+    }
     if (this.#dispatching) return;
     this.#dispatching = true;
     this.#dispatchTail = this.#drainQuotes();
@@ -239,20 +276,27 @@ export class AlpacaOptionWebSocket implements OptionStream {
 
   async #drainQuotes(): Promise<void> {
     try {
-      while (this.#pendingQuotes.length > 0) {
-        const quotes = this.#pendingQuotes.splice(0);
+      while (this.#pendingLatestQuotes.size > 0) {
+        const quotes = [...this.#pendingLatestQuotes.values()]
+          .sort((left, right) => left.timestamp - right.timestamp || left.symbol.localeCompare(right.symbol));
+        this.#pendingLatestQuotes.clear();
         const handlers = this.#handlers;
-        if (!handlers) continue;
-        if (handlers.onQuotes) await handlers.onQuotes(quotes);
-        else for (const quote of quotes) await handlers.onQuote(quote);
+        if (handlers) {
+          if (handlers.onQuotes) await handlers.onQuotes(quotes);
+          else for (const quote of quotes) await handlers.onQuote(quote);
+        }
       }
     } catch (error) {
-      this.#pendingQuotes.length = 0;
+      this.#pendingLatestQuotes.clear();
       this.#handlers?.onError?.(error);
       this.#socket?.close();
     } finally {
       this.#dispatching = false;
-      if (this.#pendingQuotes.length > 0) this.#enqueueQuotes([]);
+      if (this.#pendingLatestQuotes.size > 0) {
+        const quotes = [...this.#pendingLatestQuotes.values()];
+        this.#pendingLatestQuotes.clear();
+        this.#enqueueQuotes(quotes);
+      }
     }
   }
 
@@ -267,11 +311,17 @@ export function adaptAlpacaOptionQuote(raw: Record<string, unknown>): OptionQuot
     symbol: raw.S,
     // MsgPack timestamp extensions are decoded to Date instances even though
     // Alpaca documents the logical field as an RFC-3339 string.
-    timestamp: raw.t instanceof Date ? raw.t.getTime() : typeof raw.t === "string" ? Date.parse(raw.t) : raw.t,
+    timestamp: raw.t instanceof Date ? raw.t.getTime() :
+      typeof raw.t === "string" ? parseRfc3339ToMs(raw.t) : raw.t,
     bidPrice: raw.bp,
     askPrice: raw.ap,
     bidSize: raw.bs,
     askSize: raw.as,
+    ...(typeof raw.bx === "string" ? { bidExchange: raw.bx } : {}),
+    ...(typeof raw.ax === "string" ? { askExchange: raw.ax } : {}),
+    ...(Array.isArray(raw.c)
+      ? { conditions: raw.c.filter((condition): condition is string => typeof condition === "string") }
+      : typeof raw.c === "string" ? { conditions: [raw.c] } : {}),
   };
   if (typeof quote.symbol !== "string" || ![quote.timestamp, quote.bidPrice, quote.askPrice, quote.bidSize, quote.askSize].every(Number.isFinite)) {
     throw new Error("Invalid Alpaca option quote payload");

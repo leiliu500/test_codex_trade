@@ -1,5 +1,7 @@
 import defaultConfigJson from "../config/default.json" with { type: "json" };
+import qqqConfigJson from "../config/qqq.json" with { type: "json" };
 import { parseClock } from "./utils/time.js";
+import type { UnderlyingSymbol } from "./types.js";
 
 export type FollowThroughScope = "BULLISH_IMPULSE" | "IMPULSE" | "ALL";
 export type EntryConfirmationMode = "SHADOW" | "ENFORCE";
@@ -8,7 +10,7 @@ export type MorningEntryGuardMode = "DISABLED" | "ENFORCE";
 
 export interface EngineConfig {
   version: string;
-  symbol: "SPY";
+  symbol: UnderlyingSymbol;
   timeZone: string;
   session: {
     marketOpen: string;
@@ -253,6 +255,9 @@ export function mergeConfig(overrides: Partial<EngineConfig> = {}): EngineConfig
   return merge(defaultConfig, overrides) as EngineConfig;
 }
 
+/** QQQ starts from the unchanged SPY baseline but has an independent versioned override surface. */
+export const qqqConfig = deepFreeze(mergeConfig(qqqConfigJson as Partial<EngineConfig>));
+
 export function validateConfig(config: EngineConfig): void {
   const fractions = [
     config.regression.halfLifeFraction,
@@ -280,7 +285,7 @@ export function validateConfig(config: EngineConfig): void {
     throw new Error("Regression requires at least 3 points and one IRLS iteration");
   }
   if (config.options.expirationDaysMin !== 0 || config.options.expirationDaysMax !== 0) {
-    throw new Error("This engine is hard-limited to SPY options expiring on the current market date (0DTE)");
+    throw new Error(`The ${config.symbol} engine is hard-limited to options expiring on the current market date (0DTE)`);
   }
   if (!(Number.isFinite(config.options.minDailyVolume) && config.options.minDailyVolume >= 0 &&
         Number.isFinite(config.options.minOpenInterest) && config.options.minOpenInterest >= 0 &&
