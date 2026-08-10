@@ -95,19 +95,35 @@ test("shared SIP and OPRA hubs route events and union subscriptions without cros
   const optionHub = new SharedOptionStreamHub(option, ["SPY", "QQQ"]);
   const spyOptions: string[] = [];
   const qqqOptions: string[] = [];
+  const spyObservations: string[] = [];
+  const qqqObservations: string[] = [];
+  let spyActivities = 0;
+  let qqqActivities = 0;
   const spyOptionChannel = optionHub.channel("SPY");
   const qqqOptionChannel = optionHub.channel("QQQ");
   await spyOptionChannel.subscribe([spyOption]);
   await qqqOptionChannel.subscribe([qqqOption]);
   await Promise.all([
-    spyOptionChannel.connect(optionCollector(spyOptions)),
-    qqqOptionChannel.connect(optionCollector(qqqOptions)),
+    spyOptionChannel.connect({
+      ...optionCollector(spyOptions),
+      onQuoteObservations: (observations) => spyObservations.push(...observations.map(({ quote }) => quote.symbol)),
+      onActivity: () => { spyActivities += 1; },
+    }),
+    qqqOptionChannel.connect({
+      ...optionCollector(qqqOptions),
+      onQuoteObservations: (observations) => qqqObservations.push(...observations.map(({ quote }) => quote.symbol)),
+      onActivity: () => { qqqActivities += 1; },
+    }),
   ]);
   assert.deepEqual([...option.subscribed].sort(), [qqqOption, spyOption]);
   assert.equal(option.connectCalls, 1);
   await option.emit([optionQuote(spyOption), optionQuote(qqqOption)]);
   assert.deepEqual(spyOptions, [spyOption]);
   assert.deepEqual(qqqOptions, [qqqOption]);
+  assert.deepEqual(spyObservations, [spyOption]);
+  assert.deepEqual(qqqObservations, [qqqOption]);
+  assert.equal(spyActivities, 1);
+  assert.equal(qqqActivities, 1);
   await spyOptionChannel.close();
   assert.deepEqual([...option.subscribed], [qqqOption]);
   assert.equal(option.closeCalls, 0);
@@ -394,7 +410,13 @@ class FakeOptionStream implements OptionStream {
     handlers.onState?.(true);
   }
   async close(): Promise<void> { this.closeCalls += 1; this.handlers?.onState?.(false); }
-  async emit(quotes: readonly OptionQuote[]): Promise<void> { await this.handlers?.onQuotes?.(quotes); }
+  async emit(quotes: readonly OptionQuote[]): Promise<void> {
+    this.handlers?.onActivity?.({ receiveWallTimestamp: timestamp, receiveMonotonicTimestamp: timestamp });
+    this.handlers?.onQuoteObservations?.(quotes.map((quote) => ({
+      quote, receiveWallTimestamp: timestamp, receiveMonotonicTimestamp: timestamp,
+    })));
+    await this.handlers?.onQuotes?.(quotes);
+  }
 }
 
 class FakeMultiBroker implements MultiUnderlyingTradingRestClient {

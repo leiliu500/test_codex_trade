@@ -88,6 +88,14 @@ test("dashboard exposes liveness and feed tabs before any entries, orders, or hi
   assert.match(html, /h\.optionRestFallbackFreshQuotes/);
   assert.match(html, /h\.optionQuotePrimed/);
   assert.match(html, /h\.optionQuoteProviderLagged/);
+  assert.match(html, /h\.optionQuoteDiagnosis/);
+  assert.match(html, /PROVIDER DELAYED/);
+  assert.match(html, /CONTRACT IDLE/);
+  assert.match(html, /h\.optionExactSymbolReceiveAgeMs/);
+  assert.match(html, /h\.optionFreshContracts/);
+  assert.match(html, /h\.optionMedianArrivalLagMs/);
+  assert.match(html, /h\.optionRestCircuitState/);
+  assert.match(html, /REST diagnostic/);
   assert.match(html, /h\.optionQuoteStalled/);
   assert.match(html, /h\.optionSubscriptionsRequired/);
   assert.match(html, /opraSubscriptionIdle/);

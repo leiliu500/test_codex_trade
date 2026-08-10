@@ -9,6 +9,7 @@ import {
 import { marketDate } from "../utils/time.js";
 import { defaultConfig } from "../config.js";
 import { adaptAlpacaStockQuote } from "./stockStream.js";
+import { parseRfc3339ToMs } from "../marketData/opraQuoteHealth.js";
 
 export interface BrokerOrderRequest {
   clientOrderId: string;
@@ -214,11 +215,16 @@ export class AlpacaTradingRestClient implements MultiUnderlyingTradingRestClient
         this.#assertSameDaySymbol(symbol);
         const quote = {
           symbol,
-          timestamp: typeof item.t === "string" ? Date.parse(item.t) : item.t,
+          timestamp: typeof item.t === "string" ? parseRfc3339ToMs(item.t) : item.t,
           bidPrice: item.bp,
           askPrice: item.ap,
           bidSize: item.bs,
           askSize: item.as,
+          ...(typeof item.bx === "string" ? { bidExchange: item.bx } : {}),
+          ...(typeof item.ax === "string" ? { askExchange: item.ax } : {}),
+          ...(Array.isArray(item.c)
+            ? { conditions: item.c.filter((condition): condition is string => typeof condition === "string") }
+            : typeof item.c === "string" ? { conditions: [item.c] } : {}),
         };
         if (![quote.timestamp, quote.bidPrice, quote.askPrice, quote.bidSize, quote.askSize].every(Number.isFinite)) {
           throw new Error(`Invalid Alpaca latest option quote payload for ${symbol}`);

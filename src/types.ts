@@ -26,11 +26,15 @@ export interface StockTrade {
 
 export interface OptionQuote {
   symbol: string;
+  /** Provider event time. Never replace this with local receive time. */
   timestamp: number;
   bidPrice: number;
   askPrice: number;
   bidSize: number;
   askSize: number;
+  bidExchange?: string;
+  askExchange?: string;
+  conditions?: string[];
 }
 
 export interface OptionSnapshot {

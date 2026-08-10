@@ -40,6 +40,7 @@ export * from "./ops/killSwitch.js";
 export * from "./ops/tradingDashboard.js";
 export * from "./history/types.js";
 export * from "./history/postgresHistory.js";
+export * from "./marketData/opraQuoteHealth.js";
 export * from "./alpaca/stockStream.js";
 export * from "./alpaca/optionStream.js";
 export * from "./alpaca/restClient.js";

@@ -175,6 +175,22 @@ export class SharedOptionStreamHub {
     this.#connection ??= this.#physical.connect({
       onQuote: (quote) => this.#dispatch([quote]),
       onQuotes: (quotes) => this.#dispatch(quotes),
+      onActivity: (activity) => {
+        for (const channel of this.#channels.values()) {
+          if (!channel.active || !channel.handlers?.onActivity) continue;
+          try { channel.handlers.onActivity(activity); }
+          catch (error) { channel.handlers.onError?.(error); }
+        }
+      },
+      onQuoteObservations: (observations) => {
+        for (const channel of this.#channels.values()) {
+          if (!channel.active || !channel.handlers?.onQuoteObservations) continue;
+          const scoped = observations.filter((observation) => channel.desired.has(observation.quote.symbol));
+          if (scoped.length === 0) continue;
+          try { channel.handlers.onQuoteObservations(scoped); }
+          catch (error) { channel.handlers.onError?.(error); }
+        }
+      },
       onState: (connected) => {
         this.#connected = connected;
         if (!connected) {

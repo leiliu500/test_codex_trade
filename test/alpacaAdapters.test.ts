@@ -17,9 +17,14 @@ test("Alpaca market-data boundary maps official compact schemas", () => {
   assert.deepEqual(quote.conditions, ["R"]);
   const trade = adaptAlpacaStockTrade({ T: "t", S: "SPY", t: time, p: 500.01, s: 25, x: "D", c: ["@"] });
   assert.equal(trade.exchange, "D");
-  const option = adaptAlpacaOptionQuote({ T: "q", S: "SPY260724C00500000", t: time, bp: 1, ap: 1.02, bs: 20, as: 30 });
+  const option = adaptAlpacaOptionQuote({
+    T: "q", S: "SPY260724C00500000", t: time, bp: 1, ap: 1.02, bs: 20, as: 30,
+    bx: "C", ax: "H", c: "B",
+  });
   assert.equal(option.askPrice, 1.02);
   assert.ok(Number.isFinite(option.timestamp));
+  assert.equal(option.bidExchange, "C");
+  assert.deepEqual(option.conditions, ["B"]);
   const msgpackOption = adaptAlpacaOptionQuote({
     T: "q", S: "SPY260724C00500000", t: new Date(time), bp: 1, ap: 1.02, bs: 20, as: 30,
   });
@@ -126,6 +131,10 @@ test("OPRA backpressure keeps only the newest pending quote per contract", async
   });
 
   const batches: OptionQuote[][] = [];
+  const rawObservationProviderTimes: number[] = [];
+  const rawObservationReceiveTimes: number[] = [];
+  const rawObservationConnectionIds: number[] = [];
+  const rawObservationSubscriptionSizes: number[] = [];
   let releaseFirst!: () => void;
   let markFirstStarted!: () => void;
   let markSecondFinished!: () => void;
@@ -140,6 +149,14 @@ test("OPRA backpressure keeps only the newest pending quote per contract", async
   await stream.subscribe(symbols);
   await stream.connect({
     onQuote: () => undefined,
+    onQuoteObservations: (observations) => {
+      rawObservationProviderTimes.push(...observations.map((observation) => observation.quote.timestamp));
+      rawObservationReceiveTimes.push(...observations.map((observation) => observation.receiveWallTimestamp));
+      rawObservationConnectionIds.push(...observations.flatMap((observation) =>
+        observation.websocketConnectionId === undefined ? [] : [observation.websocketConnectionId]));
+      rawObservationSubscriptionSizes.push(...observations.map((observation) =>
+        observation.subscriptionSymbols?.length ?? 0));
+    },
     onQuotes: async (quotes) => {
       batches.push(quotes.map((quote) => ({ ...quote })));
       if (batches.length === 1) {
@@ -178,6 +195,11 @@ test("OPRA backpressure keeps only the newest pending quote per contract", async
     [symbols[1], 2],
     [symbols[0], 1.02],
   ]);
+  assert.equal(rawObservationProviderTimes.length, 5);
+  assert.ok(rawObservationProviderTimes.every(Number.isFinite));
+  assert.ok(rawObservationReceiveTimes.every(Number.isFinite));
+  assert.deepEqual(new Set(rawObservationConnectionIds), new Set([1]));
+  assert.ok(rawObservationSubscriptionSizes.every((size) => size === 2));
   await stream.close();
 });
 

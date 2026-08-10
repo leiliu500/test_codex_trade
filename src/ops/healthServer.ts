@@ -1,5 +1,6 @@
 import { createServer, type Server } from "node:http";
 import { tradingDashboardHtml, type TradingDashboardSnapshot } from "./tradingDashboard.js";
+import type { CircuitState, OpraQuoteDiagnosis } from "../marketData/opraQuoteHealth.js";
 
 export interface HealthState {
   ready: boolean;
@@ -15,6 +16,20 @@ export interface HealthState {
   lastOptionQuoteProviderAgeMs?: number;
   optionQuotePrimed?: boolean;
   optionQuoteProviderLagged?: boolean;
+  optionQuoteDiagnosis?: OpraQuoteDiagnosis;
+  optionTransportAgeMs?: number;
+  optionExactSymbolReceiveAgeMs?: number;
+  optionObservedContracts?: number;
+  optionActiveContracts?: number;
+  optionFreshContracts?: number;
+  optionDiagnosableContracts?: number;
+  optionDelayedContracts?: number;
+  optionDelayedContractFraction?: number;
+  optionFreshContractFraction?: number;
+  optionMedianArrivalLagMs?: number;
+  optionMedianAbsoluteDeviationMs?: number;
+  optionProviderAdvanceRatio?: number;
+  optionProviderTimeVelocity?: number;
   optionQuoteFreshnessThresholdMs?: number;
   optionQuoteStalled?: boolean;
   optionQuoteStallThresholdMs?: number;
@@ -23,6 +38,10 @@ export interface HealthState {
   optionRestFallbackInFlight?: boolean;
   optionRestFallbackRequests?: number;
   optionRestFallbackFreshQuotes?: number;
+  optionRestRepeatedQuotes?: number;
+  optionRestCircuitState?: CircuitState;
+  optionRestCircuitFailures?: number;
+  optionRestCircuitRetryAfterMs?: number;
   lastOptionRestFallbackAgeMs?: number;
   lastOptionRestQuoteProviderAgeMs?: number;
   lastOptionRestFallbackError?: string;
@@ -91,6 +110,27 @@ export function combineHealthStates(states: Readonly<Record<string, HealthState>
   const lastOptionRestQuoteProviderAgeMs = maximum("lastOptionRestQuoteProviderAgeMs");
   const optionQuoteFreshnessThresholdMs = minimum("optionQuoteFreshnessThresholdMs");
   const optionQuoteStallThresholdMs = minimum("optionQuoteStallThresholdMs");
+  const diagnosisPriority: OpraQuoteDiagnosis[] = [
+    "HEALTHY", "NO_DATA", "CONTRACT_IDLE", "OLD_EVENT_ARRIVED", "PROVIDER_DELAYED", "TRANSPORT_DISCONNECTED",
+  ];
+  const optionQuoteDiagnosis = values
+    .flatMap((state) => state.optionQuoteDiagnosis ? [state.optionQuoteDiagnosis] : [])
+    .sort((left, right) => diagnosisPriority.indexOf(right) - diagnosisPriority.indexOf(left))[0];
+  const optionDiagnosableContracts = sum("optionDiagnosableContracts");
+  const optionDelayedContracts = sum("optionDelayedContracts");
+  const optionFreshContracts = sum("optionFreshContracts");
+  const subscribedOptionContracts = sum("subscribedOptionContracts");
+  const circuitPriority: CircuitState[] = ["CLOSED", "HALF_OPEN", "OPEN"];
+  const optionRestCircuitState = values
+    .flatMap((state) => state.optionRestCircuitState ? [state.optionRestCircuitState] : [])
+    .sort((left, right) => circuitPriority.indexOf(right) - circuitPriority.indexOf(left))[0];
+  const optionTransportAgeMs = maximum("optionTransportAgeMs");
+  const optionExactSymbolReceiveAgeMs = maximum("optionExactSymbolReceiveAgeMs");
+  const optionMedianArrivalLagMs = maximum("optionMedianArrivalLagMs");
+  const optionMedianAbsoluteDeviationMs = maximum("optionMedianAbsoluteDeviationMs");
+  const optionProviderAdvanceRatio = minimum("optionProviderAdvanceRatio");
+  const optionProviderTimeVelocity = minimum("optionProviderTimeVelocity");
+  const optionRestCircuitRetryAfterMs = maximum("optionRestCircuitRetryAfterMs");
   return {
     ready: values.every((state) => state.ready),
     brokerRequired: values.some((state) => state.brokerRequired !== false),
@@ -103,6 +143,22 @@ export function combineHealthStates(states: Readonly<Record<string, HealthState>
     ...(lastOptionQuoteProviderAgeMs !== undefined ? { lastOptionQuoteProviderAgeMs } : {}),
     optionQuotePrimed: values.every((state) => state.optionQuotePrimed !== false),
     optionQuoteProviderLagged: values.some((state) => state.optionQuoteProviderLagged === true),
+    ...(optionQuoteDiagnosis ? { optionQuoteDiagnosis } : {}),
+    ...(optionTransportAgeMs !== undefined ? { optionTransportAgeMs } : {}),
+    ...(optionExactSymbolReceiveAgeMs !== undefined ? { optionExactSymbolReceiveAgeMs } : {}),
+    optionObservedContracts: sum("optionObservedContracts"),
+    optionActiveContracts: sum("optionActiveContracts"),
+    optionFreshContracts,
+    optionDiagnosableContracts,
+    optionDelayedContracts,
+    optionDelayedContractFraction: optionDiagnosableContracts === 0
+      ? 0 : optionDelayedContracts / optionDiagnosableContracts,
+    optionFreshContractFraction: subscribedOptionContracts === 0
+      ? 0 : optionFreshContracts / subscribedOptionContracts,
+    ...(optionMedianArrivalLagMs !== undefined ? { optionMedianArrivalLagMs } : {}),
+    ...(optionMedianAbsoluteDeviationMs !== undefined ? { optionMedianAbsoluteDeviationMs } : {}),
+    ...(optionProviderAdvanceRatio !== undefined ? { optionProviderAdvanceRatio } : {}),
+    ...(optionProviderTimeVelocity !== undefined ? { optionProviderTimeVelocity } : {}),
     ...(optionQuoteFreshnessThresholdMs !== undefined ? { optionQuoteFreshnessThresholdMs } : {}),
     optionQuoteStalled: values.some((state) => state.optionQuoteStalled === true),
     ...(optionQuoteStallThresholdMs !== undefined ? { optionQuoteStallThresholdMs } : {}),
@@ -111,6 +167,10 @@ export function combineHealthStates(states: Readonly<Record<string, HealthState>
     optionRestFallbackInFlight: values.some((state) => state.optionRestFallbackInFlight === true),
     optionRestFallbackRequests: sum("optionRestFallbackRequests"),
     optionRestFallbackFreshQuotes: sum("optionRestFallbackFreshQuotes"),
+    optionRestRepeatedQuotes: sum("optionRestRepeatedQuotes"),
+    ...(optionRestCircuitState ? { optionRestCircuitState } : {}),
+    optionRestCircuitFailures: sum("optionRestCircuitFailures"),
+    ...(optionRestCircuitRetryAfterMs !== undefined ? { optionRestCircuitRetryAfterMs } : {}),
     ...(lastOptionRestFallbackAgeMs !== undefined ? { lastOptionRestFallbackAgeMs } : {}),
     ...(lastOptionRestQuoteProviderAgeMs !== undefined ? { lastOptionRestQuoteProviderAgeMs } : {}),
     ...(values.find((state) => state.lastOptionRestFallbackError)?.lastOptionRestFallbackError
@@ -134,7 +194,7 @@ export function combineHealthStates(states: Readonly<Record<string, HealthState>
     accountOptionsApproved: values.every((state) => state.accountOptionsApproved !== false),
     positionOpen: values.some((state) => state.positionOpen === true),
     pendingOrder: values.some((state) => state.pendingOrder === true),
-    subscribedOptionContracts: sum("subscribedOptionContracts"),
+    subscribedOptionContracts,
     brokerAvailable: values.filter((state) => state.brokerRequired !== false).every((state) => state.brokerAvailable),
     marketClockState: marketStates.size === 1 ? values[0]!.marketClockState : "mixed",
     marketClockAvailable: values.every((state) => state.marketClockAvailable !== false),
