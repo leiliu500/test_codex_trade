@@ -245,6 +245,50 @@ test("SPY SIP receiver serializes quotes and trades into completed feature bars"
   await receiver.close();
 });
 
+test("SIP session reset does not expand the overnight gap into synthetic live bars", async () => {
+  const stream = new FakeStockStream();
+  const firstSession = zonedDateTimeToEpoch("2026-07-22", "15:59:58");
+  const nextSession = zonedDateTimeToEpoch("2026-07-23", "09:30:00");
+  let now = firstSession;
+  const featureTimestamps: number[] = [];
+  const receiver = new SpySipReceiver({
+    config: defaultConfig,
+    stream,
+    now: () => now,
+    flushIntervalMs: 60_000,
+    onFeature: (feature) => { featureTimestamps.push(feature.timestamp); },
+  });
+
+  await receiver.start();
+  await stream.quote({
+    symbol: "SPY", timestamp: firstSession + 100,
+    bidPrice: 500, askPrice: 500.01, bidSize: 100, askSize: 100,
+  });
+  await stream.quote({
+    symbol: "SPY", timestamp: firstSession + 1_100,
+    bidPrice: 500.01, askPrice: 500.02, bidSize: 100, askSize: 100,
+  });
+  assert.equal(receiver.healthState().completedBars, 1);
+  await receiver.close();
+
+  receiver.resetSessionState();
+  now = nextSession + 2_000;
+  await receiver.start();
+  await stream.quote({
+    symbol: "SPY", timestamp: nextSession + 100,
+    bidPrice: 501, askPrice: 501.01, bidSize: 100, askSize: 100,
+  });
+  await stream.quote({
+    symbol: "SPY", timestamp: nextSession + 1_100,
+    bidPrice: 501.01, askPrice: 501.02, bidSize: 100, askSize: 100,
+  });
+
+  assert.equal(receiver.healthState().completedBars, 2);
+  assert.deepEqual(featureTimestamps, [firstSession + 1_000, nextSession + 1_000]);
+  assert.equal(receiver.healthState().lastFeatureTimestamp, nextSession + 1_000);
+  await receiver.close();
+});
+
 test("SPY SIP receiver processes burst events in causal batches without dropping feature inputs", async () => {
   const stream = new FakeStockStream();
   const start = Date.parse("2026-07-22T14:30:00Z");

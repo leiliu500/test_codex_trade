@@ -49,9 +49,9 @@ export class SpySipReceiver {
   readonly #onStockEvents: ((events: readonly StockStreamEvent[]) => void | Promise<void>) | undefined;
   readonly #onFeature: ((feature: FeatureSnapshot) => void | Promise<void>) | undefined;
   readonly #onError: ((error: unknown) => void) | undefined;
-  readonly #aggregator: SecondAggregator;
-  readonly #features: FeatureEngine;
-  readonly #queue = new SerializedDecisionQueue();
+  #aggregator: SecondAggregator;
+  #features: FeatureEngine;
+  #queue = new SerializedDecisionQueue();
   #flushTimer: ReturnType<typeof setInterval> | undefined;
   #reconnectTimer: ReturnType<typeof setTimeout> | undefined;
   #started = false;
@@ -233,6 +233,28 @@ export class SpySipReceiver {
     this.#reconnectTimer = undefined;
     await this.#stream.close();
     await this.#queue.drained();
+  }
+
+  /**
+   * Discards provider-time and feature state before reconnecting for a new market session.
+   * Reusing the prior session's open second would otherwise expand the overnight gap into
+   * tens of thousands of empty one-second bars when the first new quote arrives.
+   */
+  resetSessionState(featureCheckpoint?: FeatureSnapshot): void {
+    if (this.#started) {
+      throw new Error(`Cannot reset ${this.#config.symbol} SIP state while the receiver is started`);
+    }
+    this.#aggregator = new SecondAggregator(this.#config.dataQuality);
+    this.#features = new FeatureEngine(this.#config);
+    if (featureCheckpoint) this.#features.restoreCheckpoint(featureCheckpoint);
+    this.#queue = new SerializedDecisionQueue();
+    this.#bufferedEvents.length = 0;
+    this.#lastQuoteTimestamp = undefined;
+    this.#lastTradeTimestamp = undefined;
+    this.#lastProviderTimestamp = undefined;
+    this.#lastFeatureTimestamp = undefined;
+    this.#lastFeature = undefined;
+    this.#lastStreamError = undefined;
   }
 
   healthState(killSwitch = false): HealthState {

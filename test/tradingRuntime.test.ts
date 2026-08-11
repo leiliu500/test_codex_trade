@@ -356,6 +356,15 @@ test("market close disconnects activity and the next open reconnects automatical
   await runtime.start();
   assert.equal(stockStream.connectCalls, 1);
   assert.equal(optionStream.connectCalls, 1);
+  await stockStream.handlers?.onQuote({
+    symbol: "SPY", timestamp: decisionTime + 100,
+    bidPrice: 500, askPrice: 500.01, bidSize: 100, askSize: 100,
+  });
+  await stockStream.handlers?.onQuote({
+    symbol: "SPY", timestamp: decisionTime + 1_100,
+    bidPrice: 500.01, askPrice: 500.02, bidSize: 100, askSize: 100,
+  });
+  assert.equal(runtime.healthState().completedBars, 1);
 
   decisionTime = zonedDateTimeToEpoch(date, "16:00:01");
   client.clock = { timestamp: decisionTime, isOpen: false };
@@ -371,7 +380,17 @@ test("market close disconnects activity and the next open reconnects automatical
   decisionTime = zonedDateTimeToEpoch("2026-07-23", "09:30:01");
   client.clock = { timestamp: decisionTime, isOpen: true };
   await waitFor(() => stockStream.connectCalls === 2 && optionStream.connectCalls === 2);
+  await stockStream.handlers?.onQuote({
+    symbol: "SPY", timestamp: decisionTime + 100,
+    bidPrice: 501, askPrice: 501.01, bidSize: 100, askSize: 100,
+  });
+  await stockStream.handlers?.onQuote({
+    symbol: "SPY", timestamp: decisionTime + 1_100,
+    bidPrice: 501.01, askPrice: 501.02, bidSize: 100, askSize: 100,
+  });
   assert.equal(runtime.healthState().marketDataIdle, false);
+  assert.equal(runtime.healthState().completedBars, 2);
+  assert.equal(runtime.healthState().lastFeatureTimestamp, decisionTime + 1_000);
   assert.ok(recorder.events.some((event) => event.type === "market_session_resumed"));
   await runtime.close();
 });
