@@ -83,6 +83,19 @@ export function parseRfc3339ToMs(timestamp: string): number {
   return result;
 }
 
+/**
+ * Converts two wall-clock timestamps into provider latency after removing a
+ * known local-minus-provider clock offset. A negative result is intentionally
+ * retained so a bad offset cannot be mistaken for zero latency.
+ */
+export function correctedProviderLatencyMs(
+  receivedTimestamp: number,
+  providerTimestamp: number,
+  clockOffsetMs = 0,
+): number {
+  return receivedTimestamp - providerTimestamp - clockOffsetMs;
+}
+
 export function median(values: readonly number[]): number {
   if (values.length === 0) return Number.NaN;
   const sorted = [...values].sort((left, right) => left - right);
@@ -124,7 +137,7 @@ export function assessRestQuote(
   maximumAgeMs = 2_000,
   clockOffsetMs = 0,
 ): RestQuoteAssessment {
-  const providerAgeMs = observedAtMs - quote.timestamp - clockOffsetMs;
+  const providerAgeMs = correctedProviderLatencyMs(observedAtMs, quote.timestamp, clockOffsetMs);
   return {
     providerAgeMs,
     fresh: providerAgeMs >= 0 && providerAgeMs <= maximumAgeMs,
@@ -173,7 +186,11 @@ export class OpraQuoteHealthMonitor {
       providerTimestamp: quote.timestamp,
       receiveWallTimestamp,
       receiveMonotonicTimestamp,
-      arrivalLagMs: receiveWallTimestamp - quote.timestamp - this.#clockOffsetMs,
+      arrivalLagMs: correctedProviderLatencyMs(
+        receiveWallTimestamp,
+        quote.timestamp,
+        this.#clockOffsetMs,
+      ),
       fingerprint: optionQuoteFingerprint(quote),
     });
     if (observations.length > this.#maximumHistoryPerSymbol) {
@@ -216,7 +233,11 @@ export class OpraQuoteHealthMonitor {
 
     const latest = observations.at(-1)!;
     const symbolReceiveAgeMs = Math.max(0, nowMonotonicTimestamp - latest.receiveMonotonicTimestamp);
-    const latestProviderAgeMs = nowWallTimestamp - latest.providerTimestamp - this.#clockOffsetMs;
+    const latestProviderAgeMs = correctedProviderLatencyMs(
+      nowWallTimestamp,
+      latest.providerTimestamp,
+      this.#clockOffsetMs,
+    );
     if (transportAgeMs > this.#transportTimeoutMs) {
       return {
         diagnosis: "TRANSPORT_DISCONNECTED",

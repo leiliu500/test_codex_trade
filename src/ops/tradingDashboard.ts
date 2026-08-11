@@ -1,5 +1,6 @@
 import type { AuditEvent, AuditRecorder } from "./recorder.js";
 import type { HistoricalMarketEvent, HistoricalMarketEventType, MarketHistorySink } from "../history/types.js";
+import { correctedProviderLatencyMs } from "../marketData/opraQuoteHealth.js";
 import type { UnderlyingSymbol } from "../types.js";
 import { parseOccSymbol } from "../options/occSymbol.js";
 import { marketDate, zonedDateTimeToEpoch } from "../utils/time.js";
@@ -272,6 +273,7 @@ export interface DashboardLiveFeedEvent {
   symbol: string;
   providerTimestamp: number;
   receivedTimestamp: number;
+  rawLatencyMs: number;
   latencyMs: number;
   marketDate: string;
   summary: string;
@@ -281,6 +283,7 @@ export interface DashboardLiveData {
   persistenceEnabled: boolean;
   quoteSampleIntervalMs: number;
   retentionDays: number;
+  marketDataClockOffsetMs: number;
   uptimeMs: number;
   totalEvents: number;
   eventCounts: Record<HistoricalMarketEventType, number>;
@@ -416,6 +419,7 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
   readonly #persistenceEnabled: boolean;
   readonly #quoteSampleIntervalMs: number;
   readonly #retentionDays: number;
+  readonly #marketDataClockOffsetMs: number;
   readonly #signals = new Map<string, DashboardSignal>();
   readonly #orders = new Map<string, DashboardOrder>();
   readonly #orderCards = new Map<string, DashboardOrderCard>();
@@ -451,12 +455,14 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
     quoteSampleIntervalMs = 0,
     retentionDays = 0,
     now: () => number = Date.now,
+    marketDataClockOffsetMs = 0,
   ) {
     this.#startedAt = startedAt;
     this.#now = now;
     this.#persistenceEnabled = persistenceEnabled;
     this.#quoteSampleIntervalMs = quoteSampleIntervalMs;
     this.#retentionDays = retentionDays;
+    this.#marketDataClockOffsetMs = marketDataClockOffsetMs;
     this.#displayDate = dashboardDisplayDate(now());
   }
 
@@ -573,7 +579,12 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
         symbol: event.symbol,
         providerTimestamp: event.providerTimestamp,
         receivedTimestamp: event.receivedTimestamp,
-        latencyMs: Math.max(0, event.receivedTimestamp - event.providerTimestamp),
+        rawLatencyMs: event.receivedTimestamp - event.providerTimestamp,
+        latencyMs: correctedProviderLatencyMs(
+          event.receivedTimestamp,
+          event.providerTimestamp,
+          this.#marketDataClockOffsetMs,
+        ),
         marketDate: event.marketDate,
         summary: marketEventSummary(event),
       });
@@ -713,6 +724,7 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
         persistenceEnabled: this.#persistenceEnabled,
         quoteSampleIntervalMs: this.#quoteSampleIntervalMs,
         retentionDays: this.#retentionDays,
+        marketDataClockOffsetMs: this.#marketDataClockOffsetMs,
         uptimeMs: Math.max(0, generatedAt - this.#startedAt),
         totalEvents: Object.values(eventCounts).reduce((sum, count) => sum + count, 0),
         eventCounts,
@@ -2159,7 +2171,7 @@ export function tradingDashboardHtml(): string {
 <div class="card"><div class="muted">Latest Feed Age</div><div class="value" id="feedAge">—</div></div>
 </section>
 <section class="panel"><h2>Entry Evaluations &amp; Decisions</h2><div class="section-note">Every evaluation remains stored, but routine one-second NO SIGNAL rows are hidden by default. Use All evaluations only when diagnosing individual gates.</div><div class="tune-controls"><div class="tune-control"><label for="decisionView">Rows shown</label><select id="decisionView"><option value="ACTIONABLE">Actionable stages only</option><option value="ALL">All evaluations</option><option value="NO_SIGNAL">NO SIGNAL only</option></select></div></div><table><thead><tr><th>Time</th><th>Underlying</th><th>Stage</th><th>Outcome</th><th>Direction</th><th>Option</th><th>Decision</th><th>Gates, Votes &amp; Reasons</th></tr></thead><tbody id="decisions"></tbody></table></section>
-<section class="panel"><h2>Live Feed Into System</h2><div class="section-note">The UI is sampled for readability. PostgreSQL retains quote baselines, full-resolution quotes for working/open options, and every trade, feature, decision, order, and fill.</div><table><thead><tr><th>Received</th><th>Feed</th><th>Type</th><th>Symbol</th><th>Value</th><th>Provider Latency</th><th>Storage Policy</th></tr></thead><tbody id="feedEventsBody"></tbody></table></section>
+<section class="panel"><h2>Live Feed Into System</h2><div class="section-note">The UI is sampled for readability. Provider latency subtracts the configured local-minus-provider clock offset; when non-zero, the raw timestamp delta is shown beside it. PostgreSQL retains quote baselines, full-resolution quotes for working/open options, and every trade, feature, decision, order, and fill.</div><table><thead><tr><th>Received</th><th>Feed</th><th>Type</th><th>Symbol</th><th>Value</th><th>Provider Latency</th><th>Storage Policy</th></tr></thead><tbody id="feedEventsBody"></tbody></table></section>
 </div>
 <div class="muted" id="updated"></div></main><script>
 const $=id=>document.getElementById(id),money=n=>new Intl.NumberFormat('en-US',{style:'currency',currency:'USD'}).format(n||0),optionalMoney=n=>Number.isFinite(n)?money(n):'—',num=(n,d=2)=>Number.isFinite(n)?n.toFixed(d):'—',count=n=>Number(n||0).toLocaleString(),time=n=>n?new Date(n).toLocaleString('en-US',{timeZone:'America/New_York'}):'—';
@@ -2212,6 +2224,7 @@ dynamics.append(title,columns,list);card.append(dynamics);return card});
 root.replaceChildren(...cards)
 }
 function setStatus(valueId,detailId,value,detail,level){$(valueId).textContent=value;$(valueId).className=level;$(detailId).textContent=detail}function age(ms){return Number.isFinite(ms)?duration(ms)+' ago':'No events yet'}function storagePolicy(event,live){if(!live.persistenceEnabled)return 'Disabled';if(event.type==='stock_quote'||event.type==='option_quote')return (live.quoteSampleIntervalMs||0)+' ms baseline · active option full';return 'Full retention'}
+function feedLatency(event,live){const corrected=latency(event.latencyMs);return Number(live.marketDataClockOffsetMs||0)===0?corrected:corrected+' corrected · raw '+latency(event.rawLatencyMs)}
 function outcomeClass(value){return ['SIGNAL','SELECTED','ALLOWED','SUBMITTED','REQUESTED','FILLED'].includes(value)?'outcome pass':['NO_SIGNAL','NO_ELIGIBLE_OPTION','BLOCKED','SKIPPED'].includes(value)?'outcome block':value==='RETRYING'?'outcome warn':'outcome'}
 function decisionDetail(item){const details=[...(item.reasons||[])];for(const direction of item.directions||[]){const failedVotes=(direction.votes||[]).filter(v=>!v.passed).map(v=>v.name);const result=direction.passed?'PASS':(direction.reasons||[]).slice(0,6).join(', ');details.push(direction.direction+': '+result+(failedVotes.length?' · failed votes '+failedVotes.join(', '):''))}return details.join(' · ')||'All configured gates passed'}
 let latestDecisions=[];
@@ -2262,7 +2275,7 @@ rows('orders',view.orders||[],[x=>({value:time(x.timestamp)}),x=>({value:itemUnd
 renderTuning(view.tuning||{entries:[]},view.orders||[]);renderPotentialMisses(view.tuning);
 rows('trades',view.trades||[],[x=>({value:time(x.entryTimestamp)}),x=>({value:time(x.exitTimestamp)}),x=>({value:itemUnderlying(x)}),x=>({value:x.symbol}),x=>({value:x.direction}),x=>({value:x.quantity}),x=>({value:money(x.averageEntryPrice)}),x=>({value:x.averageExitPrice?money(x.averageExitPrice):'—'}),x=>({value:money(x.realizedPnl),cls:x.realizedPnl>0?'positive':x.realizedPnl<0?'negative':''}),x=>({value:x.returnPct===undefined?'—':num(x.returnPct)+'%'}),x=>({value:x.exitReason}),x=>({value:x.status})]);
 renderDecisionRows(view.decisions||[]);
-rows('feedEventsBody',live.recentEvents||[],[x=>({value:time(x.receivedTimestamp)}),x=>({value:x.channel.replaceAll('_',' ')}),x=>({value:x.type.replaceAll('_',' ')}),x=>({value:x.symbol}),x=>({value:x.summary}),x=>({value:x.latencyMs+' ms'}),x=>({value:storagePolicy(x,live),cls:live.persistenceEnabled?'positive':'muted'})],'No market events received yet. Connection cards above continue to show system liveness.');
+rows('feedEventsBody',live.recentEvents||[],[x=>({value:time(x.receivedTimestamp)}),x=>({value:x.channel.replaceAll('_',' ')}),x=>({value:x.type.replaceAll('_',' ')}),x=>({value:x.symbol}),x=>({value:x.summary}),x=>({value:feedLatency(x,live)}),x=>({value:storagePolicy(x,live),cls:live.persistenceEnabled?'positive':'muted'})],'No market events received yet. Connection cards above continue to show system liveness.');
 $('updated').textContent='Display day '+data.displayDate+' · Updated '+new Date(data.generatedAt).toLocaleString()+' · resets at 10:00 PM Pacific';
 }catch(error){$('stateText').textContent='DASHBOARD ERROR';$('state').className='halted';$('updated').textContent=String(error)}
 }

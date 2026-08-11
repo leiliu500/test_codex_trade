@@ -1,5 +1,5 @@
 {
-  "version": "spy-0dte-entry-confirmation-25-option-selection-retry",
+  "version": "spy-0dte-entry-confirmation-26-entry-quote-freshness",
   "symbol": "SPY",
   "timeZone": "America/New_York",
   "session": {
@@ -166,6 +166,7 @@
     "orderPollMs": 350,
     "optionTickSize": 0.01,
     "entrySignalTtlMs": 6500,
+    "maxEntryQuoteAgeMs": 750,
     "optionSelectionRetryMs": 1000,
     "adverseFillSpreadFraction": 0.25,
     "exitTtlMinMs": 250,
@@ -178,6 +179,7 @@
     "maxRiskDollarsPerTrade": 500,
     "maxPremiumDollarsPerTrade": 1500,
     "maxContracts": 1,
+    "maxPositionsPerUnderlying": 3,
     "maxTradesPerDay": 1000,
     "maxDailyLossDollars": 1000,
     "hardOptionStopPct": 0.25,

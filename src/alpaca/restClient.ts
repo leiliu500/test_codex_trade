@@ -27,6 +27,10 @@ export interface BrokerOrder {
   status: string;
   filledQuantity: number;
   averageFillPrice?: number;
+  submittedAt?: number;
+  updatedAt?: number;
+  filledAt?: number;
+  canceledAt?: number;
 }
 
 export interface BrokerPosition {
@@ -76,6 +80,10 @@ interface RawOrder {
   status: string;
   filled_qty: string;
   filled_avg_price?: string | null;
+  submitted_at?: string | null;
+  updated_at?: string | null;
+  filled_at?: string | null;
+  canceled_at?: string | null;
 }
 
 export class AlpacaTradingRestClient implements MultiUnderlyingTradingRestClient {
@@ -457,6 +465,10 @@ function mapOrder(raw: RawOrder): BrokerOrder {
     id: raw.id, clientOrderId: raw.client_order_id, symbol: raw.symbol, status: raw.status,
     filledQuantity: Number(raw.filled_qty),
     ...(raw.filled_avg_price != null ? { averageFillPrice: Number(raw.filled_avg_price) } : {}),
+    ...(raw.submitted_at ? { submittedAt: parseRfc3339ToMs(raw.submitted_at) } : {}),
+    ...(raw.updated_at ? { updatedAt: parseRfc3339ToMs(raw.updated_at) } : {}),
+    ...(raw.filled_at ? { filledAt: parseRfc3339ToMs(raw.filled_at) } : {}),
+    ...(raw.canceled_at ? { canceledAt: parseRfc3339ToMs(raw.canceled_at) } : {}),
   };
 }
 
