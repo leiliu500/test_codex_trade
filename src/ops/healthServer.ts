@@ -60,7 +60,10 @@ export interface HealthState {
   executionMode?: "paper" | "live";
   accountOptionsApproved?: boolean;
   positionOpen?: boolean;
+  positionCount?: number;
+  maxPositions?: number;
   pendingOrder?: boolean;
+  pendingOrderCount?: number;
   subscribedOptionContracts: number;
   openPositionOptionQuoteAgeMs?: number;
   websocketConnected: boolean;
@@ -193,7 +196,10 @@ export function combineHealthStates(states: Readonly<Record<string, HealthState>
       : {}),
     accountOptionsApproved: values.every((state) => state.accountOptionsApproved !== false),
     positionOpen: values.some((state) => state.positionOpen === true),
+    positionCount: sum("positionCount"),
+    maxPositions: sum("maxPositions"),
     pendingOrder: values.some((state) => state.pendingOrder === true),
+    pendingOrderCount: sum("pendingOrderCount"),
     subscribedOptionContracts,
     brokerAvailable: values.filter((state) => state.brokerRequired !== false).every((state) => state.brokerAvailable),
     marketClockState: marketStates.size === 1 ? values[0]!.marketClockState : "mixed",

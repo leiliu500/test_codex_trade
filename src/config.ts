@@ -176,6 +176,7 @@ export interface EngineConfig {
     orderPollMs: number;
     optionTickSize: number;
     entrySignalTtlMs: number;
+    maxEntryQuoteAgeMs: number;
     optionSelectionRetryMs: number;
     adverseFillSpreadFraction: number;
     exitTtlMinMs: number;
@@ -188,6 +189,7 @@ export interface EngineConfig {
     maxRiskDollarsPerTrade: number;
     maxPremiumDollarsPerTrade: number;
     maxContracts: number;
+    maxPositionsPerUnderlying: number;
     maxTradesPerDay: number;
     maxDailyLossDollars: number;
     hardOptionStopPct: number;
@@ -437,7 +439,15 @@ export function validateConfig(config: EngineConfig): void {
   if (config.risk.maxContracts !== 1) {
     throw new Error("Entry order sizing is hard-limited to exactly one option contract");
   }
+  if (!(Number.isInteger(config.risk.maxPositionsPerUnderlying) &&
+        config.risk.maxPositionsPerUnderlying > 0 &&
+        config.risk.maxPositionsPerUnderlying <= 10)) {
+    throw new Error("Maximum positions per underlying must be an integer in [1, 10]");
+  }
   if (!(config.execution.entrySignalTtlMs > 0 &&
+        Number.isFinite(config.execution.maxEntryQuoteAgeMs) &&
+        config.execution.maxEntryQuoteAgeMs > 0 &&
+        config.execution.maxEntryQuoteAgeMs <= config.dataQuality.maxOptionQuoteAgeMs &&
         Number.isFinite(config.execution.optionSelectionRetryMs) &&
         config.execution.optionSelectionRetryMs >= 0 &&
         config.execution.optionSelectionRetryMs <= config.execution.entrySignalTtlMs &&

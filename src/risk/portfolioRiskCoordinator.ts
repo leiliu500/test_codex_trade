@@ -3,7 +3,9 @@ import { marketDate } from "../utils/time.js";
 
 export interface PortfolioRiskLimits {
   timeZone: string;
-  maxConcurrentUnderlyings: number;
+  maxConcurrentUnderlyings?: number;
+  maxConcurrentPositions?: number;
+  maxPositionsPerUnderlying?: number;
   maxAggregateRiskDollars: number;
   maxAggregatePremiumDollars: number;
   maxDailyLossDollars: number;
@@ -11,6 +13,7 @@ export interface PortfolioRiskLimits {
 
 export interface PortfolioReservationRequest {
   underlying: UnderlyingSymbol;
+  reservationId?: string;
   timestamp: number;
   riskDollars: number;
   premiumDollars: number;
@@ -28,9 +31,11 @@ export interface PortfolioRiskSnapshot {
   reservedRiskDollars: number;
   reservedPremiumDollars: number;
   activeUnderlyings: UnderlyingSymbol[];
+  activePositions: number;
 }
 
 interface Reservation {
+  underlying: UnderlyingSymbol;
   riskDollars: number;
   premiumDollars: number;
 }
@@ -38,7 +43,7 @@ interface Reservation {
 /** Atomic account-level protection shared by otherwise independent symbol engines. */
 export class PortfolioRiskCoordinator {
   readonly #limits: PortfolioRiskLimits;
-  readonly #reservations = new Map<UnderlyingSymbol, Reservation>();
+  readonly #reservations = new Map<string, Reservation>();
   #date: string;
   #realizedPnl: number;
   #tail: Promise<void> = Promise.resolve();
@@ -53,9 +58,21 @@ export class PortfolioRiskCoordinator {
     return this.#serialize(() => {
       this.#rollDate(request.timestamp);
       const reasons: string[] = [];
-      if (this.#reservations.has(request.underlying)) reasons.push("PORTFOLIO_UNDERLYING_EXPOSURE_EXISTS");
-      if (this.#reservations.size >= this.#limits.maxConcurrentUnderlyings) {
-        reasons.push("PORTFOLIO_MAX_CONCURRENT_UNDERLYINGS");
+      const reservationId = request.reservationId ?? request.underlying;
+      const underlyingPositions = [...this.#reservations.values()].filter(
+        (reservation) => reservation.underlying === request.underlying,
+      ).length;
+      const maxPositionsPerUnderlying = this.#limits.maxPositionsPerUnderlying ?? 1;
+      const maxConcurrentPositions = this.#limits.maxConcurrentPositions ??
+        this.#limits.maxConcurrentUnderlyings ?? 1;
+      if (this.#reservations.has(reservationId)) reasons.push("PORTFOLIO_POSITION_EXPOSURE_EXISTS");
+      if (underlyingPositions >= maxPositionsPerUnderlying) {
+        reasons.push(maxPositionsPerUnderlying === 1
+          ? "PORTFOLIO_UNDERLYING_EXPOSURE_EXISTS"
+          : "PORTFOLIO_MAX_POSITIONS_PER_UNDERLYING");
+      }
+      if (this.#reservations.size >= maxConcurrentPositions) {
+        reasons.push("PORTFOLIO_MAX_CONCURRENT_POSITIONS");
       }
       if (this.#realizedPnl <= -this.#limits.maxDailyLossDollars) reasons.push("PORTFOLIO_MAX_DAILY_LOSS");
       const reservedRisk = this.#sum("riskDollars");
@@ -73,7 +90,8 @@ export class PortfolioRiskCoordinator {
         reasons.push("PORTFOLIO_BUYING_POWER_RESERVED");
       }
       if (reasons.length === 0) {
-        this.#reservations.set(request.underlying, {
+        this.#reservations.set(reservationId, {
+          underlying: request.underlying,
           riskDollars: request.riskDollars,
           premiumDollars: request.premiumDollars,
         });
@@ -84,25 +102,29 @@ export class PortfolioRiskCoordinator {
 
   adoptExposure(
     underlying: UnderlyingSymbol, riskDollars: number, premiumDollars: number, timestamp: number,
+    reservationId: string = underlying,
   ): Promise<void> {
     return this.#serialize(() => {
       this.#rollDate(timestamp);
-      this.#reservations.set(underlying, {
+      this.#reservations.set(reservationId, {
+        underlying,
         riskDollars: Math.max(0, riskDollars),
         premiumDollars: Math.max(0, premiumDollars),
       });
     });
   }
 
-  releaseExposure(underlying: UnderlyingSymbol): Promise<void> {
-    return this.#serialize(() => { this.#reservations.delete(underlying); });
+  releaseExposure(underlying: UnderlyingSymbol, reservationId: string = underlying): Promise<void> {
+    return this.#serialize(() => { this.#reservations.delete(reservationId); });
   }
 
-  recordCompletedExit(underlying: UnderlyingSymbol, timestamp: number, realizedPnl: number): Promise<void> {
+  recordCompletedExit(
+    underlying: UnderlyingSymbol, timestamp: number, realizedPnl: number, reservationId: string = underlying,
+  ): Promise<void> {
     return this.#serialize(() => {
       this.#rollDate(timestamp);
       this.#realizedPnl += realizedPnl;
-      this.#reservations.delete(underlying);
+      this.#reservations.delete(reservationId);
     });
   }
 
@@ -114,7 +136,10 @@ export class PortfolioRiskCoordinator {
         realizedPnl: this.#realizedPnl,
         reservedRiskDollars: this.#sum("riskDollars"),
         reservedPremiumDollars: this.#sum("premiumDollars"),
-        activeUnderlyings: [...this.#reservations.keys()],
+        activeUnderlyings: [...new Set(
+          [...this.#reservations.values()].map((reservation) => reservation.underlying),
+        )],
+        activePositions: this.#reservations.size,
       };
     });
   }
@@ -126,7 +151,7 @@ export class PortfolioRiskCoordinator {
     this.#realizedPnl = 0;
   }
 
-  #sum(key: keyof Reservation): number {
+  #sum(key: "riskDollars" | "premiumDollars"): number {
     let total = 0;
     for (const reservation of this.#reservations.values()) total += reservation[key];
     return total;
