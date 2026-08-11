@@ -1541,9 +1541,19 @@ export class SpyOptionsTradingRuntime {
     if (this.#stopping || !this.#marketOpen || !this.#marketDataIdle) return;
     this.#marketDataIdle = false;
     this.#optionQuoteStalled = false;
+    this.#lastFeature = undefined;
+    this.#lastRegime = undefined;
+    this.#strategyStateMarketDate = marketDate(timestamp, this.#config.timeZone);
+    this.#strategyStateReady = !this.#requireStrategyRecovery;
+    this.#strategyStateStatus = this.#requireStrategyRecovery
+      ? "RESTORING_SESSION_STATE" : "RECOVERY_NOT_REQUIRED";
+    this.#strategyCoverageStartedAtOpen = false;
+    this.#strategyRecoveryError = undefined;
+    this.#stockReceiver.resetSessionState();
+    await this.#stockReceiver.startBuffered();
+    await this.#restoreStrategyState(Math.max(timestamp, this.#now()));
     const latestQuote = await this.#getLatestSipQuote();
     this.#lastSpot = (latestQuote.bidPrice + latestQuote.askPrice) / 2;
-    await this.#stockReceiver.start();
     await this.#startUniverseRefresh(this.#lastSpot, timestamp, true);
     try {
       await this.#connectOptionStream();
@@ -1551,6 +1561,21 @@ export class SpyOptionsTradingRuntime {
       this.#recordError(error);
       this.#scheduleOptionReconnect();
     }
+    const catchup = await this.#stockReceiver.activate();
+    if (catchup.latestFeature) {
+      this.#lastFeature = catchup.latestFeature;
+      this.#lastSpot = catchup.latestFeature.price;
+      this.#lastRegime = classifyRegime(catchup.latestFeature, this.#config.regimes);
+      this.#updateStrategyState(catchup.latestFeature);
+    }
+    this.#emit("strategy_live_catchup", {
+      events: catchup.events,
+      bars: catchup.bars,
+      rejectedEvents: catchup.rejectedEvents,
+      latestFeatureTimestamp: catchup.latestFeature?.timestamp ?? null,
+      strategyStateReady: this.#strategyStateReady,
+      strategyStateStatus: this.#strategyStateStatus,
+    });
     await this.#auditRuntime(timestamp, "market_session_resumed", {
       reason: "MARKET_OPEN",
       marketOpen: true,
