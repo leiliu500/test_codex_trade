@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { defaultConfig, qqqConfig } from "../src/config.js";
+import { defaultConfig, googlConfig, qqqConfig } from "../src/config.js";
 import {
   ConcurrentLiveOrderManager,
 } from "../src/execution/concurrentLiveOrderManager.js";
@@ -199,7 +199,8 @@ test("startup adopts and independently exits three broker positions", async () =
   assert.equal(broker.orders.size, 3);
 });
 
-test("SPY and QQQ configurations each allow three position slots", () => {
+test("SPY, QQQ, and GOOGL configurations each allow three position slots", () => {
   assert.equal(defaultConfig.risk.maxPositionsPerUnderlying, 3);
   assert.equal(qqqConfig.risk.maxPositionsPerUnderlying, 3);
+  assert.equal(googlConfig.risk.maxPositionsPerUnderlying, 3);
 });

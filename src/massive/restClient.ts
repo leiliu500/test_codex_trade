@@ -1,5 +1,7 @@
-import type {
-  AccountState, OptionContract, OptionQuote, OptionSnapshot, StockQuote, UnderlyingSymbol,
+import {
+  isUnderlyingSymbol,
+  type AccountState, type OptionContract, type OptionQuote, type OptionSnapshot, type StockQuote,
+  type UnderlyingSymbol,
 } from "../types.js";
 import type {
   BrokerOrder, BrokerOrderRequest, BrokerPosition, MultiUnderlyingTradingRestClient,
@@ -54,7 +56,7 @@ export class MassiveOptionRestClient {
     const groups = new Map<string, { underlying: UnderlyingSymbol; expirationDate: string; strikes: number[] }>();
     for (const symbol of target) {
       const parsed = parseOccSymbol(symbol);
-      if (!parsed || (parsed.underlying !== "SPY" && parsed.underlying !== "QQQ")) {
+      if (!parsed || !isUnderlyingSymbol(parsed.underlying)) {
         throw new Error(`Massive option data rejected invalid symbol ${symbol}`);
       }
       const underlying = parsed.underlying;

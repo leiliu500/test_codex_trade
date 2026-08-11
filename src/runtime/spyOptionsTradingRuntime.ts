@@ -3,9 +3,10 @@ import type { OptionStream } from "../alpaca/optionStream.js";
 import type { StockStream } from "../alpaca/stockStream.js";
 import type { StockStreamEvent } from "../alpaca/stockStream.js";
 import type { TradingRestClient } from "../alpaca/restClient.js";
-import type {
-  AccountState, FeatureSnapshot, OptionCandidateEvaluation, OptionContract, OptionQuote, RegimeDecision,
-  StockQuote, TradeSignal, UnderlyingSymbol,
+import {
+  isUnderlyingSymbol,
+  type AccountState, type FeatureSnapshot, type OptionCandidateEvaluation, type OptionContract,
+  type OptionQuote, type RegimeDecision, type StockQuote, type TradeSignal, type UnderlyingSymbol,
 } from "../types.js";
 import type { HealthState } from "../ops/healthServer.js";
 import type { AuditEvent, AuditRecorder } from "../ops/recorder.js";
@@ -31,6 +32,7 @@ import type { PortfolioRiskCoordinator } from "../risk/portfolioRiskCoordinator.
 import { lateEntryGuardAudit, morningEntryGuardAudit } from "../strategy/lateEntryGuard.js";
 import { validateOptionQuote } from "../features/quoteSanitizer.js";
 import { parseOccSymbol } from "../options/occSymbol.js";
+import { sameDayOptionContractReasons } from "../options/tradingInvariants.js";
 import {
   currentBullishProjectionBps, evaluateLateBullishGrindOptionConfirmation,
   requiresLateBullishGrindOptionConfirmation,
@@ -81,10 +83,12 @@ export interface SpyOptionsTradingRuntimeOptions {
 
 export function optionUniverseRequired(
   now: number, marketOpen: boolean, hasOptionExposure: boolean, config: EngineConfig,
+  sameDayOptionContractsAvailable = true,
 ): boolean {
   return marketOpen && (
     hasOptionExposure ||
-    secondsSinceMidnight(now, config.timeZone) <= parseClock(config.options.zeroDteEntryCutoff)
+    sameDayOptionContractsAvailable &&
+      secondsSinceMidnight(now, config.timeZone) <= parseClock(config.options.zeroDteEntryCutoff)
   );
 }
 
@@ -143,6 +147,7 @@ export class SpyOptionsTradingRuntime {
   readonly #lastOptionRestFingerprints = new Map<string, string>();
   #contracts: OptionContract[] = [];
   #subscribedSymbols = new Set<string>();
+  #sameDayOptionContractsAvailable: boolean | undefined;
   #optionConnected = false;
   #brokerAvailable = false;
   #positionsReconciled = false;
@@ -868,11 +873,14 @@ export class SpyOptionsTradingRuntime {
     const streamsConnected = stock.websocketConnected && this.#optionConnected;
     const streamsReady = this.#marketDataIdle || streamsConnected;
     const hasOptionExposure = this.#execution.positions.length > 0 || this.#execution.pendingOrders.length > 0;
+    const noSameDayContractIdle = !hasOptionExposure && this.#sameDayOptionContractsAvailable === false;
     const optionSubscriptionsRequired = optionUniverseRequired(
       now, this.#marketOpen, hasOptionExposure, this.#config,
+      this.#sameDayOptionContractsAvailable !== false,
     );
     const universeReady = this.#subscribedSymbols.size > 0 || !optionSubscriptionsRequired;
-    const strategyReady = !this.#executionEnabled || !this.#marketOpen || this.#strategyStateReady;
+    const strategyReady = !this.#executionEnabled || !this.#marketOpen ||
+      this.#strategyStateReady || noSameDayContractIdle;
     const optionChainHealth = this.#optionChainHealth(now);
     const optionQuoteSilenceAgeMs = this.#subscribedSymbols.size > 0
       ? optionChainHealth.transportAgeMs : undefined;
@@ -927,6 +935,9 @@ export class SpyOptionsTradingRuntime {
       optionQuoteStalled,
       optionQuoteStallThresholdMs: OPTION_QUOTE_STALL_TIMEOUT_MS,
       optionSubscriptionsRequired,
+      ...(this.#sameDayOptionContractsAvailable !== undefined
+        ? { optionSameDayContractsAvailable: this.#sameDayOptionContractsAvailable }
+        : {}),
       optionRestFallbackEnabled: this.#client.getLatestOptionQuotes !== undefined,
       optionRestFallbackInFlight: this.#optionRestRecoveryInFlight !== undefined,
       optionRestFallbackRequests: this.#optionRestFallbackRequests,
@@ -972,8 +983,9 @@ export class SpyOptionsTradingRuntime {
       openOrderCount: this.#execution.pendingOrders.length,
       positionsReconciled: this.#positionsReconciled,
       recorderHealthy,
-      strategyStateReady: this.#strategyStateReady,
-      strategyStateStatus: this.#strategyStateStatus,
+      strategyStateReady: this.#strategyStateReady || noSameDayContractIdle,
+      strategyStateStatus: noSameDayContractIdle
+        ? "NO_SAME_DAY_OPTION_CONTRACTS" : this.#strategyStateStatus,
       ...(this.#strategyStateMarketDate ? { strategyStateMarketDate: this.#strategyStateMarketDate } : {}),
       strategyOpeningRangeEnd: this.#config.session.openingRangeEnd,
       restoredStockEvents: this.#restoredStockEvents,
@@ -996,16 +1008,23 @@ export class SpyOptionsTradingRuntime {
       reasons.push("ACCOUNT_NOT_READY");
     }
     if (this.#executionEnabled && !this.#recorder.healthy()) reasons.push("AUDIT_RECORDER_UNHEALTHY");
-    if (this.#executionEnabled && !this.#strategyStateReady) reasons.push("STRATEGY_STATE_NOT_READY");
+    if (this.#executionEnabled && !this.#strategyStateReady &&
+        this.#sameDayOptionContractsAvailable !== false) reasons.push("STRATEGY_STATE_NOT_READY");
     if (this.#executionEnabled && !this.#ordersInitialized) reasons.push("ORDER_MANAGER_NOT_READY");
     if (this.#executionEnabled && !this.#stockReceiver.healthState(this.#killSwitch).websocketConnected) {
       reasons.push("STOCK_FEED_DISCONNECTED");
+    }
+    if (this.#executionEnabled && this.#sameDayOptionContractsAvailable === false) {
+      reasons.push("NO_SAME_DAY_OPTION_CONTRACTS");
     }
     const optionHealth = this.#optionChainHealth(timestamp);
     if (this.#executionEnabled && this.#isOptionQuoteStalled(timestamp)) {
       reasons.push("OPTION_FEED_STALLED");
     } else if (this.#executionEnabled && !this.#optionConnected &&
-        optionUniverseRequired(timestamp, this.#marketOpen, false, this.#config)) {
+        optionUniverseRequired(
+          timestamp, this.#marketOpen, false, this.#config,
+          this.#sameDayOptionContractsAvailable !== false,
+        )) {
       reasons.push("OPTION_FEED_DISCONNECTED");
     } else if (this.#executionEnabled && this.#subscribedSymbols.size > 0 &&
         optionHealth.diagnosis === "NO_DATA") {
@@ -1210,6 +1229,11 @@ export class SpyOptionsTradingRuntime {
     if (this.#marketDataIdle || !this.#marketOpen) return;
     const contracts = await this.#client.listOptionContracts(this.#config.symbol);
     if (this.#stopping || this.#marketDataIdle || !this.#marketOpen) return;
+    this.#sameDayOptionContractsAvailable = contracts.some((contract) =>
+      contract.active && contract.tradable &&
+      sameDayOptionContractReasons(
+        contract, timestamp, this.#config.timeZone, this.#config.symbol,
+      ).length === 0);
     const nextSymbols = new Set(this.#universe.plan(contracts, spot, timestamp));
     const snapshots = nextSymbols.size > 0
       ? await this.#client.getOptionSnapshots([...nextSymbols])
@@ -1239,6 +1263,7 @@ export class SpyOptionsTradingRuntime {
     }
     this.#emit("option_universe_refreshed", {
       contractCount: contracts.length,
+      sameDayOptionContractsAvailable: this.#sameDayOptionContractsAvailable,
       subscribedOptionContracts: nextSymbols.size,
       added: add.length,
       removed: remove.length,
@@ -1533,6 +1558,7 @@ export class SpyOptionsTradingRuntime {
     if (this.#marketDataIdle) return;
     this.#marketOpen = false;
     this.#marketDataIdle = true;
+    this.#sameDayOptionContractsAvailable = undefined;
     this.#optionConnected = false;
     this.#optionQuoteStalled = false;
     this.#providerDelayDiagnosticReconnectAttempted = false;
@@ -1569,6 +1595,7 @@ export class SpyOptionsTradingRuntime {
     await this.#marketDataTransition;
     if (this.#stopping || !this.#marketOpen || !this.#marketDataIdle) return;
     this.#marketDataIdle = false;
+    this.#sameDayOptionContractsAvailable = undefined;
     this.#optionQuoteStalled = false;
     this.#lastFeature = undefined;
     this.#lastRegime = undefined;
@@ -1883,7 +1910,7 @@ function auditEventBelongsToUnderlying(event: AuditEvent, underlying: Underlying
   for (const symbol of candidates) {
     const parsed = symbol ? parseOccSymbol(symbol) : undefined;
     if (parsed) return parsed.underlying === underlying;
-    if (symbol === "SPY" || symbol === "QQQ") return symbol === underlying;
+    if (isUnderlyingSymbol(symbol)) return symbol === underlying;
   }
   // Untagged historical audit events predate multi-underlying support and are SPY-only.
   return underlying === "SPY";

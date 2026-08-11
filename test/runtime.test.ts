@@ -45,6 +45,10 @@ test("runtime environment is paper-safe and validates the health listener", () =
     MARKET_DATA_ENABLED: "true", ALPACA_API_KEY: "key", ALPACA_API_SECRET: "secret",
   }).marketDataEnabled, true);
   assert.equal(readEnvironment({ MARKET_DATA_CLOCK_OFFSET_MS: "-12.5" }).marketDataClockOffsetMs, -12.5);
+  assert.deepEqual(readEnvironment({ TRADING_SYMBOLS: "spy, GOOGL,qqq,GOOGL" }).tradingSymbols, [
+    "SPY", "GOOGL", "QQQ",
+  ]);
+  assert.throws(() => readEnvironment({ TRADING_SYMBOLS: "SPY,MSFT" }), /SPY,QQQ,GOOGL/);
   assert.throws(() => readEnvironment({
     MARKET_DATA_ENABLED: "true", ENABLE_LIVE_ORDERS: "true",
     ALPACA_API_KEY: "key", ALPACA_API_SECRET: "secret",

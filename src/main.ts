@@ -1,6 +1,6 @@
 import { loadDotEnv } from "./utils/loadDotEnv.js";
 import { readEnvironment } from "./utils/env.js";
-import { defaultConfig, qqqConfig, validateConfig, type EngineConfig } from "./config.js";
+import { defaultConfig, googlConfig, qqqConfig, validateConfig, type EngineConfig } from "./config.js";
 import { combineHealthStates, startHealthServer, type HealthState } from "./ops/healthServer.js";
 import { AlpacaStockWebSocket } from "./alpaca/stockStream.js";
 import { AlpacaOptionWebSocket } from "./alpaca/optionStream.js";
@@ -31,6 +31,7 @@ const environment = readEnvironment();
 const configCatalog: Readonly<Record<UnderlyingSymbol, EngineConfig>> = {
   SPY: defaultConfig,
   QQQ: qqqConfig,
+  GOOGL: googlConfig,
 };
 const configs = environment.tradingSymbols.map((symbol) => configCatalog[symbol]);
 for (const config of configs) validateConfig(config);
@@ -159,7 +160,8 @@ if (broker) {
   const recovery = await recoverTerminalDashboardOrders(
     broker,
     dashboard.snapshot().orderCards,
-    { SPY: defaultConfig.version, QQQ: qqqConfig.version },
+    Object.fromEntries(Object.entries(configCatalog).map(([symbol, config]) => [symbol, config.version])) as
+      Readonly<Record<UnderlyingSymbol, string>>,
     defaultConfig.timeZone,
   );
   for (const event of recovery.events) {
@@ -215,7 +217,7 @@ const tradingRuntimes = broker && stockHub && optionHub ? configs.map((config) =
       : {}),
     ...(history ? {
       loadStockHistory: (date: string, start: number, end: number, quoteStart?: number) =>
-        history.streamStockEvents(date, start, end, quoteStart),
+        history.streamStockEvents(date, start, end, quoteStart, undefined, symbol),
     } : {}),
     onEvent: (type, data) => logger.log("info", type, { underlying: symbol, ...data }),
     onError: (error) => logger.log("error", "options_runtime_error", {
@@ -291,8 +293,15 @@ server.on("error", (error) => {
 async function startTradingRuntimes(): Promise<void> {
   if (shuttingDown || tradingRuntimes.length === 0) return;
   tradingRuntimeStartupAttempt += 1;
-  const results = await Promise.allSettled(tradingRuntimes.map((runtime) => runtime.start()));
-  const failures = results.flatMap((result) => result.status === "rejected" ? [result.reason] : []);
+  const failures: unknown[] = [];
+  for (const runtime of tradingRuntimes) {
+    if (shuttingDown || failures.length > 0) break;
+    try {
+      await runtime.start();
+    } catch (error) {
+      failures.push(error);
+    }
+  }
   if (failures.length === 0) {
     tradingRuntimeStartupAttempt = 0;
     logger.log("info", "multi_underlying_paper_runtime_started", {

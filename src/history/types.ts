@@ -95,7 +95,7 @@ export interface HistoryStore extends MarketHistorySink, OrderCardPersistence {
   }>>;
   streamStockEvents(
     marketDate: string, startReceivedTimestamp: number, endReceivedTimestamp: number,
-    quoteStartReceivedTimestamp?: number,
+    quoteStartReceivedTimestamp?: number, batchSize?: number, underlying?: UnderlyingSymbol,
   ): AsyncIterable<readonly HistoricalMarketEvent[]>;
   loadLatestRecoveredFeature(
     marketDate: string, underlying?: UnderlyingSymbol,

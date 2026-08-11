@@ -290,14 +290,18 @@ test("PostgreSQL history streams current-session SIP events in bounded pages", a
   const client: DatabaseClient = {
     async query<R extends QueryResultRow = QueryResultRow>(text: string, values: readonly unknown[] = []) {
       assert.match(text, /received_timestamp >= \$2/);
+      assert.match(text, /symbol = \$7/);
       assert.deepEqual(values.slice(0, 3), ["2026-07-22", 1_000, 2_000]);
+      assert.equal(values[6], "SPY");
       const resultRows = page++ === 0 ? rows.slice(0, 100) : rows.slice(100);
       return { command: "SELECT", rowCount: resultRows.length, oid: 0, fields: [], rows: resultRows as unknown as R[] };
     },
   };
   const store = new PostgresHistoryStore({ connectionString: "postgresql://unused", client });
   const streamed = [];
-  for await (const batch of store.streamStockEvents("2026-07-22", 1_000, 2_000, undefined, 100)) streamed.push(...batch);
+  for await (const batch of store.streamStockEvents(
+    "2026-07-22", 1_000, 2_000, undefined, 100, "SPY",
+  )) streamed.push(...batch);
   assert.equal(streamed.length, 101);
   assert.equal(page, 2);
   assert.equal(streamed[0]?.providerTimestamp, 900);

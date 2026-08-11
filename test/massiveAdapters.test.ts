@@ -177,6 +177,26 @@ test("Massive option REST maps filtered real-time chain snapshots and diagnostic
   await assert.rejects(() => delayed.getLatestOptionQuotes([call]), /non-real-time/);
 });
 
+test("Massive option REST accepts enabled GOOGL OCC symbols", async () => {
+  const symbol = "GOOGL260811C00190000";
+  const requests: URL[] = [];
+  const mockFetch = (async (input: string | URL | Request): Promise<Response> => {
+    const url = new URL(String(input));
+    requests.push(url);
+    return json({ status: "OK", results: [massiveSnapshot(symbol, "call", 190, 1.2, 1.22, 0.51)] });
+  }) as typeof fetch;
+  const client = new MassiveOptionRestClient({
+    apiKey: "massive-key",
+    baseUrl: "https://api.massive.test",
+    fetch: mockFetch,
+    underlyings: ["GOOGL"],
+  });
+
+  const quotes = await client.getLatestOptionQuotes([symbol]);
+  assert.equal(quotes[0]?.symbol, symbol);
+  assert.equal(requests[0]?.pathname, "/v3/snapshot/options/GOOGL");
+});
+
 function massiveSnapshot(
   symbol: string, contractType: "call" | "put", strike: number,
   bid: number, ask: number, delta: number,
