@@ -3,6 +3,7 @@ import { readEnvironment } from "./utils/env.js";
 import { defaultConfig, googlConfig, qqqConfig, validateConfig, type EngineConfig } from "./config.js";
 import { combineHealthStates, startHealthServer, type HealthState } from "./ops/healthServer.js";
 import { AlpacaStockWebSocket } from "./alpaca/stockStream.js";
+import { AlpacaStockHistoryRestClient } from "./alpaca/stockHistory.js";
 import { AlpacaOptionWebSocket } from "./alpaca/optionStream.js";
 import {
   AlpacaTradingRestClient, UnderlyingTradingRestClient, type MultiUnderlyingTradingRestClient,
@@ -17,6 +18,7 @@ import { CompositeRecorder, JsonLineRecorder, type AuditEvent } from "./ops/reco
 import { TradingDashboardStore } from "./ops/tradingDashboard.js";
 import { PostgresHistoryStore } from "./history/postgresHistory.js";
 import { CompositeMarketHistorySink, SharedPriorityMarketHistoryHub } from "./history/types.js";
+import { streamSessionStockRecovery } from "./history/sessionStockRecovery.js";
 import { JsonLogger } from "./utils/logger.js";
 import { marketDate } from "./utils/time.js";
 import type { FeatureSnapshot, UnderlyingSymbol } from "./types.js";
@@ -127,6 +129,14 @@ const physicalStockStream = environment.marketDataEnabled ? new AlpacaStockWebSo
   feed: environment.stockDataFeed,
   symbols: environment.tradingSymbols,
 }) : undefined;
+const historicalStockClient = history && environment.marketDataEnabled
+  ? new AlpacaStockHistoryRestClient({
+      apiKey: environment.alpacaApiKey!,
+      apiSecret: environment.alpacaApiSecret!,
+      feed: environment.stockDataFeed,
+      timeZone: defaultConfig.timeZone,
+    })
+  : undefined;
 const stockHub = physicalStockStream
   ? new SharedStockStreamHub(physicalStockStream, environment.tradingSymbols)
   : undefined;
@@ -215,9 +225,24 @@ const tradingRuntimes = broker && stockHub && optionHub ? configs.map((config) =
     ...(restoredFeatureCheckpoints.has(symbol)
       ? { restoredFeatureCheckpoint: restoredFeatureCheckpoints.get(symbol)! }
       : {}),
-    ...(history ? {
-      loadStockHistory: (date: string, start: number, end: number, quoteStart?: number) =>
-        history.streamStockEvents(date, start, end, quoteStart, undefined, symbol),
+    ...(history && historicalStockClient ? {
+      loadStockHistory: (date: string, start: number, end: number, quoteStart?: number) => {
+        const primary = history.streamStockEvents(date, start, end, quoteStart, undefined, symbol);
+        if (quoteStart !== undefined) return primary;
+        return streamSessionStockRecovery({
+          primary,
+          fallback: historicalStockClient,
+          symbol,
+          startTimestamp: start,
+          endTimestamp: end,
+          quoteSampleIntervalMs: environment.historyQuoteSampleMs,
+          onFallback: (detail) => logger.log("warn", "alpaca_sip_session_recovery_started", {
+            underlying: symbol,
+            start: new Date(detail.startTimestamp).toISOString(),
+            end: new Date(detail.endTimestamp).toISOString(),
+          }),
+        });
+      },
     } : {}),
     onEvent: (type, data) => logger.log("info", type, { underlying: symbol, ...data }),
     onError: (error) => logger.log("error", "options_runtime_error", {
