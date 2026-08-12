@@ -1169,13 +1169,9 @@ export class SpyOptionsTradingRuntime {
       this.#strategyStateStatus = this.#strategyStateReady ? "BUILDING_OPENING_RANGE" : "MISSING_MARKET_OPEN_COVERAGE";
       return;
     }
-    const featureFresh = this.#now() - feature.timestamp <= 5_000 && feature.timestamp - this.#now() <= 1_000;
     this.#strategyStateReady = this.#strategyCoverageStartedAtOpen && feature.openingRange.complete &&
-      feature.vwap.sessionVwap !== undefined && feature.dataValid && featureFresh;
-    this.#strategyStateStatus = this.#strategyStateReady ? "READY"
-      : !featureFresh ? "STALE_RECOVERED_FEATURE"
-      : !feature.dataValid ? "FEATURE_WARMUP"
-      : "INCOMPLETE_SESSION_STATE";
+      feature.vwap.sessionVwap !== undefined;
+    this.#strategyStateStatus = this.#strategyStateReady ? "READY" : "INCOMPLETE_SESSION_STATE";
   }
 
   async #onStockEvents(events: readonly StockStreamEvent[]): Promise<void> {

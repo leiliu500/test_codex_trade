@@ -1541,3 +1541,75 @@ test("paper runtime fails closed when current-session SIP recovery is unavailabl
   assert.deepEqual(evaluation?.data.reasons, ["STRATEGY_STATE_NOT_READY"]);
   await runtime.close();
 });
+
+test("transient invalid SIP features do not erase recovered session readiness", async () => {
+  let decisionTime = now;
+  const client = new FakeRuntimeClient();
+  const optionStream = new FakeOptionStream();
+  const recorder = new MemoryRecorder();
+  const open = zonedDateTimeToEpoch(date, defaultConfig.session.marketOpen);
+  const history: HistoricalMarketEvent[] = [];
+  for (let timestamp = open; timestamp < now; timestamp += 1_000) {
+    const price = 500 + (timestamp - open) / 10_000_000;
+    history.push({
+      type: "stock_quote",
+      providerTimestamp: timestamp + 100,
+      receivedTimestamp: timestamp + 100,
+      marketDate: date,
+      symbol: "SPY",
+      data: {
+        symbol: "SPY", timestamp: timestamp + 100,
+        bidPrice: price - 0.005, askPrice: price + 0.005, bidSize: 100, askSize: 100,
+      },
+    }, {
+      type: "stock_trade",
+      providerTimestamp: timestamp + 200,
+      receivedTimestamp: timestamp + 200,
+      marketDate: date,
+      symbol: "SPY",
+      data: { symbol: "SPY", timestamp: timestamp + 200, price, size: 100 },
+    });
+  }
+  const runtime = new SpyOptionsTradingRuntime({
+    config: defaultConfig,
+    client,
+    stockStream: new FakeStockStream(),
+    optionStream,
+    executionEnabled: true,
+    executionMode: "paper",
+    requireStrategyRecovery: true,
+    loadStockHistory: async function* () { yield history; },
+    now: () => decisionTime,
+    monotonicNow: () => decisionTime,
+    executionTickMs: 60_000,
+    recorder,
+  });
+  await runtime.start();
+  assert.equal(runtime.healthState().strategyStateReady, true);
+  assert.equal(runtime.healthState().strategyStateStatus, "READY");
+
+  decisionTime += 1_000;
+  await optionStream.quote({
+    symbol: callSymbol,
+    timestamp: decisionTime,
+    bidPrice: 1.99,
+    askPrice: 2.01,
+    bidSize: 100,
+    askSize: 100,
+  });
+  await runtime.ingestFeature({
+    ...bullishFeature(),
+    timestamp: decisionTime,
+    quoteAgeMs: 1_200,
+    dataValid: false,
+    invalidReasons: ["NO_CURRENT_SECOND_QUOTE"],
+  });
+
+  assert.equal(runtime.healthState().strategyStateReady, true);
+  assert.equal(runtime.healthState().strategyStateStatus, "READY");
+  assert.equal(client.requests.length, 0);
+  const evaluation = recorder.events.filter((event) => event.type === "live_entry_evaluation").at(-1);
+  assert.equal(evaluation?.data.decision, "NO_SIGNAL");
+  assert.deepEqual(evaluation?.data.reasons, ["NO_CURRENT_SECOND_QUOTE"]);
+  await runtime.close();
+});
