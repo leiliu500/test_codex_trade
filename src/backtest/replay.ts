@@ -18,7 +18,12 @@ import {
 } from "../options/optionSelector.js";
 import { RiskManager } from "../risk/riskManager.js";
 import { ExitManager } from "../risk/exitManager.js";
-import { OrderExecutor, type OrderState } from "../execution/orderExecutor.js";
+import {
+  entryAggressionFromMicrostructure,
+  entryReplaceTtlFromMicrostructure,
+  OrderExecutor,
+  type OrderState,
+} from "../execution/orderExecutor.js";
 import { SerializedDecisionQueue } from "../execution/tradingEngine.js";
 import { MemoryRecorder, type AuditRecorder } from "../ops/recorder.js";
 import { computeStrategyMetrics, type CompletedTrade, type StrategyMetrics } from "./metrics.js";
@@ -100,7 +105,7 @@ export class ReplayEngine {
   readonly #aggregator: SecondAggregator;
   readonly #features: FeatureEngine;
   readonly #signals: SignalEngine;
-  readonly #book = new OptionBook();
+  readonly #book: OptionBook;
   readonly #selector: OptionSelector;
   readonly #risk: RiskManager;
   readonly #exits: ExitManager;
@@ -130,6 +135,7 @@ export class ReplayEngine {
 
   constructor(options: ReplayOptions = {}) {
     this.#config = options.config ?? defaultConfig;
+    this.#book = new OptionBook(this.#config.options.microstructure.windowSec * 1_000);
     this.#calibration = options.calibration;
     this.#fillModel = options.fillModel ?? "conservative";
     this.#aggregator = new SecondAggregator(this.#config.dataQuality);
@@ -183,6 +189,26 @@ export class ReplayEngine {
           this.#assertOptionUnderlying(event.data.symbol);
           if (!this.#book.updateQuote(event.data)) {
             this.#audit(event.timestamp, "option_quote_rejected", { reason: "OUT_OF_ORDER", symbol: event.data.symbol });
+          } else if (this.#pendingOptionSelection) {
+            this.#advancePendingOptionSelection(event.timestamp);
+          }
+          break;
+        case "option_trade":
+          this.#assertOptionUnderlying(event.data.symbol);
+          if (!this.#book.updateTrade(event.data)) {
+            this.#audit(event.timestamp, "option_trade_rejected", {
+              reason: "INVALID_OR_DUPLICATE", symbol: event.data.symbol,
+            });
+          } else if (this.#pendingOptionSelection) {
+            this.#advancePendingOptionSelection(event.timestamp);
+          }
+          break;
+        case "option_aggregate":
+          this.#assertOptionUnderlying(event.data.symbol);
+          if (!this.#book.updateAggregate(event.data)) {
+            this.#audit(event.timestamp, "option_aggregate_rejected", {
+              reason: "INVALID_OR_OUT_OF_ORDER", symbol: event.data.symbol,
+            });
           } else if (this.#pendingOptionSelection) {
             this.#advancePendingOptionSelection(event.timestamp);
           }
@@ -338,21 +364,24 @@ export class ReplayEngine {
           ],
         };
         this.#pendingLateBullishGrindConfirmation = undefined;
-        const {
-          gammaAwareProjectedOptionMove: _staleProjectedOptionMove,
-          ...confirmedCandidate
-        } = pendingConfirmation.candidate;
-        this.#submitEntryCandidate(
-          timestamp,
-          confirmedSignal,
-          {
-            ...confirmedCandidate,
-            mid: (quote.bidPrice + quote.askPrice) / 2,
-            spreadPct: (quote.askPrice - quote.bidPrice) /
-              ((quote.bidPrice + quote.askPrice) / 2),
-          },
-          quote,
-        );
+        const confirmedCandidate = pendingConfirmation.candidate.contract
+          ? this.#selector.evaluate(
+              pendingConfirmation.candidate.contract,
+              this.#book.get(pendingConfirmation.candidate.symbol),
+              confirmedSignal,
+              timestamp,
+              this.#book,
+            )
+          : undefined;
+        if (!confirmedCandidate?.eligible) {
+          this.#audit(timestamp, "option_microstructure_confirmation_rejected", {
+            signalId: confirmedSignal.id,
+            symbol: pendingConfirmation.candidate.symbol,
+            reasons: confirmedCandidate?.rejectionReasons ?? ["MISSING_OPTION_CONTRACT"],
+          });
+          return;
+        }
+        this.#submitEntryCandidate(timestamp, confirmedSignal, confirmedCandidate, quote);
         return;
       } else {
         return;
@@ -586,6 +615,15 @@ export class ReplayEngine {
       quantity: risk.quantity,
       timestamp,
       quote,
+      spreadFraction: entryAggressionFromMicrostructure(
+        this.#config,
+        candidate.optionMicrostructure,
+      ),
+      actionTtlMs: entryReplaceTtlFromMicrostructure(
+        this.#config,
+        candidate.optionMicrostructure,
+      ),
+      urgency: Math.max(0, candidate.optionMicrostructure?.confirmationScore ?? 0),
     });
     state = this.#orders.submit(state, timestamp);
     this.#pending = { purpose: "ENTRY", state, signal, candidate, risk };
@@ -629,6 +667,19 @@ export class ReplayEngine {
     const pending = this.#pending;
     if (!pending) return;
     const quote = this.#book.get(pending.state.symbol)?.quote;
+    if (pending.purpose === "ENTRY") {
+      const microstructure = this.#book.microstructure(pending.state.symbol, timestamp);
+      if (microstructure && (
+        microstructure.confirmationScore < this.#config.execution.entryMicrostructureCancelScore ||
+        microstructure.spreadExpansionRatio > this.#config.execution.entrySpreadExpansionCancelRatio
+      )) {
+        this.#orders.requestCancel(
+          pending.state,
+          timestamp,
+          "option microstructure reversed while entry was pending",
+        );
+      }
+    }
     this.#orders.onTimer(pending.state, timestamp, quote);
     if (pending.state.status === "CANCEL_PENDING") {
       this.#orders.confirmCancel(pending.state, timestamp);
@@ -723,7 +774,10 @@ export function parseReplayLine(line: string, lineNumber = 1): ReplayEvent {
   catch { throw new Error(`Invalid JSON at replay line ${lineNumber}`); }
   if (!value || typeof value !== "object") throw new Error(`Replay line ${lineNumber} is not an object`);
   const candidate = value as Partial<ReplayEvent>;
-  const allowed = new Set(["stock_quote", "stock_trade", "option_contract", "option_quote", "option_snapshot", "prior_close"]);
+  const allowed = new Set([
+    "stock_quote", "stock_trade", "option_contract", "option_quote", "option_trade",
+    "option_aggregate", "option_snapshot", "prior_close",
+  ]);
   if (!candidate.type || !allowed.has(candidate.type) || !Number.isFinite(candidate.timestamp) || !("data" in candidate)) {
     throw new Error(`Invalid replay schema at line ${lineNumber}`);
   }

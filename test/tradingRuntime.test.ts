@@ -904,7 +904,10 @@ test("transient option spread rejection retries from OPRA and submits only after
   assert.equal(armed?.data.selectionStatus, "RETRYING");
   assert.equal(armed?.data.candidate, null);
   assert.equal((armed?.data.closestCandidate as Record<string, unknown>).symbol, callSymbol);
-  assert.deepEqual(armed?.data.selectionReasons, ["MORNING_ENTRY_OPTION_SPREAD_TOO_WIDE"]);
+  assert.deepEqual(armed?.data.selectionReasons, [
+    "MORNING_ENTRY_OPTION_SPREAD_TOO_WIDE",
+    "MORNING_ENTRY_COST_MARGIN_BELOW_MINIMUM",
+  ]);
   assert.equal(client.requests.length, 0);
 
   decisionTime += 100;
@@ -953,6 +956,16 @@ test("option selection does not retry a structural midpoint rejection", async ()
   assert.equal(selection?.data.selectionStatus, "NO_ELIGIBLE_OPTION");
   assert.equal(selection?.data.retryOutcome, "STRUCTURAL_REJECTION");
   assert.ok((selection?.data.selectionReasons as string[]).includes("MIDPOINT_OUTSIDE_RANGE"));
+  assert.deepEqual(selection?.data.closestCandidateQuote, {
+    timestamp: now,
+    bidPrice: 13,
+    askPrice: 13.01,
+    bidSize: 100,
+    askSize: 100,
+    correctedProviderAgeMs: 0,
+    freshnessThresholdMs: config.dataQuality.maxOptionQuoteAgeMs,
+    freshAtDecision: true,
+  });
   assert.equal(client.requests.length, 0);
   await runtime.close();
 });

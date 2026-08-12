@@ -1,8 +1,8 @@
 import { performance } from "node:perf_hooks";
 import WebSocket, { type RawData } from "ws";
-import type { OptionQuote } from "../types.js";
+import type { OptionAggregate, OptionQuote, OptionTrade } from "../types.js";
 import type {
-  OptionStream, OptionStreamHandlers,
+  OptionStream, OptionStreamEvent, OptionStreamHandlers,
 } from "../alpaca/optionStream.js";
 import type { OpraQuoteObservation } from "../marketData/opraQuoteHealth.js";
 import { parseOccSymbol } from "../options/occSymbol.js";
@@ -95,11 +95,22 @@ export class MassiveOptionWebSocket implements OptionStream {
           const decoded = JSON.parse(rawDataToString(data)) as unknown;
           const messages = Array.isArray(decoded) ? decoded : [decoded];
           const quotes: OptionQuote[] = [];
+          const events: OptionStreamEvent[] = [];
           for (const value of messages) {
             if (!value || typeof value !== "object") throw new Error("Invalid Massive option stream payload");
             const message = value as Record<string, unknown>;
             if (message.ev === "Q") {
-              quotes.push(adaptMassiveOptionQuote(message));
+              const quote = adaptMassiveOptionQuote(message);
+              quotes.push(quote);
+              events.push({ type: "quote", value: quote });
+              continue;
+            }
+            if (message.ev === "T") {
+              events.push({ type: "trade", value: adaptMassiveOptionTrade(message) });
+              continue;
+            }
+            if (message.ev === "A") {
+              events.push({ type: "aggregate", value: adaptMassiveOptionAggregate(message) });
               continue;
             }
             if (message.ev !== "status") continue;
@@ -137,8 +148,11 @@ export class MassiveOptionWebSocket implements OptionStream {
               subscriptionSymbols,
             }));
             handlers.onQuoteObservations?.(observations);
-            this.#enqueueQuotes(quotes);
           }
+          if (events.length > 0) {
+            handlers.onRawEvents?.(events, { receiveWallTimestamp, receiveMonotonicTimestamp });
+          }
+          if (quotes.length > 0) this.#enqueueQuotes(quotes);
         } catch (error) {
           this.#failSubscriptionWaiter(error);
           rejectOnce(error);
@@ -215,7 +229,13 @@ export class MassiveOptionWebSocket implements OptionStream {
   }
 
   #sendSubscription(action: "subscribe" | "unsubscribe", symbols: readonly string[]): void {
-    this.#send({ action, params: symbols.map((symbol) => `Q.${toMassiveOptionTicker(symbol)}`).join(",") });
+    this.#send({
+      action,
+      params: symbols.flatMap((symbol) => {
+        const ticker = toMassiveOptionTicker(symbol);
+        return [`Q.${ticker}`, `T.${ticker}`, `A.${ticker}`];
+      }).join(","),
+    });
   }
 
   #waitForSubscription(action: "subscribe" | "unsubscribe"): Promise<void> {
@@ -314,6 +334,49 @@ export function adaptMassiveOptionQuote(raw: Record<string, unknown>): OptionQuo
     askSize: raw.as as number,
     ...(typeof raw.bx === "number" || typeof raw.bx === "string" ? { bidExchange: String(raw.bx) } : {}),
     ...(typeof raw.ax === "number" || typeof raw.ax === "string" ? { askExchange: String(raw.ax) } : {}),
+    ...(typeof raw.q === "number" && Number.isFinite(raw.q) ? { sequenceNumber: raw.q } : {}),
+  };
+}
+
+export function adaptMassiveOptionTrade(raw: Record<string, unknown>): OptionTrade {
+  const symbol = fromMassiveOptionTicker(raw.sym);
+  const values = [raw.t, raw.p, raw.s];
+  if (!values.every((value) => typeof value === "number" && Number.isFinite(value))) {
+    throw new Error(`Invalid Massive option trade payload for ${symbol}`);
+  }
+  return {
+    symbol,
+    timestamp: raw.t as number,
+    price: raw.p as number,
+    size: raw.s as number,
+    ...(typeof raw.x === "number" || typeof raw.x === "string" ? { exchange: String(raw.x) } : {}),
+    ...(Array.isArray(raw.c)
+      ? { conditions: raw.c.filter((value): value is number => typeof value === "number" && Number.isFinite(value)) }
+      : {}),
+    ...(typeof raw.q === "number" && Number.isFinite(raw.q) ? { sequenceNumber: raw.q } : {}),
+  };
+}
+
+export function adaptMassiveOptionAggregate(raw: Record<string, unknown>): OptionAggregate {
+  const symbol = fromMassiveOptionTicker(raw.sym);
+  const required = [raw.s, raw.e, raw.o, raw.h, raw.l, raw.c, raw.v];
+  if (!required.every((value) => typeof value === "number" && Number.isFinite(value))) {
+    throw new Error(`Invalid Massive option aggregate payload for ${symbol}`);
+  }
+  return {
+    symbol,
+    startTimestamp: raw.s as number,
+    endTimestamp: raw.e as number,
+    open: raw.o as number,
+    high: raw.h as number,
+    low: raw.l as number,
+    close: raw.c as number,
+    volume: raw.v as number,
+    ...(typeof raw.av === "number" && Number.isFinite(raw.av) ? { accumulatedVolume: raw.av } : {}),
+    ...(typeof raw.vw === "number" && Number.isFinite(raw.vw) ? { vwap: raw.vw } : {}),
+    ...(typeof raw.a === "number" && Number.isFinite(raw.a) ? { sessionVwap: raw.a } : {}),
+    ...(typeof raw.z === "number" && Number.isFinite(raw.z) ? { averageTradeSize: raw.z } : {}),
+    ...(typeof raw.op === "number" && Number.isFinite(raw.op) ? { officialOpen: raw.op } : {}),
   };
 }
 

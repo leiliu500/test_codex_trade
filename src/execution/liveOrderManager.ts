@@ -1,12 +1,14 @@
 import type { EngineConfig } from "../config.js";
 import type {
   AccountState, ExitDecision, ExitReason, ExitTrigger, FeatureSnapshot, OptionCandidateEvaluation,
-  OptionQuote, OptionSnapshot, PositionState, RegimeDecision, RiskDecision, TradeSignal,
+  OptionMicrostructureSnapshot, OptionQuote, OptionSnapshot, PositionState, RegimeDecision,
+  RiskDecision, TradeSignal,
 } from "../types.js";
 import type { BrokerOrder, BrokerPosition, TradingRestClient } from "../alpaca/restClient.js";
 import { reconcileBrokerState } from "../alpaca/restClient.js";
 import { validateOptionQuote } from "../features/quoteSanitizer.js";
 import { sameDayOptionContractReasons } from "../options/tradingInvariants.js";
+import { activeSignalEntryGuard } from "../strategy/lateEntryGuard.js";
 import { ExitManager } from "../risk/exitManager.js";
 import { RiskManager } from "../risk/riskManager.js";
 import type { DailyRiskState } from "../risk/riskManager.js";
@@ -18,7 +20,15 @@ import {
   type DashboardOrderManagement,
 } from "../ops/orderCards.js";
 import { marketDate } from "../utils/time.js";
-import { OrderExecutor, reconcileEntryExposure, type OrderState } from "./orderExecutor.js";
+import {
+  entryAggressionFromMicrostructure,
+  entryReplaceTtlFromMicrostructure,
+  exitUrgencyFromMicrostructure,
+  OrderExecutor,
+  reconcileEntryExposure,
+  urgencyTtl,
+  type OrderState,
+} from "./orderExecutor.js";
 
 type ExecutionPurpose = "ENTRY" | "EXIT";
 
@@ -37,6 +47,18 @@ interface PendingBrokerExecution {
   exitIntentId?: string;
   entryImpliedVolatility?: number;
   entrySnapshotTimestamp?: number;
+  arrivalMid?: number;
+  entryMicrostructureScore?: number;
+}
+
+interface ExecutionQualityProbe {
+  symbol: string;
+  side: "buy" | "sell";
+  purpose: ExecutionPurpose;
+  fillTimestamp: number;
+  fillPrice: number;
+  quantity: number;
+  horizonSec: number;
 }
 
 export type TradeLifecycleState =
@@ -65,6 +87,7 @@ export interface EntryExecutionRequest {
   candidate: OptionCandidateEvaluation;
   quote: OptionQuote;
   optionSnapshot?: OptionSnapshot;
+  optionMicrostructure?: OptionMicrostructureSnapshot;
   killSwitch?: boolean;
 }
 
@@ -79,6 +102,7 @@ export interface ExecutionTick {
   continuationLcbDollars?: number;
   trendProbability?: number;
   optionSnapshot?: OptionSnapshot;
+  optionMicrostructure?: OptionMicrostructureSnapshot;
 }
 
 export interface EntryExecutionResult {
@@ -158,6 +182,8 @@ export class LiveOrderManager {
   #lifecycle: TradeLifecycleState = "FLAT";
   #safeMode = false;
   readonly #lastOptionQuotes = new Map<string, OptionQuote>();
+  readonly #lastOptionMicrostructures = new Map<string, OptionMicrostructureSnapshot>();
+  readonly #executionQualityProbes: ExecutionQualityProbe[] = [];
   #lastAuditedManagementState: DashboardOrderManagement | undefined;
   #halted = false;
   #haltReason: string | undefined;
@@ -242,6 +268,13 @@ export class LiveOrderManager {
       }
       if (request.candidate.symbol === this.#config.symbol) reasons.push("UNDERLYING_ORDER_FORBIDDEN");
 
+      const profileQuoteAgeLimitMs = activeSignalEntryGuard(this.#config, request.signal)
+        ?.maxEntryQuoteAgeMs;
+      const entryQuoteAgeLimitMs = profileQuoteAgeLimitMs ??
+        this.#config.execution.maxEntryQuoteAgeMs;
+      const initialQuoteAgeLimitMs = profileQuoteAgeLimitMs ??
+        this.#config.dataQuality.maxOptionQuoteAgeMs;
+
       const clock = await this.#client.getMarketClock();
       if (!clock.isOpen) reasons.push("MARKET_CLOSED");
       if (request.candidate.contract) {
@@ -249,7 +282,10 @@ export class LiveOrderManager {
           request.candidate.contract, clock.timestamp, this.#config.timeZone, this.#config.symbol,
         ));
       }
-      const quoteValidation = validateOptionQuote(request.quote, clock.timestamp, this.#config.dataQuality);
+      const quoteValidation = validateOptionQuote(request.quote, clock.timestamp, {
+        ...this.#config.dataQuality,
+        maxOptionQuoteAgeMs: initialQuoteAgeLimitMs,
+      });
       if (!quoteValidation.usable) reasons.push(...quoteValidation.reasons.map((reason) => `QUOTE_${reason}`));
       if (clock.timestamp - request.signal.timestamp > this.#config.execution.entrySignalTtlMs) {
         reasons.push("SIGNAL_TTL_EXPIRED");
@@ -259,6 +295,8 @@ export class LiveOrderManager {
         return { submitted: false, reasons: [...new Set(reasons)] };
       }
       this.#rememberQuote(request.quote);
+      const entryMicrostructure = request.optionMicrostructure ?? request.candidate.optionMicrostructure;
+      this.#rememberMicrostructure(entryMicrostructure);
 
       const account = await this.#client.getAccount();
       const guardedAccount: AccountState = { ...account, killSwitch: account.killSwitch || request.killSwitch === true };
@@ -301,7 +339,7 @@ export class LiveOrderManager {
       const entryQuoteAgeMs = submissionClock.timestamp - request.quote.timestamp;
       if (!submissionClock.isOpen) submissionReasons.push("MARKET_CLOSED");
       if (entryQuoteAgeMs < 0) submissionReasons.push("ENTRY_QUOTE_FUTURE");
-      if (entryQuoteAgeMs > this.#config.execution.maxEntryQuoteAgeMs) {
+      if (entryQuoteAgeMs > entryQuoteAgeLimitMs) {
         submissionReasons.push("ENTRY_QUOTE_TOO_OLD");
       }
       if (submissionClock.timestamp - request.signal.timestamp > this.#config.execution.entrySignalTtlMs) {
@@ -314,7 +352,7 @@ export class LiveOrderManager {
           stage: "PRE_SUBMISSION",
           quoteTimestamp: request.quote.timestamp,
           quoteAgeMs: entryQuoteAgeMs,
-          maxEntryQuoteAgeMs: this.#config.execution.maxEntryQuoteAgeMs,
+          maxEntryQuoteAgeMs: entryQuoteAgeLimitMs,
           reasons: submissionReasons,
         });
         return { submitted: false, reasons: [...new Set(submissionReasons)], risk };
@@ -328,6 +366,9 @@ export class LiveOrderManager {
         quantity: risk.quantity,
         timestamp: submissionClock.timestamp,
         quote: request.quote,
+        spreadFraction: entryAggressionFromMicrostructure(this.#config, entryMicrostructure),
+        actionTtlMs: entryReplaceTtlFromMicrostructure(this.#config, entryMicrostructure),
+        urgency: Math.max(0, entryMicrostructure?.confirmationScore ?? 0),
         priceCollar: maximumEntryPremium(request.candidate, request.quote, this.#config),
       });
       state = this.#orders.submit(state, submissionClock.timestamp);
@@ -351,8 +392,11 @@ export class LiveOrderManager {
             ? { entryImpliedVolatility: request.optionSnapshot.impliedVolatility }
             : {}),
         ...(request.optionSnapshot?.timestamp !== undefined
-          ? { entrySnapshotTimestamp: request.optionSnapshot.timestamp }
-          : {}),
+            ? { entrySnapshotTimestamp: request.optionSnapshot.timestamp }
+            : {}),
+        arrivalMid: optionMid,
+        ...(entryMicrostructure
+          ? { entryMicrostructureScore: entryMicrostructure.confirmationScore } : {}),
         lastPolledAt: submissionClock.timestamp,
       };
       this.#lifecycle = "ENTRY_PENDING";
@@ -365,6 +409,8 @@ export class LiveOrderManager {
     return this.#serialize(async () => {
       this.#assertOperational();
       this.#rememberQuote(request.optionQuote);
+      this.#rememberMicrostructure(request.optionMicrostructure);
+      await this.#evaluateExecutionQualityProbes(request.timestamp);
 
       if (this.#pending && request.timestamp - this.#pending.lastPolledAt >= this.#config.execution.orderPollMs) {
         const brokerOrder = await this.#client.getOrder(this.#pending.brokerOrderId);
@@ -401,7 +447,7 @@ export class LiveOrderManager {
       }
 
       if (this.#pending) {
-        await this.#managePendingTimer(request.timestamp);
+        await this.#managePendingTimer(request);
         return this.snapshot();
       }
 
@@ -582,6 +628,12 @@ export class LiveOrderManager {
     }
     intent.attempts += 1;
     const marketable = true;
+    const microstructure = this.#microstructureFor(this.#position.symbol);
+    const dynamicUrgency = exitUrgencyFromMicrostructure(
+      this.#config,
+      intent.urgency,
+      microstructure,
+    );
     const clientOrderId = this.#clientOrderId(
       "exit",
       `${intent.id}-attempt-${intent.attempts}`,
@@ -599,7 +651,7 @@ export class LiveOrderManager {
       timestamp,
       quote,
       marketable,
-      urgency: intent.urgency,
+      urgency: dynamicUrgency,
       priceCollar,
       intentId: intent.id,
     });
@@ -610,7 +662,7 @@ export class LiveOrderManager {
       triggers: intent.triggers,
       exitIntentId: intent.id,
       attempt: intent.attempts,
-      urgency: intent.urgency,
+      urgency: dynamicUrgency,
       marketable,
       tradeState: this.#position.tradeState,
       executablePnl: this.#position.executablePnl,
@@ -629,6 +681,7 @@ export class LiveOrderManager {
       exitReason: intent.reason,
       exitIntentId: intent.id,
       lastPolledAt: timestamp,
+      arrivalMid: (quote.bidPrice + quote.askPrice) / 2,
     };
     this.#lifecycle = "EXIT_PENDING";
     await this.#synchronizeBrokerOrder(brokerOrder, timestamp);
@@ -673,6 +726,12 @@ export class LiveOrderManager {
       const newNotional = broker.averageFillPrice! * totalFilled;
       const incrementalPrice = (newNotional - oldNotional) / incrementalQuantity;
       this.#orders.recordFill(pending.state, timestamp, incrementalQuantity, incrementalPrice);
+      await this.#scheduleExecutionQualityProbes(
+        pending,
+        timestamp,
+        incrementalPrice,
+        incrementalQuantity,
+      );
       if (pending.purpose === "ENTRY") {
         const firstFill = this.#position === undefined;
         this.#position = reconcileEntryExposure(
@@ -807,12 +866,35 @@ export class LiveOrderManager {
     }
   }
 
-  async #managePendingTimer(timestamp: number): Promise<void> {
+  async #managePendingTimer(request: ExecutionTick): Promise<void> {
+    const timestamp = request.timestamp;
     const pending = this.#pending;
     if (!pending || pending.state.status === "CANCEL_PENDING") return;
     const quote = this.#quoteFor(pending.state.symbol);
     const beforeReplacements = pending.state.replacements;
     const beforeLimit = pending.state.limitPrice;
+    const microstructure = this.#microstructureFor(pending.state.symbol, request.optionMicrostructure);
+    if (pending.purpose === "ENTRY") {
+      pending.state.initialAggression = entryAggressionFromMicrostructure(
+        this.#config,
+        microstructure,
+      );
+      pending.state.actionTtlMs = entryReplaceTtlFromMicrostructure(
+        this.#config,
+        microstructure,
+      );
+    } else {
+      pending.state.urgency = exitUrgencyFromMicrostructure(
+        this.#config,
+        this.#exitIntent?.urgency ?? pending.state.urgency,
+        microstructure,
+      );
+      pending.state.actionTtlMs = urgencyTtl(
+        pending.state.urgency,
+        this.#config.execution.exitTtlMinMs,
+        this.#config.execution.exitTtlMaxMs,
+      );
+    }
     this.#orders.onTimer(pending.state, timestamp, quote);
     if ((pending.state.status as string) === "CANCEL_PENDING") {
       await this.#requestCancel(timestamp);
@@ -1014,6 +1096,20 @@ export class LiveOrderManager {
         isOppositeDirectionRegime(pending.direction, request.regime.regime)) {
       reasons.push("SIGNAL_DIRECTION_INVALIDATED");
     }
+    const microstructure = this.#microstructureFor(
+      pending.state.symbol,
+      request.optionMicrostructure,
+    );
+    if (microstructure) {
+      if (microstructure.confirmationScore <
+          this.#config.execution.entryMicrostructureCancelScore) {
+        reasons.push("OPTION_MICROSTRUCTURE_REVERSED");
+      }
+      if (microstructure.spreadExpansionRatio >
+          this.#config.execution.entrySpreadExpansionCancelRatio) {
+        reasons.push("OPTION_SPREAD_EXPANSION_CANCEL");
+      }
+    }
     return [...new Set(reasons)];
   }
 
@@ -1021,6 +1117,86 @@ export class LiveOrderManager {
     if (!quote) return;
     const previous = this.#lastOptionQuotes.get(quote.symbol);
     if (!previous || quote.timestamp >= previous.timestamp) this.#lastOptionQuotes.set(quote.symbol, quote);
+  }
+
+  #rememberMicrostructure(snapshot: OptionMicrostructureSnapshot | undefined): void {
+    if (!snapshot) return;
+    const previous = this.#lastOptionMicrostructures.get(snapshot.symbol);
+    if (!previous || snapshot.timestamp >= previous.timestamp) {
+      this.#lastOptionMicrostructures.set(snapshot.symbol, snapshot);
+    }
+  }
+
+  #microstructureFor(
+    symbol: string,
+    preferred?: OptionMicrostructureSnapshot,
+  ): OptionMicrostructureSnapshot | undefined {
+    if (preferred?.symbol === symbol) return preferred;
+    return this.#lastOptionMicrostructures.get(symbol);
+  }
+
+  async #scheduleExecutionQualityProbes(
+    pending: PendingBrokerExecution,
+    timestamp: number,
+    fillPrice: number,
+    quantity: number,
+  ): Promise<void> {
+    const arrivalMid = pending.arrivalMid;
+    const immediateSlippagePerShare = arrivalMid === undefined
+      ? undefined
+      : pending.state.side === "buy"
+        ? fillPrice - arrivalMid
+        : arrivalMid - fillPrice;
+    await this.#audit(timestamp, "execution_quality_fill", {
+      purpose: pending.purpose,
+      symbol: pending.state.symbol,
+      side: pending.state.side,
+      fillPrice,
+      quantity,
+      arrivalMid: arrivalMid ?? null,
+      immediateSlippagePerShare: immediateSlippagePerShare ?? null,
+      immediateSlippageDollars: immediateSlippagePerShare === undefined
+        ? null : immediateSlippagePerShare * 100 * quantity,
+      entryMicrostructureScore: pending.entryMicrostructureScore ?? null,
+    });
+    for (const horizonSec of this.#config.execution.executionQualityProbeSec) {
+      this.#executionQualityProbes.push({
+        symbol: pending.state.symbol,
+        side: pending.state.side,
+        purpose: pending.purpose,
+        fillTimestamp: timestamp,
+        fillPrice,
+        quantity,
+        horizonSec,
+      });
+    }
+  }
+
+  async #evaluateExecutionQualityProbes(timestamp: number): Promise<void> {
+    for (let index = this.#executionQualityProbes.length - 1; index >= 0; index -= 1) {
+      const probe = this.#executionQualityProbes[index]!;
+      if (timestamp < probe.fillTimestamp + probe.horizonSec * 1_000) continue;
+      const quote = this.#quoteFor(probe.symbol);
+      if (!quote || quote.timestamp < probe.fillTimestamp + probe.horizonSec * 1_000) continue;
+      const mid = (quote.bidPrice + quote.askPrice) / 2;
+      const adverseSelectionPerShare = probe.side === "buy"
+        ? probe.fillPrice - mid
+        : mid - probe.fillPrice;
+      await this.#audit(timestamp, "execution_quality_probe", {
+        purpose: probe.purpose,
+        symbol: probe.symbol,
+        side: probe.side,
+        fillTimestamp: probe.fillTimestamp,
+        fillPrice: probe.fillPrice,
+        quantity: probe.quantity,
+        horizonSec: probe.horizonSec,
+        observedQuoteTimestamp: quote.timestamp,
+        observedMid: mid,
+        adverseSelectionPerShare,
+        adverseSelectionDollars: adverseSelectionPerShare * 100 * probe.quantity,
+      });
+      this.#executionQualityProbes.splice(index, 1);
+    }
   }
 
   #quoteFor(symbol: string, preferred?: OptionQuote): OptionQuote | undefined {

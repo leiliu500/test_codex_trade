@@ -126,6 +126,21 @@ export interface EngineConfig {
         minimumBidImprovement: number;
         minimumProjectedMoveBps: number;
       };
+      bearishCleanImpulse: {
+        enabled: boolean;
+        minDirectionalProjectionBps: number;
+        minFastEfficiency: number;
+        minFastNormalizedSlope: number;
+        minMediumNormalizedSlope: number;
+        minMediumR2: number;
+        minSlowNormalizedSlope: number;
+        minSlowR2: number;
+        minEfficiency60: number;
+        minCostMarginBps: number;
+        maxOptionSpreadPct: number;
+        maxOptionSpreadTicks: number;
+        maxEntryQuoteAgeMs: number;
+      };
       bearishUnclassifiedImpulseFollowThroughStart: string;
       bearishStrongDownImpulse: {
         followThroughMinSec: number;
@@ -167,6 +182,20 @@ export interface EngineConfig {
     maxImpliedVolatility: number;
     fallbackImpliedVolatility: number;
     slippagePerSidePctOfSpread: number;
+    microstructure: {
+      enabled: boolean;
+      windowSec: number;
+      snapshotRefreshSec: number;
+      minimumQuoteEvents: number;
+      minimumEntryScore: number;
+      maximumSpreadExpansionRatio: number;
+      minimumChainAverageScore: number;
+      minimumChainObservedContracts: number;
+      scoreWeight: number;
+      chainScoreWeight: number;
+      thetaCostMultiplier: number;
+      adverseIvMovePoints: number;
+    };
   };
   execution: {
     entryLimitSpreadFraction: number;
@@ -184,6 +213,12 @@ export interface EngineConfig {
     exitTtlMaxMs: number;
     exitPriceCollarPct: number;
     exitMarketableOffsetTicks: number;
+    entryMicrostructureAggressionAdjustment: number;
+    entryMicrostructureCancelScore: number;
+    entrySpreadExpansionCancelRatio: number;
+    entryReplaceMinMs: number;
+    exitMicrostructureUrgencyAdjustment: number;
+    executionQualityProbeSec: number[];
   };
   risk: {
     riskFractionOfEquity: number;
@@ -273,6 +308,8 @@ export function validateConfig(config: EngineConfig): void {
     config.execution.exitLimitSpreadFraction,
     config.execution.adverseFillSpreadFraction,
     config.execution.exitPriceCollarPct,
+    config.execution.entryMicrostructureAggressionAdjustment,
+    config.execution.exitMicrostructureUrgencyAdjustment,
     config.risk.softProtectionRetentionRatio,
     config.risk.profitRetentionBase,
     config.risk.profitRetentionMax,
@@ -298,6 +335,27 @@ export function validateConfig(config: EngineConfig): void {
         Number.isFinite(config.options.minDailyVolumeForOpenInterestFallback) &&
         config.options.minDailyVolumeForOpenInterestFallback >= config.options.minDailyVolume)) {
     throw new Error("Option liquidity thresholds are invalid");
+  }
+  if (!(typeof config.options.microstructure.enabled === "boolean" &&
+        Number.isFinite(config.options.microstructure.windowSec) &&
+        config.options.microstructure.windowSec >= 1 &&
+        Number.isFinite(config.options.microstructure.snapshotRefreshSec) &&
+        config.options.microstructure.snapshotRefreshSec >= 5 &&
+        config.options.microstructure.snapshotRefreshSec <= config.options.chainRefreshSec &&
+        Number.isInteger(config.options.microstructure.minimumQuoteEvents) &&
+        config.options.microstructure.minimumQuoteEvents >= 1 &&
+        config.options.microstructure.minimumEntryScore >= -1 &&
+        config.options.microstructure.minimumEntryScore <= 1 &&
+        config.options.microstructure.maximumSpreadExpansionRatio >= 1 &&
+        config.options.microstructure.minimumChainAverageScore >= -1 &&
+        config.options.microstructure.minimumChainAverageScore <= 1 &&
+        Number.isInteger(config.options.microstructure.minimumChainObservedContracts) &&
+        config.options.microstructure.minimumChainObservedContracts >= 1 &&
+        config.options.microstructure.scoreWeight >= 0 &&
+        config.options.microstructure.chainScoreWeight >= 0 &&
+        config.options.microstructure.thetaCostMultiplier >= 0 &&
+        config.options.microstructure.adverseIvMovePoints >= 0)) {
+    throw new Error("Option microstructure settings are invalid");
   }
   const entryStart = parseClock(config.session.entryStart);
   const lateBullishImpulseStart = parseClock(config.signals.lateBullishImpulseStart);
@@ -431,6 +489,36 @@ export function validateConfig(config: EngineConfig): void {
         config.signals.lateEntryGuard.bullishGrindOptionConfirmation.minimumProjectedMoveBps > 0 &&
         config.signals.lateEntryGuard.bullishGrindOptionConfirmation.minimumProjectedMoveBps <=
           config.signals.lateEntryGuard.minProjectedMoveBps &&
+        typeof config.signals.lateEntryGuard.bearishCleanImpulse.enabled === "boolean" &&
+        config.signals.lateEntryGuard.bearishCleanImpulse.minDirectionalProjectionBps > 0 &&
+        config.signals.lateEntryGuard.bearishCleanImpulse.minDirectionalProjectionBps <
+          config.signals.lateEntryGuard.minProjectedMoveBps &&
+        config.signals.lateEntryGuard.bearishCleanImpulse.minFastEfficiency > 0 &&
+        config.signals.lateEntryGuard.bearishCleanImpulse.minFastEfficiency <= 1 &&
+        config.signals.lateEntryGuard.bearishCleanImpulse.minFastNormalizedSlope > 0 &&
+        config.signals.lateEntryGuard.bearishCleanImpulse.minMediumNormalizedSlope > 0 &&
+        config.signals.lateEntryGuard.bearishCleanImpulse.minMediumR2 >= 0 &&
+        config.signals.lateEntryGuard.bearishCleanImpulse.minMediumR2 <= 1 &&
+        config.signals.lateEntryGuard.bearishCleanImpulse.minSlowNormalizedSlope > 0 &&
+        config.signals.lateEntryGuard.bearishCleanImpulse.minSlowR2 >= 0 &&
+        config.signals.lateEntryGuard.bearishCleanImpulse.minSlowR2 <= 1 &&
+        config.signals.lateEntryGuard.bearishCleanImpulse.minEfficiency60 >
+          config.regimes.chopEfficiency &&
+        config.signals.lateEntryGuard.bearishCleanImpulse.minEfficiency60 <= 1 &&
+        config.signals.lateEntryGuard.bearishCleanImpulse.minCostMarginBps >= 0 &&
+        config.signals.lateEntryGuard.bearishCleanImpulse.minCostMarginBps <=
+          config.signals.lateEntryGuard.minCostMarginBps &&
+        config.signals.lateEntryGuard.bearishCleanImpulse.maxOptionSpreadPct >=
+          config.signals.lateEntryGuard.maxOptionSpreadPct &&
+        config.signals.lateEntryGuard.bearishCleanImpulse.maxOptionSpreadPct <=
+          config.dataQuality.maxOptionSpreadPct &&
+        Number.isInteger(config.signals.lateEntryGuard.bearishCleanImpulse.maxOptionSpreadTicks) &&
+        config.signals.lateEntryGuard.bearishCleanImpulse.maxOptionSpreadTicks >= 1 &&
+        Number.isFinite(config.signals.lateEntryGuard.bearishCleanImpulse.maxEntryQuoteAgeMs) &&
+        config.signals.lateEntryGuard.bearishCleanImpulse.maxEntryQuoteAgeMs >=
+          config.dataQuality.maxOptionQuoteAgeMs &&
+        config.signals.lateEntryGuard.bearishCleanImpulse.maxEntryQuoteAgeMs <=
+          config.execution.entrySignalTtlMs &&
         config.signals.lateEntryGuard.bearishStrongDownImpulse.followThroughMinSec >= 0 &&
         config.signals.lateEntryGuard.bearishStrongDownImpulse.followThroughMaxSec >=
           config.signals.lateEntryGuard.bearishStrongDownImpulse.followThroughMinSec &&
@@ -457,7 +545,16 @@ export function validateConfig(config: EngineConfig): void {
         config.execution.optionSelectionRetryMs <= config.execution.entrySignalTtlMs &&
         config.execution.exitTtlMinMs > 0 &&
         config.execution.exitTtlMaxMs >= config.execution.exitTtlMinMs &&
-        config.execution.exitMarketableOffsetTicks >= 0)) {
+        config.execution.exitMarketableOffsetTicks >= 0 &&
+        config.execution.entryMicrostructureCancelScore >= -1 &&
+        config.execution.entryMicrostructureCancelScore <= 1 &&
+        config.execution.entrySpreadExpansionCancelRatio >= 1 &&
+        config.execution.entryReplaceMinMs > 0 &&
+        config.execution.entryReplaceMinMs <= config.execution.replaceAfterMs &&
+        Array.isArray(config.execution.executionQualityProbeSec) &&
+        config.execution.executionQualityProbeSec.length > 0 &&
+        config.execution.executionQualityProbeSec.every((value, index, values) =>
+          Number.isFinite(value) && value > 0 && (index === 0 || value > values[index - 1]!)))) {
     throw new Error("Order-management TTL and marketable-offset settings are invalid");
   }
   if (!(config.risk.softProtectionActivationDollars > 0 &&

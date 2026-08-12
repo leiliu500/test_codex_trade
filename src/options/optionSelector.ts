@@ -4,10 +4,10 @@ import { marketDate, parseClock, secondsSinceMidnight, zonedDateTimeToEpoch } fr
 import { validateOptionQuote } from "../features/quoteSanitizer.js";
 import { blackScholes, impliedVolatility } from "./blackScholes.js";
 import { evaluateOptionCost, gammaAwareProjectedOptionMove } from "./costGate.js";
-import type { OptionBook, OptionBookEntry } from "./optionBook.js";
+import { OptionBook, type OptionBookEntry } from "./optionBook.js";
 import { sameDayOptionContractReasons } from "./tradingInvariants.js";
 import {
-  activeStaticEntryGuard, projectedMoveContinuationGuard,
+  activeSignalEntryGuard, projectedMoveContinuationGuard,
 } from "../strategy/lateEntryGuard.js";
 
 export interface SelectionResult {
@@ -19,7 +19,12 @@ export interface SelectionResult {
 const STATIC_SPREAD_REJECTION = /^(MORNING|LATE)_ENTRY_OPTION_SPREAD_TOO_WIDE$/;
 
 export function isTransientOptionSelectionReason(reason: string): boolean {
-  return reason.startsWith("QUOTE_") || STATIC_SPREAD_REJECTION.test(reason);
+  return reason.startsWith("QUOTE_") ||
+    reason.startsWith("OPTION_MICROSTRUCTURE_") ||
+    reason.startsWith("CHAIN_MICROSTRUCTURE_") ||
+    reason === "PROJECTED_MOVE_FAILS_COST_GATE" ||
+    reason.endsWith("_COST_MARGIN_BELOW_MINIMUM") ||
+    STATIC_SPREAD_REJECTION.test(reason);
 }
 
 export function relevantOptionEvaluations(
@@ -61,7 +66,7 @@ export class OptionSelector {
     decisionTimestamp = signal.timestamp,
   ): SelectionResult {
     const evaluations = contracts.map((contract) =>
-      this.evaluate(contract, book.get(contract.symbol), signal, decisionTimestamp));
+      this.evaluate(contract, book.get(contract.symbol), signal, decisionTimestamp, book));
     const eligible = evaluations.filter((candidate) => candidate.eligible)
       .sort((a, b) => b.score! - a.score!);
     const rejectionCounts: Record<string, number> = {};
@@ -80,6 +85,7 @@ export class OptionSelector {
     entry: OptionBookEntry | undefined,
     signal: TradeSignal,
     decisionTimestamp = signal.timestamp,
+    sourceBook?: OptionBook,
   ): OptionCandidateEvaluation {
     const rejectionReasons: string[] = [];
     const expectedType = signal.direction === "BULLISH" ? "call" : "put";
@@ -99,10 +105,14 @@ export class OptionSelector {
     const quote = entry?.quote;
     const mid = quote ? (quote.bidPrice + quote.askPrice) / 2 : undefined;
     const spreadPct = quote && mid ? (quote.askPrice - quote.bidPrice) / mid : undefined;
-    const staticEntryGuard = activeStaticEntryGuard(this.#config, signal.timestamp);
+    const staticEntryGuard = activeSignalEntryGuard(this.#config, signal);
     if (mid !== undefined && (mid < this.#config.options.minOptionMid || mid > this.#config.options.maxOptionMid)) rejectionReasons.push("MIDPOINT_OUTSIDE_RANGE");
+    const optionSpread = quote ? quote.askPrice - quote.bidPrice : undefined;
+    const exceedsSpreadTicks = staticEntryGuard?.maxOptionSpreadTicks !== undefined &&
+      optionSpread !== undefined &&
+      optionSpread > staticEntryGuard.maxOptionSpreadTicks * this.#config.execution.optionTickSize + 1e-9;
     if (staticEntryGuard && spreadPct !== undefined &&
-        spreadPct > staticEntryGuard.maxOptionSpreadPct) {
+        (spreadPct > staticEntryGuard.maxOptionSpreadPct || exceedsSpreadTicks)) {
       rejectionReasons.push(`${staticEntryGuard.reasonPrefix}OPTION_SPREAD_TOO_WIDE`);
     }
     const dailyVolume = entry?.snapshot?.dailyVolume ?? -Infinity;
@@ -133,19 +143,67 @@ export class OptionSelector {
     if (!(iv !== undefined && iv > 0 && iv <= this.#config.options.maxImpliedVolatility)) iv = this.#config.options.fallbackImpliedVolatility;
     let delta = entry?.snapshot?.greeks?.delta;
     let gamma = entry?.snapshot?.greeks?.gamma;
-    if (!(delta !== undefined && Number.isFinite(delta)) || !(gamma !== undefined && gamma >= 0)) {
+    let theta = entry?.snapshot?.greeks?.theta;
+    let vega = entry?.snapshot?.greeks?.vega;
+    if (!(delta !== undefined && Number.isFinite(delta)) || !(gamma !== undefined && gamma >= 0) ||
+        !(theta !== undefined && Number.isFinite(theta)) || !(vega !== undefined && vega >= 0)) {
       const greeks = blackScholes({ ...modelBase, volatility: iv });
       if (!(delta !== undefined && Number.isFinite(delta))) delta = greeks.delta;
       if (!(gamma !== undefined && gamma >= 0)) gamma = greeks.gamma;
+      if (!(theta !== undefined && Number.isFinite(theta))) theta = greeks.thetaPerCalendarDay;
+      if (!(vega !== undefined && vega >= 0)) vega = greeks.vegaPerVolPoint;
     }
     const absoluteDelta = Math.abs(delta);
     if (!(absoluteDelta >= this.#config.options.minAbsDelta && absoluteDelta <= this.#config.options.maxAbsDelta)) rejectionReasons.push("DELTA_OUTSIDE_RANGE");
+
+    const microstructureConfig = this.#config.options.microstructure;
+    const evaluationBook = sourceBook ?? evaluationBookFor(
+      contract,
+      entry,
+      microstructureConfig.windowSec * 1_000,
+    );
+    const optionMicrostructure = evaluationBook.microstructure(contract.symbol, decisionTimestamp);
+    const chainConfirmation = evaluationBook.chainConfirmation(
+      contract.type,
+      decisionTimestamp,
+      contract.strike,
+      this.#config.options.strikeRangePct * 2,
+    );
+    if (microstructureConfig.enabled) {
+      if (!optionMicrostructure) rejectionReasons.push("OPTION_MICROSTRUCTURE_UNAVAILABLE");
+      else {
+        if (!optionMicrostructure.dataFresh) rejectionReasons.push("OPTION_MICROSTRUCTURE_STALE");
+        if (optionMicrostructure.quoteEvents < microstructureConfig.minimumQuoteEvents) {
+          rejectionReasons.push("OPTION_MICROSTRUCTURE_INSUFFICIENT_QUOTES");
+        }
+        if (optionMicrostructure.confirmationScore < microstructureConfig.minimumEntryScore) {
+          rejectionReasons.push("OPTION_MICROSTRUCTURE_ADVERSE");
+        }
+        if (optionMicrostructure.spreadExpansionRatio >
+            microstructureConfig.maximumSpreadExpansionRatio) {
+          rejectionReasons.push("OPTION_MICROSTRUCTURE_SPREAD_EXPANDING");
+        }
+      }
+      if (chainConfirmation.observedContracts < microstructureConfig.minimumChainObservedContracts) {
+        rejectionReasons.push("CHAIN_MICROSTRUCTURE_UNAVAILABLE");
+      } else if (chainConfirmation.averageScore < microstructureConfig.minimumChainAverageScore) {
+        rejectionReasons.push("CHAIN_MICROSTRUCTURE_ADVERSE");
+      }
+    }
+
+    const expectedThetaCostPerShare = Math.max(0, -(theta ?? 0)) *
+      this.#config.signals.projectionHorizonSec / 86_400 *
+      microstructureConfig.thetaCostMultiplier;
+    const expectedVegaRiskPerShare = Math.max(0, vega ?? 0) *
+      microstructureConfig.adverseIvMovePoints;
+    const holdingCostPerShare = expectedThetaCostPerShare + expectedVegaRiskPerShare;
 
     let cost: ReturnType<typeof evaluateOptionCost> | undefined;
     if (quote && absoluteDelta > 0) {
       cost = evaluateOptionCost(
         quote.bidPrice, quote.askPrice, absoluteDelta, signal.featureSnapshot.price, signal.projectedMoveBps,
         this.#config.options.slippagePerSidePctOfSpread, this.#config.signals.costMultiplier,
+        holdingCostPerShare,
       );
       if (!cost.passes) rejectionReasons.push("PROJECTED_MOVE_FAILS_COST_GATE");
       if (staticEntryGuard && cost.costMarginBps < staticEntryGuard.minCostMarginBps) {
@@ -160,9 +218,19 @@ export class OptionSelector {
     const liquidity = 0.12 * (
       Math.log(1 + (entry?.snapshot?.dailyVolume ?? 0)) + 0.5 * Math.log(1 + (entry?.snapshot?.openInterest ?? 0))
     );
+    const gammaProjectedMove = gammaAwareProjectedOptionMove(
+      signal.featureSnapshot.price, signal.projectedMoveBps, absoluteDelta, gamma,
+    );
+    const expectedNetOptionMove = cost
+      ? gammaProjectedMove - cost.roundTripCostPerShare
+      : undefined;
+    const ivSkewVsNearby = chainConfirmation.nearbyIvMedian !== undefined
+      ? iv - chainConfirmation.nearbyIvMedian : undefined;
     const score = eligible
       ? 4 * cost!.costMarginBps - 15 * Math.abs(absoluteDelta - this.#config.options.targetAbsDelta)
-        - 8 * spreadPct! + liquidity
+        - 8 * spreadPct! + liquidity +
+        microstructureConfig.scoreWeight * (optionMicrostructure?.confirmationScore ?? 0) +
+        microstructureConfig.chainScoreWeight * chainConfirmation.averageScore
       : undefined;
     return {
       symbol: contract.symbol,
@@ -170,6 +238,12 @@ export class OptionSelector {
       delta,
       gamma,
       impliedVolatility: iv,
+      expectedThetaCostPerShare,
+      expectedVegaRiskPerShare,
+      ...(expectedNetOptionMove !== undefined ? { expectedNetOptionMove } : {}),
+      ...(optionMicrostructure ? { optionMicrostructure } : {}),
+      chainConfirmation,
+      ...(ivSkewVsNearby !== undefined ? { ivSkewVsNearby } : {}),
       ...(mid !== undefined ? { mid } : {}),
       ...(spreadPct !== undefined ? { spreadPct } : {}),
       ...(cost ? {
@@ -177,11 +251,24 @@ export class OptionSelector {
         equivalentUnderlyingCostBps: cost.equivalentUnderlyingCostBps,
         requiredMoveBps: cost.requiredMoveBps,
         costMarginBps: cost.costMarginBps,
-        gammaAwareProjectedOptionMove: gammaAwareProjectedOptionMove(signal.featureSnapshot.price, signal.projectedMoveBps, absoluteDelta, gamma),
+        gammaAwareProjectedOptionMove: gammaProjectedMove,
       } : {}),
       ...(score !== undefined ? { score } : {}),
       eligible,
       rejectionReasons: [...new Set(rejectionReasons)],
     };
   }
+
+}
+
+function evaluationBookFor(
+  contract: OptionContract,
+  entry: OptionBookEntry | undefined,
+  windowMs: number,
+): OptionBook {
+  const book = new OptionBook(windowMs);
+  book.upsertContract(entry?.contract ?? contract);
+  if (entry?.snapshot) book.updateSnapshot(entry.snapshot);
+  if (entry?.quote) book.updateQuote(entry.quote);
+  return book;
 }

@@ -1,13 +1,14 @@
 import {
   isUnderlyingSymbol,
-  type AccountState, type OptionContract, type OptionQuote, type OptionSnapshot, type StockQuote,
+  type AccountState, type OptionAggregate, type OptionContract, type OptionQuote, type OptionSnapshot,
+  type OptionTrade, type StockQuote,
   type UnderlyingSymbol,
 } from "../types.js";
 import type {
   BrokerOrder, BrokerOrderRequest, BrokerPosition, MultiUnderlyingTradingRestClient,
 } from "../alpaca/restClient.js";
 import { parseOccSymbol } from "../options/occSymbol.js";
-import { fromMassiveOptionTicker } from "./optionStream.js";
+import { fromMassiveOptionTicker, toMassiveOptionTicker } from "./optionStream.js";
 
 export interface MassiveOptionRestConfig {
   apiKey: string;
@@ -15,6 +16,8 @@ export interface MassiveOptionRestConfig {
   fetch?: typeof fetch;
   underlyings?: readonly UnderlyingSymbol[];
 }
+
+export type MassiveOptionAggregateTimespan = "second" | "minute";
 
 interface MassivePage {
   results?: Array<Record<string, unknown>>;
@@ -49,6 +52,48 @@ export class MassiveOptionRestClient {
       const quote = adaptMassiveSnapshotQuote(item);
       return quote ? [quote] : [];
     });
+  }
+
+  async getHistoricalOptionQuotes(
+    symbol: string,
+    startTimestamp: number,
+    endTimestamp: number,
+  ): Promise<OptionQuote[]> {
+    const normalized = this.#validateSymbol(symbol);
+    const query = historicalTimestampQuery(startTimestamp, endTimestamp);
+    const items = await this.#requestAll(`/v3/quotes/${encodeURIComponent(toMassiveOptionTicker(normalized))}?${query}`);
+    return items.map((item) => adaptMassiveHistoricalOptionQuote(normalized, item));
+  }
+
+  async getHistoricalOptionTrades(
+    symbol: string,
+    startTimestamp: number,
+    endTimestamp: number,
+  ): Promise<OptionTrade[]> {
+    const normalized = this.#validateSymbol(symbol);
+    const query = historicalTimestampQuery(startTimestamp, endTimestamp);
+    const items = await this.#requestAll(`/v3/trades/${encodeURIComponent(toMassiveOptionTicker(normalized))}?${query}`);
+    return items.map((item) => adaptMassiveHistoricalOptionTrade(normalized, item));
+  }
+
+  async getHistoricalOptionAggregates(
+    symbol: string,
+    startTimestamp: number,
+    endTimestamp: number,
+    multiplier = 1,
+    timespan: MassiveOptionAggregateTimespan = "second",
+  ): Promise<OptionAggregate[]> {
+    const normalized = this.#validateSymbol(symbol);
+    assertHistoricalRange(startTimestamp, endTimestamp);
+    if (!Number.isInteger(multiplier) || multiplier <= 0) {
+      throw new Error("Massive option aggregate multiplier must be a positive integer");
+    }
+    const query = new URLSearchParams({ adjusted: "true", sort: "asc", limit: "50000" });
+    const path = `/v2/aggs/ticker/${encodeURIComponent(toMassiveOptionTicker(normalized))}` +
+      `/range/${multiplier}/${timespan}/${Math.trunc(startTimestamp)}/${Math.trunc(endTimestamp)}?${query}`;
+    const items = await this.#requestAll(path);
+    const durationMs = multiplier * (timespan === "second" ? 1_000 : 60_000);
+    return items.map((item) => adaptMassiveHistoricalOptionAggregate(normalized, item, durationMs));
   }
 
   async #getChainItems(symbols: readonly string[]): Promise<Array<Record<string, unknown>>> {
@@ -94,6 +139,18 @@ export class MassiveOptionRestClient {
       const item = matches.get(symbol);
       return item ? [item] : [];
     });
+  }
+
+  #validateSymbol(symbol: string): string {
+    const normalized = fromMassiveOptionTicker(toMassiveOptionTicker(symbol));
+    const parsed = parseOccSymbol(normalized);
+    if (!parsed || !isUnderlyingSymbol(parsed.underlying)) {
+      throw new Error(`Massive option data rejected invalid symbol ${symbol}`);
+    }
+    if (!this.#underlyings.has(parsed.underlying)) {
+      throw new Error(`${parsed.underlying} is not enabled at the Massive option-data boundary`);
+    }
+    return normalized;
   }
 
   async #requestAll(path: string): Promise<Array<Record<string, unknown>>> {
@@ -211,6 +268,89 @@ export function adaptMassiveSnapshotQuote(item: Record<string, unknown>): Option
   };
 }
 
+export function adaptMassiveHistoricalOptionQuote(
+  symbol: string,
+  item: Record<string, unknown>,
+): OptionQuote {
+  const timestamp = optionalUnixTimestampMs(item.sip_timestamp);
+  const bidPrice = finiteNumber(item.bid_price);
+  const askPrice = finiteNumber(item.ask_price);
+  const bidSize = finiteNumber(item.bid_size);
+  const askSize = finiteNumber(item.ask_size);
+  if ([timestamp, bidPrice, askPrice, bidSize, askSize].some((value) => value === undefined)) {
+    throw new Error(`Invalid Massive historical option quote payload for ${symbol}`);
+  }
+  return {
+    symbol,
+    timestamp: timestamp!,
+    bidPrice: bidPrice!,
+    askPrice: askPrice!,
+    bidSize: bidSize!,
+    askSize: askSize!,
+    ...(item.bid_exchange !== undefined ? { bidExchange: String(item.bid_exchange) } : {}),
+    ...(item.ask_exchange !== undefined ? { askExchange: String(item.ask_exchange) } : {}),
+    ...(finiteNumber(item.sequence_number) !== undefined
+      ? { sequenceNumber: finiteNumber(item.sequence_number)! } : {}),
+  };
+}
+
+export function adaptMassiveHistoricalOptionTrade(
+  symbol: string,
+  item: Record<string, unknown>,
+): OptionTrade {
+  const timestamp = optionalUnixTimestampMs(item.sip_timestamp);
+  const participantTimestamp = optionalUnixTimestampMs(item.participant_timestamp);
+  const price = finiteNumber(item.price);
+  const size = finiteNumber(item.size);
+  if ([timestamp, price, size].some((value) => value === undefined)) {
+    throw new Error(`Invalid Massive historical option trade payload for ${symbol}`);
+  }
+  return {
+    symbol,
+    timestamp: timestamp!,
+    ...(participantTimestamp !== undefined ? { participantTimestamp } : {}),
+    price: price!,
+    size: size!,
+    ...(item.exchange !== undefined ? { exchange: String(item.exchange) } : {}),
+    ...(Array.isArray(item.conditions)
+      ? { conditions: item.conditions.filter(
+          (value): value is number => typeof value === "number" && Number.isFinite(value),
+        ) }
+      : {}),
+    ...(finiteNumber(item.correction) !== undefined
+      ? { correction: finiteNumber(item.correction)! } : {}),
+    ...(finiteNumber(item.sequence_number) !== undefined
+      ? { sequenceNumber: finiteNumber(item.sequence_number)! } : {}),
+  };
+}
+
+export function adaptMassiveHistoricalOptionAggregate(
+  symbol: string,
+  item: Record<string, unknown>,
+  durationMs: number,
+): OptionAggregate {
+  const startTimestamp = optionalUnixTimestampMs(item.t);
+  const open = finiteNumber(item.o);
+  const high = finiteNumber(item.h);
+  const low = finiteNumber(item.l);
+  const close = finiteNumber(item.c);
+  const volume = finiteNumber(item.v);
+  if ([startTimestamp, open, high, low, close, volume].some((value) => value === undefined)) {
+    throw new Error(`Invalid Massive historical option aggregate payload for ${symbol}`);
+  }
+  return {
+    symbol,
+    startTimestamp: startTimestamp!,
+    endTimestamp: startTimestamp! + durationMs - 1,
+    open: open!,
+    high: high!,
+    low: low!,
+    close: close!,
+    volume: volume!,
+    ...(finiteNumber(item.vw) !== undefined ? { vwap: finiteNumber(item.vw)! } : {}),
+  };
+}
+
 function assertRealTimeQuote(symbol: string, quote: Record<string, unknown> | undefined): void {
   if (quote?.timeframe !== undefined && quote.timeframe !== "REAL-TIME") {
     throw new Error(`Massive returned non-real-time option data for ${symbol}`);
@@ -223,6 +363,24 @@ function optionalUnixTimestampMs(value: unknown): number | undefined {
   if (timestamp >= 100_000_000_000_000_000) return Math.trunc(timestamp / 1_000_000);
   if (timestamp >= 100_000_000_000_000) return Math.trunc(timestamp / 1_000);
   return Math.trunc(timestamp);
+}
+
+function historicalTimestampQuery(startTimestamp: number, endTimestamp: number): URLSearchParams {
+  assertHistoricalRange(startTimestamp, endTimestamp);
+  return new URLSearchParams({
+    "timestamp.gte": `${BigInt(Math.trunc(startTimestamp)) * 1_000_000n}`,
+    "timestamp.lte": `${BigInt(Math.trunc(endTimestamp)) * 1_000_000n}`,
+    order: "asc",
+    sort: "timestamp",
+    limit: "50000",
+  });
+}
+
+function assertHistoricalRange(startTimestamp: number, endTimestamp: number): void {
+  if (!Number.isFinite(startTimestamp) || !Number.isFinite(endTimestamp) ||
+      startTimestamp < 0 || endTimestamp < startTimestamp) {
+    throw new Error("Massive option history requires a finite increasing timestamp range");
+  }
 }
 
 function finiteNumber(value: unknown): number | undefined {

@@ -12,6 +12,8 @@ export interface HealthState {
   receivedStockQuotes?: number;
   receivedStockTrades?: number;
   receivedOptionQuotes?: number;
+  receivedOptionTrades?: number;
+  receivedOptionAggregates?: number;
   lastOptionQuoteAgeMs?: number;
   lastOptionQuoteProviderAgeMs?: number;
   optionQuotePrimed?: boolean;
@@ -143,6 +145,8 @@ export function combineHealthStates(states: Readonly<Record<string, HealthState>
     receivedStockQuotes: sum("receivedStockQuotes"),
     receivedStockTrades: sum("receivedStockTrades"),
     receivedOptionQuotes: sum("receivedOptionQuotes"),
+    receivedOptionTrades: sum("receivedOptionTrades"),
+    receivedOptionAggregates: sum("receivedOptionAggregates"),
     ...(lastOptionQuoteAgeMs !== undefined ? { lastOptionQuoteAgeMs } : {}),
     ...(lastOptionQuoteProviderAgeMs !== undefined ? { lastOptionQuoteProviderAgeMs } : {}),
     optionQuotePrimed: values.every((state) => state.optionQuotePrimed !== false),

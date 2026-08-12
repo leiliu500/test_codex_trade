@@ -423,6 +423,9 @@ test("aligned bullish continuations below the static projection floor require ca
     .includes("LATE_ENTRY_PROJECTED_MOVE_BELOW_MINIMUM"));
 
   const continuationConfig = structuredClone(defaultConfig);
+  // This test isolates continuation qualification from the independent theta/vega cost overlay.
+  continuationConfig.options.microstructure.thetaCostMultiplier = 0;
+  continuationConfig.options.microstructure.adverseIvMovePoints = 0;
   continuationConfig.signals.bullishTrendContinuation.enabled = true;
   const engine = new SignalEngine(continuationConfig);
   const armed = engine.evaluateDetailed(continuation, up);
@@ -572,6 +575,134 @@ test("late persistence gates reject short bearish bursts and weak-medium bullish
     requiresLateBullishGrindOptionConfirmation(immediateLateConfig, noisyBurst.signal!),
     true,
   );
+});
+
+test("SPY clean bearish impulse captures a sub-floor move without weakening ordinary late entries", () => {
+  const base = feature(-1);
+  const timestamp = zonedDateTimeToEpoch("2026-07-22", "12:43:54");
+  const cleanBreakdown: FeatureSnapshot = {
+    ...base,
+    timestamp,
+    price: 771.594,
+    mid: 771.59,
+    ofi5: -5.209,
+    ofi15: -14.187,
+    micropriceDisplacementBps: 0.035,
+    fast: {
+      ...base.fast,
+      efficiencyRatio: 0.75,
+      noiseFloorBps: 0.684,
+      realizedVolatilityBps: 0.684,
+      normalizedSlope: -4.372,
+      normalizedAcceleration: -3.191,
+      regression: {
+        ...base.fast.regression,
+        slopeBpsPerSec: -0.2991358,
+        accelerationBpsPerSec2: -0.043667,
+        r2: 0.836,
+      },
+    },
+    medium: {
+      ...base.medium,
+      normalizedSlope: -4.473,
+      regression: { ...base.medium.regression, r2: 0.885 },
+    },
+    slow: {
+      ...base.slow,
+      normalizedSlope: -1.533,
+      regression: { ...base.slow.regression, r2: 0.585 },
+    },
+    efficiency60: 0.274,
+    signChanges60: 26,
+    vwap: {
+      ...base.vwap,
+      sessionVwap: 774.198,
+      rollingVwap: 771.695,
+      rollingVwapSlopeBpsPerSec: -0.00428,
+    },
+    openingRange: {
+      ...base.openingRange,
+      high: 774.088,
+      low: 772.583,
+      nearLow: false,
+    },
+  };
+  const unclassified: RegimeDecision = { regime: "UNCLASSIFIED", confidence: 0, reasons: [] };
+  const signal = new SignalEngine(defaultConfig).evaluateDetailed(cleanBreakdown, unclassified).signal;
+  assert.equal(signal?.direction, "BEARISH");
+  assert.equal(signal?.kind, "IMPULSE");
+  assert.ok(signal!.projectedMoveBps >=
+    defaultConfig.signals.lateEntryGuard.bearishCleanImpulse.minDirectionalProjectionBps);
+  assert.ok(signal!.projectedMoveBps < defaultConfig.signals.lateEntryGuard.minProjectedMoveBps);
+  assert.ok(signal?.reasons.some((reason) => reason.includes("late clean bearish impulse accepted")));
+
+  const weakEfficiency = new SignalEngine(defaultConfig).evaluateDetailed({
+    ...cleanBreakdown,
+    fast: {
+      ...cleanBreakdown.fast,
+      efficiencyRatio:
+        defaultConfig.signals.lateEntryGuard.bearishCleanImpulse.minFastEfficiency - 0.01,
+    },
+  }, unclassified);
+  assert.equal(weakEfficiency.signal, undefined);
+  assert.ok(weakEfficiency.directions.find((item) => item.direction === "BEARISH")?.reasons
+    .includes("LATE_ENTRY_PROJECTED_MOVE_BELOW_MINIMUM"));
+
+  const contract: OptionContract = {
+    symbol: "SPY260722P00772000",
+    underlying: "SPY",
+    expirationDate: "2026-07-22",
+    strike: 772,
+    type: "put",
+    active: true,
+    tradable: true,
+  };
+  const book = new OptionBook(defaultConfig.options.microstructure.windowSec * 1_000);
+  book.upsertContract(contract);
+  book.updateSnapshot({
+    symbol: contract.symbol,
+    timestamp,
+    impliedVolatility: 0.22,
+    greeks: { delta: -0.593, gamma: 0.02, theta: 0, vega: 0 },
+    dailyVolume: 1_000,
+    openInterest: 5_000,
+  });
+  book.updateQuote({
+    symbol: contract.symbol,
+    timestamp,
+    bidPrice: 0.88,
+    askPrice: 0.89,
+    bidSize: 100,
+    askSize: 100,
+  });
+  const candidate = new OptionSelector(defaultConfig).evaluate(
+    contract,
+    book.get(contract.symbol),
+    signal!,
+    timestamp,
+    book,
+  );
+  assert.equal(candidate.eligible, true);
+  assert.ok(candidate.spreadPct! > defaultConfig.signals.lateEntryGuard.maxOptionSpreadPct);
+  assert.ok(candidate.costMarginBps! >=
+    defaultConfig.signals.lateEntryGuard.bearishCleanImpulse.minCostMarginBps);
+
+  book.updateQuote({
+    symbol: contract.symbol,
+    timestamp: timestamp + 1,
+    bidPrice: 0.87,
+    askPrice: 0.89,
+    bidSize: 100,
+    askSize: 100,
+  });
+  const twoTickSpread = new OptionSelector(defaultConfig).evaluate(
+    contract,
+    book.get(contract.symbol),
+    signal!,
+    timestamp + 1,
+    book,
+  );
+  assert.ok(twoTickSpread.rejectionReasons.includes("LATE_ENTRY_OPTION_SPREAD_TOO_WIDE"));
 });
 
 test("clean low-noise late bullish grinds can reenter without weakening ordinary confirmation", () => {
@@ -1166,7 +1297,7 @@ test("late-session option selection requires tighter spread, post-cost margin, a
   const aboveDefaultMargin = new OptionSelector(defaultConfig).evaluate(
     contract,
     book.get(contract.symbol),
-    { ...signal, projectedMoveBps: 2.4 },
+    { ...signal, projectedMoveBps: 3.1 },
     timestamp + 2,
   );
   assert.ok(aboveDefaultMargin.costMarginBps! >= defaultConfig.signals.lateEntryGuard.minCostMarginBps);

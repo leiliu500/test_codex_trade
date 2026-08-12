@@ -18,6 +18,7 @@ export * from "./strategy/signalEngine.js";
 export * from "./strategy/lateBullishGrindConfirmation.js";
 export * from "./options/occSymbol.js";
 export * from "./options/optionBook.js";
+export * from "./options/optionMicrostructure.js";
 export * from "./options/optionUniverse.js";
 export * from "./options/blackScholes.js";
 export * from "./options/costGate.js";

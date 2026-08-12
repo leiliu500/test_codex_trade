@@ -171,6 +171,43 @@ export interface DashboardTuning {
   entries: DashboardEntryQuality[];
   falseNegativeSummary: DashboardFalseNegativeSummary;
   potentialMisses: DashboardPotentialMiss[];
+  optionSelectionOpportunitySummary: DashboardOptionSelectionOpportunitySummary;
+  optionSelectionOpportunities: DashboardOptionSelectionOpportunity[];
+}
+
+export interface DashboardOptionSelectionOpportunity {
+  signalId: string;
+  timestamp: number;
+  underlying: UnderlyingSymbol;
+  symbol?: string;
+  direction: string;
+  regime: string;
+  status: "PENDING" | "PROFITABLE_MISS" | "CORRECT_REJECTION" | "NON_EXECUTABLE";
+  horizonSec: number;
+  decisionQuoteTimestamp?: number;
+  decisionBid?: number;
+  decisionAsk?: number;
+  decisionBidSize?: number;
+  decisionAskSize?: number;
+  decisionProviderAgeMs?: number;
+  freshnessThresholdMs?: number;
+  forwardQuoteTimestamp?: number;
+  forwardBid?: number;
+  grossExecutablePnlPerContract?: number;
+  grossExecutableReturnPct?: number;
+  reasons: string[];
+  diagnosticReasons: string[];
+}
+
+export interface DashboardOptionSelectionOpportunitySummary {
+  rejectedSelections: number;
+  pending: number;
+  evaluated: number;
+  profitableMisses: number;
+  correctRejections: number;
+  nonExecutable: number;
+  profitableMissRate: number;
+  horizonSec: number;
 }
 
 export interface DashboardPotentialMiss {
@@ -372,6 +409,8 @@ const MISSED_ENTRY_HORIZON_SEC = 5;
 const MISSED_ENTRY_MOVE_THRESHOLD_BPS = 2;
 const FORWARD_SAMPLE_TOLERANCE_MS = 2_000;
 const MISSED_ENTRY_CLUSTER_MS = 15_000;
+const OPTION_SELECTION_OUTCOME_HORIZON_SEC = 30;
+const OPTION_SELECTION_OUTCOME_TOLERANCE_MS = 5_000;
 export const DASHBOARD_DISPLAY_TIME_ZONE = "America/Los_Angeles";
 export const DASHBOARD_DISPLAY_ROLLOVER = "22:00:00";
 
@@ -412,6 +451,24 @@ function orderCardDisplayTimestamp(card: DashboardOrderCard): number | undefined
   return card.entryTimestamp ?? card.updates[0]?.timestamp ?? card.exitTimestamp;
 }
 
+function optionSelectionOpportunitySummary(
+  opportunities: readonly DashboardOptionSelectionOpportunity[],
+): DashboardOptionSelectionOpportunitySummary {
+  const profitableMisses = opportunities.filter((item) => item.status === "PROFITABLE_MISS").length;
+  const correctRejections = opportunities.filter((item) => item.status === "CORRECT_REJECTION").length;
+  const evaluated = profitableMisses + correctRejections;
+  return {
+    rejectedSelections: opportunities.length,
+    pending: opportunities.filter((item) => item.status === "PENDING").length,
+    evaluated,
+    profitableMisses,
+    correctRejections,
+    nonExecutable: opportunities.filter((item) => item.status === "NON_EXECUTABLE").length,
+    profitableMissRate: evaluated > 0 ? profitableMisses / evaluated : 0,
+    horizonSec: OPTION_SELECTION_OUTCOME_HORIZON_SEC,
+  };
+}
+
 /** Reconstructible read model derived only from durable execution audit events. */
 export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
   readonly #startedAt: number;
@@ -432,6 +489,7 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
   readonly #lastFeedSampleAt = new Map<string, number>();
   readonly #decisions: DashboardDecision[] = [];
   readonly #potentialMisses: DashboardPotentialMiss[] = [];
+  readonly #optionSelectionOpportunities = new Map<string, DashboardOptionSelectionOpportunity>();
   readonly #entryGateBlocks = new Map<string, number>();
   readonly #entryStatsByUnderlying = new Map<UnderlyingSymbol, UnderlyingEntryStats>();
   readonly #lastMarketEventReceivedAtByUnderlying = new Map<UnderlyingSymbol, number>();
@@ -563,11 +621,14 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
           this.#latestOptionQuotes.set(event.symbol, { timestamp, bidPrice, askPrice });
         }
         this.#refreshProjectedOrderCards(timestamp, event.symbol, "PNL");
+        this.#updateOptionSelectionOpportunities(event, bidPrice);
         this.#pruneMap(this.#latestOptionQuotes, 5_000);
       }
     }
 
-    const sampleInterval = ["stock_quote", "stock_trade", "option_quote"].includes(event.type) ? 250 : 0;
+    const sampleInterval = [
+      "stock_quote", "stock_trade", "option_quote", "option_trade", "option_aggregate",
+    ].includes(event.type) ? 250 : 0;
     const sampleKey = `${underlying ?? "UNKNOWN"}:${event.type}`;
     const lastSample = this.#lastFeedSampleAt.get(sampleKey);
     if (lastSample === undefined || event.receivedTimestamp - lastSample >= sampleInterval) {
@@ -685,6 +746,9 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
       underlying === undefined || dashboardDecisionUnderlying(decision) === underlying);
     const potentialMisses = this.#potentialMisses.filter((miss) =>
       underlying === undefined || (miss.underlying ?? "SPY") === underlying);
+    const optionSelectionOpportunities = [...this.#optionSelectionOpportunities.values()]
+      .filter((item) => underlying === undefined || item.underlying === underlying)
+      .sort((left, right) => right.timestamp - left.timestamp);
     return {
       performance: {
         signalsFired: signals.length,
@@ -717,6 +781,12 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
         falseNegativeSummary: this.#falseNegativeSummary(underlying),
         potentialMisses: potentialMisses.slice(0, 250).map((miss) => ({
           ...miss, reasons: [...miss.reasons], failedGates: [...miss.failedGates],
+        })),
+        optionSelectionOpportunitySummary: optionSelectionOpportunitySummary(optionSelectionOpportunities),
+        optionSelectionOpportunities: optionSelectionOpportunities.slice(0, 250).map((item) => ({
+          ...item,
+          reasons: [...item.reasons],
+          diagnosticReasons: [...item.diagnosticReasons],
         })),
       },
       liveData: {
@@ -763,6 +833,7 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
     this.#lastFeedSampleAt.clear();
     this.#decisions.length = 0;
     this.#potentialMisses.length = 0;
+    this.#optionSelectionOpportunities.clear();
     this.#entryGateBlocks.clear();
     this.#entryStatsByUnderlying.clear();
     this.#lastMarketEventReceivedAtByUnderlying.clear();
@@ -1228,7 +1299,112 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
         : candidate ? "FIRED" : "NO_ELIGIBLE_OPTION",
       reasons: selectionReasons,
     });
+    this.#recordOptionSelectionOpportunity(
+      event,
+      id,
+      underlying,
+      selectionStatus,
+      candidate,
+      closest,
+      selectionReasons,
+    );
     this.#pruneMap(this.#signals, 1_000);
+  }
+
+  #recordOptionSelectionOpportunity(
+    event: AuditEvent,
+    signalId: string,
+    underlying: UnderlyingSymbol,
+    selectionStatus: string | undefined,
+    candidate: string | undefined,
+    closest: Record<string, unknown>,
+    reasons: string[],
+  ): void {
+    if (candidate) {
+      this.#optionSelectionOpportunities.delete(signalId);
+      return;
+    }
+    if (selectionStatus !== "NO_ELIGIBLE_OPTION") return;
+
+    const quote = recordValue(event.data.closestCandidateQuote);
+    const symbol = stringValue(closest.symbol);
+    const decisionTimestamp = numberValue(event.data.decisionTimestamp) ?? event.timestamp;
+    const decisionQuoteTimestamp = numberValue(quote.timestamp);
+    const decisionBid = numberValue(quote.bidPrice);
+    const decisionAsk = numberValue(quote.askPrice);
+    const decisionBidSize = numberValue(quote.bidSize);
+    const decisionAskSize = numberValue(quote.askSize);
+    const decisionProviderAgeMs = numberValue(quote.correctedProviderAgeMs);
+    const freshnessThresholdMs = numberValue(quote.freshnessThresholdMs);
+    const explicitlyFresh = quote.freshAtDecision === true;
+    const inferredFresh = decisionProviderAgeMs !== undefined && freshnessThresholdMs !== undefined &&
+      decisionProviderAgeMs >= 0 && decisionProviderAgeMs <= freshnessThresholdMs;
+    const validMarket = decisionBid !== undefined && decisionAsk !== undefined &&
+      decisionBidSize !== undefined && decisionAskSize !== undefined &&
+      decisionBid > 0 && decisionAsk > decisionBid && decisionBidSize > 0 && decisionAskSize > 0;
+    const executable = symbol !== undefined && decisionQuoteTimestamp !== undefined &&
+      validMarket && (explicitlyFresh || inferredFresh);
+    const diagnosticReasons: string[] = [];
+    if (!symbol) diagnosticReasons.push("MISSING_CANDIDATE_SYMBOL");
+    if (decisionQuoteTimestamp === undefined || decisionBid === undefined || decisionAsk === undefined) {
+      diagnosticReasons.push("MISSING_DECISION_QUOTE");
+    } else if (!validMarket) {
+      diagnosticReasons.push("INVALID_DECISION_MARKET");
+    }
+    if (!explicitlyFresh && !inferredFresh && decisionQuoteTimestamp !== undefined) {
+      diagnosticReasons.push("STALE_DECISION_QUOTE");
+    }
+
+    this.#optionSelectionOpportunities.set(signalId, {
+      signalId,
+      timestamp: decisionTimestamp,
+      underlying,
+      ...(symbol ? { symbol } : {}),
+      direction: stringValue(event.data.direction) ?? "UNKNOWN",
+      regime: stringValue(event.data.regime) ?? "UNKNOWN",
+      status: executable ? "PENDING" : "NON_EXECUTABLE",
+      horizonSec: OPTION_SELECTION_OUTCOME_HORIZON_SEC,
+      ...(decisionQuoteTimestamp !== undefined ? { decisionQuoteTimestamp } : {}),
+      ...(decisionBid !== undefined ? { decisionBid } : {}),
+      ...(decisionAsk !== undefined ? { decisionAsk } : {}),
+      ...(decisionBidSize !== undefined ? { decisionBidSize } : {}),
+      ...(decisionAskSize !== undefined ? { decisionAskSize } : {}),
+      ...(decisionProviderAgeMs !== undefined ? { decisionProviderAgeMs } : {}),
+      ...(freshnessThresholdMs !== undefined ? { freshnessThresholdMs } : {}),
+      reasons: [...reasons],
+      diagnosticReasons,
+    });
+    this.#pruneMap(this.#optionSelectionOpportunities, 2_000);
+  }
+
+  #updateOptionSelectionOpportunities(event: HistoricalMarketEvent, forwardBid: number): void {
+    for (const opportunity of this.#optionSelectionOpportunities.values()) {
+      if (opportunity.status !== "PENDING" || opportunity.symbol !== event.symbol ||
+          opportunity.decisionAsk === undefined) continue;
+      const elapsed = event.receivedTimestamp - opportunity.timestamp;
+      const horizonMs = opportunity.horizonSec * 1_000;
+      if (elapsed < horizonMs) continue;
+      if (elapsed > horizonMs + OPTION_SELECTION_OUTCOME_TOLERANCE_MS) {
+        opportunity.status = "NON_EXECUTABLE";
+        opportunity.diagnosticReasons.push("NO_FRESH_FORWARD_QUOTE_AT_HORIZON");
+        continue;
+      }
+      const providerAgeMs = correctedProviderLatencyMs(
+        event.receivedTimestamp,
+        event.providerTimestamp,
+        this.#marketDataClockOffsetMs,
+      );
+      const freshnessThresholdMs = opportunity.freshnessThresholdMs;
+      if (providerAgeMs < 0 ||
+          (freshnessThresholdMs !== undefined && providerAgeMs > freshnessThresholdMs)) continue;
+      const grossExecutablePnlPerContract = 100 * (forwardBid - opportunity.decisionAsk);
+      opportunity.forwardQuoteTimestamp = numberValue(event.data.timestamp) ?? event.providerTimestamp;
+      opportunity.forwardBid = forwardBid;
+      opportunity.grossExecutablePnlPerContract = grossExecutablePnlPerContract;
+      opportunity.grossExecutableReturnPct = 100 * (forwardBid - opportunity.decisionAsk) /
+        opportunity.decisionAsk;
+      opportunity.status = grossExecutablePnlPerContract > 0 ? "PROFITABLE_MISS" : "CORRECT_REJECTION";
+    }
   }
 
   #recordRiskDecision(event: AuditEvent): void {
@@ -1756,6 +1932,8 @@ function emptyMarketEventCounts(): Record<HistoricalMarketEventType, number> {
     stock_trade: 0,
     option_contract: 0,
     option_quote: 0,
+    option_trade: 0,
+    option_aggregate: 0,
     option_snapshot: 0,
     feature_snapshot: 0,
   };
@@ -1777,7 +1955,7 @@ function dashboardDecisionUnderlying(decision: DashboardDecision): UnderlyingSym
 
 function marketEventChannel(type: HistoricalMarketEventType): DashboardLiveFeedEvent["channel"] {
   if (type === "stock_quote" || type === "stock_trade") return "SIP";
-  if (type === "option_quote") return "OPRA";
+  if (type === "option_quote" || type === "option_trade" || type === "option_aggregate") return "OPRA";
   if (type === "feature_snapshot") return "ENGINE";
   return "ALPACA_REST";
 }
@@ -1789,6 +1967,14 @@ function marketEventSummary(event: HistoricalMarketEvent): string {
   }
   if (event.type === "stock_trade") {
     return `trade ${formatFeedNumber(numberValue(data.price))} × ${formatFeedNumber(numberValue(data.size), 0)}`;
+  }
+  if (event.type === "option_trade") {
+    return `option trade ${formatFeedNumber(numberValue(data.price))} × ${formatFeedNumber(numberValue(data.size), 0)}`;
+  }
+  if (event.type === "option_aggregate") {
+    return `OHLC ${formatFeedNumber(numberValue(data.open))}/${formatFeedNumber(numberValue(data.high))}/` +
+      `${formatFeedNumber(numberValue(data.low))}/${formatFeedNumber(numberValue(data.close))} · ` +
+      `volume ${formatFeedNumber(numberValue(data.volume), 0)}`;
   }
   if (event.type === "option_contract") {
     return `${stringValue(data.type) ?? "option"} · strike ${formatFeedNumber(numberValue(data.strike))} · expires ${stringValue(data.expirationDate) ?? "—"}`;
@@ -2119,6 +2305,7 @@ export function tradingDashboardHtml(): string {
 <div class="card"><div class="muted">Options Selected</div><div class="value" id="optionsSelected">0</div><div class="muted card-detail" id="optionSelectionDetail">0% of signals</div></div>
 <div class="card"><div class="muted">Risk Passed</div><div class="value" id="riskAllowed">0</div><div class="muted card-detail" id="riskDetail">0 blocked</div></div>
 <div class="card"><div class="muted">Potential Missed Entries</div><div class="value" id="potentialMisses">0</div><div class="muted card-detail" id="potentialMissDetail">Waiting for +5s outcomes</div></div>
+<div class="card"><div class="muted">Executable Selection Misses</div><div class="value" id="selectionMisses">0</div><div class="muted card-detail" id="selectionMissDetail">Waiting for +30s option bids</div></div>
 <div class="card"><div class="muted">No-Signal Evaluations</div><div class="value" id="noSignalEvaluations">0</div><div class="muted card-detail" id="noSignalDetail">All decisions remain recorded</div></div>
 <div class="card"><div class="muted">Entry Orders</div><div class="value" id="entryOrders">0</div></div>
 <div class="card"><div class="muted">Filled Entries</div><div class="value" id="filledEntries">0</div></div>
@@ -2134,6 +2321,7 @@ export function tradingDashboardHtml(): string {
 <section class="panel"><h2>Orders</h2><div class="section-note">Cards show broker execution plus the order manager lifecycle, buffered soft and full winner-protection states, executable P&amp;L, profit floor, recovery and continuation evidence, exit triggers, urgency, and retries. The complete timeline is stored in PostgreSQL for order-history restoration.</div><div id="orderCards" class="live-grid"><div class="empty">Waiting for an option order…</div></div></section>
 <section class="panel"><h2>Signal → Trade Funnel</h2><div class="section-note">A fired signal is not an order. Each row shows the selector version, option choice, risk, and submission status explicitly.</div><table><thead><tr><th>Time</th><th>Underlying</th><th>Version</th><th>Direction</th><th>Kind</th><th>Regime</th><th>Projected</th><th>Option</th><th>Risk</th><th>Status</th><th>Reason</th></tr></thead><tbody id="signals"></tbody></table></section>
 <section class="panel"><h2>Potential Missed Entry Review</h2><div class="section-note">Hindsight diagnostic, not an automatic trade recommendation. A row appears only when directional gates produced NO SIGNAL and the same underlying subsequently moved at least ${MISSED_ENTRY_MOVE_THRESHOLD_BPS.toFixed(1)} bps in one direction over the ${MISSED_ENTRY_HORIZON_SEC}-second projection horizon. Consecutive rows are clustered per underlying for readability.</div><table><thead><tr><th>Evaluation</th><th>Underlying</th><th>Direction</th><th>Regime</th><th>Start</th><th>+${MISSED_ENTRY_HORIZON_SEC}s</th><th>Forward Move</th><th>Failed Gates / Votes</th><th>Decision Reason</th></tr></thead><tbody id="potentialMissRows"></tbody></table></section>
+<section class="panel"><h2>Executable Option-Rejection Review</h2><div class="section-note">Rejected option candidates are judged causally from the decision ask to the first fresh bid near +${OPTION_SELECTION_OUTCOME_HORIZON_SEC} seconds. Positive values are gross, before fees. Missing or stale decision/forward quotes stay explicitly non-executable and never count as profitable misses.</div><table><thead><tr><th>Decision</th><th>Underlying</th><th>Option</th><th>Direction / Regime</th><th>Status</th><th>Decision Bid / Ask</th><th>Quote Age</th><th>+${OPTION_SELECTION_OUTCOME_HORIZON_SEC}s Bid</th><th>Gross P&amp;L / Contract</th><th>Selection / Diagnostic Reason</th></tr></thead><tbody id="selectionOpportunityRows"></tbody></table></section>
 <section class="panel"><h2>Entry Gate Blocks</h2><div class="section-note">Counts every top-level reason that prevented an entry evaluation. This exposes global state failures such as incomplete opening-range recovery even when no hindsight row is created.</div><table><thead><tr><th>Gate / Reason</th><th>Blocked Evaluations</th><th>Share of Evaluations</th></tr></thead><tbody id="gateBlockRows"></tbody></table></section>
 <section class="panel"><h2>Orders &amp; Executions</h2><table><thead><tr><th>Time</th><th>Underlying</th><th>Purpose</th><th>Option</th><th>Side</th><th>Qty</th><th>Limit</th><th>Filled</th><th>Avg Fill</th><th>Status</th></tr></thead><tbody id="orders"></tbody></table></section>
 <section class="panel"><h2>Trade Performance</h2><table><thead><tr><th>Entry</th><th>Exit</th><th>Underlying</th><th>Option</th><th>Direction</th><th>Qty</th><th>Entry Px</th><th>Exit Px</th><th>P&amp;L</th><th>Return</th><th>Exit Reason</th><th>Status</th></tr></thead><tbody id="trades"></tbody></table></section>
@@ -2228,7 +2416,7 @@ function outcomeClass(value){return ['SIGNAL','SELECTED','ALLOWED','SUBMITTED','
 function decisionDetail(item){const details=[...(item.reasons||[])];for(const direction of item.directions||[]){const failedVotes=(direction.votes||[]).filter(v=>!v.passed).map(v=>v.name);const result=direction.passed?'PASS':(direction.reasons||[]).slice(0,6).join(', ');details.push(direction.direction+': '+result+(failedVotes.length?' · failed votes '+failedVotes.join(', '):''))}return details.join(' · ')||'All configured gates passed'}
 let latestDecisions=[];
 function renderDecisionRows(items){latestDecisions=items||[];const view=$('decisionView').value,filtered=view==='ALL'?latestDecisions:view==='NO_SIGNAL'?latestDecisions.filter(x=>x.stage==='ENTRY_EVALUATION'&&x.outcome==='NO_SIGNAL'):latestDecisions.filter(x=>!(x.stage==='ENTRY_EVALUATION'&&x.outcome==='NO_SIGNAL'));rows('decisions',filtered,[x=>({value:time(x.timestamp)}),x=>({value:itemUnderlying(x)}),x=>({value:x.stage.replaceAll('_',' ')}),x=>({value:x.outcome.replaceAll('_',' '),cls:outcomeClass(x.outcome)}),x=>({value:x.direction}),x=>({value:x.symbol}),x=>({value:x.summary}),x=>({value:decisionDetail(x),cls:'decision-reasons'})],view==='ACTIONABLE'?'No actionable signal, option-selection, risk, or order events yet. Routine NO SIGNAL evaluations remain recorded.':'No evaluations match this view.')}
-function renderPotentialMisses(tuning){const summary=tuning?.falseNegativeSummary||{evaluations:0,noSignalEvaluations:0,matureNoSignalEvaluations:0,potentialMisses:0,potentialMissRate:0,horizonSec:5,thresholdBps:2,gateBlocks:[]},misses=tuning?.potentialMisses||[];$('potentialMisses').textContent=count(summary.potentialMisses);$('potentialMisses').className='value '+(summary.potentialMisses>0?'negative':'positive');$('potentialMissDetail').textContent=count(summary.potentialMisses)+' of '+count(summary.matureNoSignalEvaluations)+' mature · '+percent(100*summary.potentialMissRate,2);$('noSignalEvaluations').textContent=count(summary.noSignalEvaluations);$('noSignalDetail').textContent=count(summary.matureNoSignalEvaluations)+' have a +'+summary.horizonSec+'s outcome';rows('potentialMissRows',misses,[x=>({value:time(x.timestamp)}),x=>({value:x.underlying||'SPY'}),x=>({value:x.direction,cls:x.direction==='BULLISH'?'positive':'negative'}),x=>({value:String(x.regime).replaceAll('_',' ')}),x=>({value:num(x.price)}),x=>({value:num(x.forwardPrice)}),x=>({value:signedBps(x.forwardMoveBps),cls:x.forwardMoveBps>0?'positive':'negative'}),x=>({value:(x.failedGates||[]).join(' · '),cls:'decision-reasons'}),x=>({value:(x.reasons||[]).join(' · '),cls:'decision-reasons'})],'No potential hindsight misses detected at the '+summary.horizonSec+'-second / '+num(summary.thresholdBps,1)+'-bps review threshold.');rows('gateBlockRows',summary.gateBlocks||[],[x=>({value:String(x.reason).replaceAll('_',' '),cls:'decision-reasons'}),x=>({value:count(x.count)}),x=>({value:percent(summary.evaluations>0?100*x.count/summary.evaluations:0,1)})],'No entry gates have blocked an evaluation.')}
+function renderPotentialMisses(tuning){const summary=tuning?.falseNegativeSummary||{evaluations:0,noSignalEvaluations:0,matureNoSignalEvaluations:0,potentialMisses:0,potentialMissRate:0,horizonSec:5,thresholdBps:2,gateBlocks:[]},misses=tuning?.potentialMisses||[],optionSummary=tuning?.optionSelectionOpportunitySummary||{rejectedSelections:0,pending:0,evaluated:0,profitableMisses:0,correctRejections:0,nonExecutable:0,profitableMissRate:0,horizonSec:30},optionOutcomes=tuning?.optionSelectionOpportunities||[];$('potentialMisses').textContent=count(summary.potentialMisses);$('potentialMisses').className='value '+(summary.potentialMisses>0?'negative':'positive');$('potentialMissDetail').textContent=count(summary.potentialMisses)+' of '+count(summary.matureNoSignalEvaluations)+' mature · '+percent(100*summary.potentialMissRate,2);$('selectionMisses').textContent=count(optionSummary.profitableMisses);$('selectionMisses').className='value '+(optionSummary.profitableMisses>0?'negative':'positive');$('selectionMissDetail').textContent=count(optionSummary.profitableMisses)+' profitable · '+count(optionSummary.correctRejections)+' protected · '+count(optionSummary.nonExecutable)+' non-executable';$('noSignalEvaluations').textContent=count(summary.noSignalEvaluations);$('noSignalDetail').textContent=count(summary.matureNoSignalEvaluations)+' have a +'+summary.horizonSec+'s outcome';rows('potentialMissRows',misses,[x=>({value:time(x.timestamp)}),x=>({value:x.underlying||'SPY'}),x=>({value:x.direction,cls:x.direction==='BULLISH'?'positive':'negative'}),x=>({value:String(x.regime).replaceAll('_',' ')}),x=>({value:num(x.price)}),x=>({value:num(x.forwardPrice)}),x=>({value:signedBps(x.forwardMoveBps),cls:x.forwardMoveBps>0?'positive':'negative'}),x=>({value:(x.failedGates||[]).join(' · '),cls:'decision-reasons'}),x=>({value:(x.reasons||[]).join(' · '),cls:'decision-reasons'})],'No potential hindsight misses detected at the '+summary.horizonSec+'-second / '+num(summary.thresholdBps,1)+'-bps review threshold.');rows('selectionOpportunityRows',optionOutcomes,[x=>({value:time(x.timestamp)}),x=>({value:x.underlying||'SPY'}),x=>({value:x.symbol}),x=>({value:x.direction+' · '+String(x.regime).replaceAll('_',' ')}),x=>({value:String(x.status).replaceAll('_',' '),cls:x.status==='PROFITABLE_MISS'?'negative':x.status==='CORRECT_REJECTION'?'positive':'muted'}),x=>({value:x.decisionAsk===undefined?'—':money(x.decisionBid)+' / '+money(x.decisionAsk)}),x=>({value:latency(x.decisionProviderAgeMs)}),x=>({value:x.forwardBid===undefined?'—':money(x.forwardBid)}),x=>({value:x.grossExecutablePnlPerContract===undefined?'—':money(x.grossExecutablePnlPerContract),cls:x.grossExecutablePnlPerContract>0?'positive':x.grossExecutablePnlPerContract<0?'negative':''}),x=>({value:[...(x.reasons||[]),...(x.diagnosticReasons||[])].join(' · '),cls:'decision-reasons'})],'No rejected option candidates have reached an executable '+optionSummary.horizonSec+'-second review.');rows('gateBlockRows',summary.gateBlocks||[],[x=>({value:String(x.reason).replaceAll('_',' '),cls:'decision-reasons'}),x=>({value:count(x.count)}),x=>({value:percent(summary.evaluations>0?100*x.count/summary.evaluations:0,1)})],'No entry gates have blocked an evaluation.')}
 let scheduledDisplayRolloverAt=0,displayRolloverTimer;
 function scheduleDisplayRollover(timestamp){if(!Number.isFinite(timestamp)||timestamp===scheduledDisplayRolloverAt)return;scheduledDisplayRolloverAt=timestamp;if(displayRolloverTimer)clearTimeout(displayRolloverTimer);const delay=Math.max(0,timestamp-Date.now()+250);displayRolloverTimer=setTimeout(()=>window.location.reload(),Math.min(delay,2147483647))}
 const percent=(value,d=1)=>Number.isFinite(value)?num(value,d)+'%':'—',latency=value=>!Number.isFinite(value)?'—':value<1000?Math.round(value)+' ms':value<60000?num(value/1000,2)+' s':duration(value),signedBps=value=>Number.isFinite(value)?(value>0?'+':'')+num(value,1)+' bps':'—';
@@ -2255,9 +2443,10 @@ $('stateText').textContent=selected+' · '+readiness.toUpperCase()+' · '+(h.exe
 setStatus('engineState','engineDetail','LIVE','API heartbeat · uptime '+duration(live.uptimeMs),'ok');
 const marketIdle=h.marketDataIdle===true,stockConnected=h.stockWebsocketConnected??h.websocketConnected,sipQuotes=h.receivedStockQuotes??live.eventCounts.stock_quote??0,sipTrades=h.receivedStockTrades??live.eventCounts.stock_trade??0,sipLive=sipQuotes+sipTrades;
 setStatus('sipState','sipDetail',marketIdle?'IDLE':stockConnected?'CONNECTED':'DISCONNECTED',count(sipQuotes)+' live quotes · '+count(sipTrades)+' live trades · quote '+age(h.lastStockQuoteAgeMs),marketIdle||stockConnected?'ok':'halted');
-const subscriptions=h.subscribedOptionContracts||0,opraQuotes=h.receivedOptionQuotes??live.eventCounts.option_quote??0,opraRequired=h.optionSubscriptionsRequired===true,opraSubscriptionIdle=h.marketClockState==='market-open'&&subscriptions===0&&h.optionSubscriptionsRequired===false,opraStalled=h.optionQuoteStalled===true,opraPrimed=h.optionQuotePrimed!==false,opraDiagnosis=h.optionQuoteDiagnosis||(h.optionQuoteProviderLagged?'PROVIDER_DELAYED':opraPrimed?'HEALTHY':'NO_DATA'),opraConnected=h.optionWebsocketConnected===true,opraState=marketIdle||opraSubscriptionIdle?'IDLE':opraStalled||opraDiagnosis==='TRANSPORT_DISCONNECTED'?'STALLED':opraDiagnosis==='PROVIDER_DELAYED'?'PROVIDER DELAYED':opraDiagnosis==='OLD_EVENT_ARRIVED'?'OLD EVENT':opraDiagnosis==='CONTRACT_IDLE'?'CONTRACT IDLE':opraDiagnosis==='NO_DATA'?'WARMING':opraConnected?'CONNECTED':opraRequired?'DISCONNECTED':'STANDBY',opraLevel=marketIdle||opraSubscriptionIdle?'ok':opraStalled||opraDiagnosis==='TRANSPORT_DISCONNECTED'||opraDiagnosis==='PROVIDER_DELAYED'||opraDiagnosis==='OLD_EVENT_ARRIVED'?'halted':opraDiagnosis==='CONTRACT_IDLE'||opraDiagnosis==='NO_DATA'?'degraded':opraConnected?'ok':opraRequired?'halted':'degraded',opraError=opraStalled&&h.lastStreamError?' · '+h.lastStreamError:'';
+const subscriptions=h.subscribedOptionContracts||0,opraQuotes=h.receivedOptionQuotes??live.eventCounts.option_quote??0,opraTrades=h.receivedOptionTrades??live.eventCounts.option_trade??0,opraAggregates=h.receivedOptionAggregates??live.eventCounts.option_aggregate??0,opraRequired=h.optionSubscriptionsRequired===true,opraSubscriptionIdle=h.marketClockState==='market-open'&&subscriptions===0&&h.optionSubscriptionsRequired===false,opraStalled=h.optionQuoteStalled===true,opraPrimed=h.optionQuotePrimed!==false,opraDiagnosis=h.optionQuoteDiagnosis||(h.optionQuoteProviderLagged?'PROVIDER_DELAYED':opraPrimed?'HEALTHY':'NO_DATA'),opraConnected=h.optionWebsocketConnected===true,opraState=marketIdle||opraSubscriptionIdle?'IDLE':opraStalled||opraDiagnosis==='TRANSPORT_DISCONNECTED'?'STALLED':opraDiagnosis==='PROVIDER_DELAYED'?'PROVIDER DELAYED':opraDiagnosis==='OLD_EVENT_ARRIVED'?'OLD EVENT':opraDiagnosis==='CONTRACT_IDLE'?'CONTRACT IDLE':opraDiagnosis==='NO_DATA'?'WARMING':opraConnected?'CONNECTED':opraRequired?'DISCONNECTED':'STANDBY',opraLevel=marketIdle||opraSubscriptionIdle?'ok':opraStalled||opraDiagnosis==='TRANSPORT_DISCONNECTED'||opraDiagnosis==='PROVIDER_DELAYED'||opraDiagnosis==='OLD_EVENT_ARRIVED'?'halted':opraDiagnosis==='CONTRACT_IDLE'||opraDiagnosis==='NO_DATA'?'degraded':opraConnected?'ok':opraRequired?'halted':'degraded',opraError=opraStalled&&h.lastStreamError?' · '+h.lastStreamError:'';
 const restFallback=h.optionRestFallbackEnabled?(' · REST diagnostic '+age(h.lastOptionRestQuoteProviderAgeMs)+' · '+count(h.optionRestFallbackFreshQuotes)+' fresh/'+count(h.optionRestFallbackRequests)+' requests · circuit '+(h.optionRestCircuitState||'CLOSED')+(h.optionRestRepeatedQuotes?' · '+count(h.optionRestRepeatedQuotes)+' repeated':'')+(h.optionRestFallbackInFlight?' (probing)':'')+(h.lastOptionRestFallbackError?' · REST error '+h.lastOptionRestFallbackError:'')):'';
-const opraDetail=opraSubscriptionIdle?(h.optionSameDayContractsAvailable===false?'NO SAME-DAY OPTION CONTRACTS · 0 subscriptions · '+count(opraQuotes)+' session WS quotes':'ENTRY CUTOFF · NO ACTIVE EXPOSURE · 0 subscriptions · '+count(opraQuotes)+' session WS quotes'):count(opraQuotes)+' WS quotes · transport '+age(h.optionTransportAgeMs??h.lastOptionQuoteAgeMs)+' · exact symbol '+age(h.optionExactSymbolReceiveAgeMs)+' · provider '+age(h.lastOptionQuoteProviderAgeMs)+' · '+count(h.optionFreshContracts)+'/'+count(subscriptions)+' fresh contracts'+(Number.isFinite(h.optionMedianArrivalLagMs)?' · median arrival lag '+latency(h.optionMedianArrivalLagMs):'')+restFallback+opraError;
+const opraFlow=count(opraQuotes)+' Q · '+count(opraTrades)+' T · '+count(opraAggregates)+' A';
+const opraDetail=opraSubscriptionIdle?(h.optionSameDayContractsAvailable===false?'NO SAME-DAY OPTION CONTRACTS · 0 subscriptions · '+opraFlow:'ENTRY CUTOFF · NO ACTIVE EXPOSURE · 0 subscriptions · '+opraFlow):opraFlow+' · transport '+age(h.optionTransportAgeMs??h.lastOptionQuoteAgeMs)+' · exact symbol '+age(h.optionExactSymbolReceiveAgeMs)+' · provider '+age(h.lastOptionQuoteProviderAgeMs)+' · '+count(h.optionFreshContracts)+'/'+count(subscriptions)+' fresh contracts'+(Number.isFinite(h.optionMedianArrivalLagMs)?' · median arrival lag '+latency(h.optionMedianArrivalLagMs):'')+restFallback+opraError;
 setStatus('opraState','opraDetail',opraState,opraDetail,opraLevel);
 const dbLevel=!live.persistenceEnabled?'degraded':h.recorderHealthy?'ok':'halted',retentionDetail=(live.quoteSampleIntervalMs===0?'full-resolution quotes':live.quoteSampleIntervalMs+' ms quote baseline')+' · '+live.retentionDays+'d raw retention';
 setStatus('databaseState','databaseDetail',!live.persistenceEnabled?'DISABLED':h.recorderHealthy?'WRITING':'UNHEALTHY',live.persistenceEnabled?retentionDetail:'Persistence is not enabled',dbLevel);

@@ -1,12 +1,15 @@
 import type { EngineConfig, FollowThroughScope } from "../config.js";
-import type { OptionStream } from "../alpaca/optionStream.js";
+import type {
+  OptionStream, OptionStreamActivity, OptionStreamEvent,
+} from "../alpaca/optionStream.js";
 import type { StockStream } from "../alpaca/stockStream.js";
 import type { StockStreamEvent } from "../alpaca/stockStream.js";
 import type { TradingRestClient } from "../alpaca/restClient.js";
 import {
   isUnderlyingSymbol,
   type AccountState, type FeatureSnapshot, type OptionCandidateEvaluation, type OptionContract,
-  type OptionQuote, type RegimeDecision, type StockQuote, type TradeSignal, type UnderlyingSymbol,
+  type OptionQuote, type RegimeDecision, type StockQuote,
+  type TradeSignal, type UnderlyingSymbol,
 } from "../types.js";
 import type { HealthState } from "../ops/healthServer.js";
 import type { AuditEvent, AuditRecorder } from "../ops/recorder.js";
@@ -132,7 +135,7 @@ export class SpyOptionsTradingRuntime {
   readonly #requireStrategyRecovery: boolean;
   readonly #loadStockHistory: SpyOptionsTradingRuntimeOptions["loadStockHistory"];
   readonly #queue = new SerializedDecisionQueue();
-  readonly #book = new OptionBook();
+  readonly #book: OptionBook;
   readonly #selector: OptionSelector;
   readonly #universe: OptionUniverseManager;
   readonly #signals: SignalEngine;
@@ -144,6 +147,7 @@ export class SpyOptionsTradingRuntime {
   readonly #optionHealth: OpraQuoteHealthMonitor;
   readonly #optionRestCircuit = new StaleQuoteCircuitBreaker();
   readonly #rawObservedQuotes = new WeakMap<OptionQuote, OpraQuoteObservation>();
+  readonly #rawProcessedOptionEvents = new WeakSet<object>();
   readonly #lastOptionRestFingerprints = new Map<string, string>();
   #contracts: OptionContract[] = [];
   #subscribedSymbols = new Set<string>();
@@ -156,10 +160,14 @@ export class SpyOptionsTradingRuntime {
   #marketDataIdle = false;
   #marketDataTransition: Promise<void> = Promise.resolve();
   #universeRefreshInFlight: Promise<void> | undefined;
+  #optionSnapshotRefreshInFlight: Promise<void> | undefined;
+  #lastOptionSnapshotRefresh = -Infinity;
   #lastSpot: number | undefined;
   #lastFeature: FeatureSnapshot | undefined;
   #lastRegime: RegimeDecision | undefined;
   #optionQuoteCount = 0;
+  #optionTradeCount = 0;
+  #optionAggregateCount = 0;
   #rejectedOptionQuotes = 0;
   #optionQuoteStalled = false;
   #optionRestRecoveryInFlight: Promise<void> | undefined;
@@ -209,6 +217,7 @@ export class SpyOptionsTradingRuntime {
     this.#monotonicNow = options.monotonicNow ?? performance.now.bind(performance);
     this.#marketDataClockOffsetMs = options.marketDataClockOffsetMs ?? 0;
     this.#optionDataProvider = options.optionDataProvider ?? "alpaca";
+    this.#book = new OptionBook(options.config.options.microstructure.windowSec * 1_000);
     this.#optionHealth = new OpraQuoteHealthMonitor({
       executionMaxQuoteAgeMs: options.config.dataQuality.maxOptionQuoteAgeMs,
       transportTimeoutMs: OPTION_QUOTE_STALL_TIMEOUT_MS,
@@ -411,6 +420,8 @@ export class SpyOptionsTradingRuntime {
     this.#optionReconnectTimer = undefined;
     await this.#marketDataTransition;
     await Promise.allSettled(this.#universeRefreshInFlight ? [this.#universeRefreshInFlight] : []);
+    await Promise.allSettled(this.#optionSnapshotRefreshInFlight
+      ? [this.#optionSnapshotRefreshInFlight] : []);
     await Promise.allSettled([this.#stockReceiver.close(), this.#optionStream.close()]);
     await this.#queue.drained();
     this.#optionConnected = false;
@@ -688,6 +699,10 @@ export class SpyOptionsTradingRuntime {
     const quote = candidate ? this.#book.get(candidate.symbol)?.quote : undefined;
     const relevant = relevantOptionEvaluations(evaluatedSignal, selection, this.#config);
     const closest = relevant[0];
+    const closestQuote = closest ? this.#book.get(closest.symbol)?.quote : undefined;
+    const closestQuoteProviderAgeMs = closestQuote
+      ? decisionTimestamp - closestQuote.timestamp - this.#marketDataClockOffsetMs
+      : undefined;
     const selectionReasons = retry.selectionReasons ?? closest?.rejectionReasons ?? [];
     const signalEvent = {
       signalId: identitySignal.id,
@@ -712,6 +727,18 @@ export class SpyOptionsTradingRuntime {
         timestamp: quote.timestamp,
         bidPrice: quote.bidPrice,
         askPrice: quote.askPrice,
+      } : null,
+      closestCandidateQuote: closestQuote ? {
+        timestamp: closestQuote.timestamp,
+        bidPrice: closestQuote.bidPrice,
+        askPrice: closestQuote.askPrice,
+        bidSize: closestQuote.bidSize,
+        askSize: closestQuote.askSize,
+        correctedProviderAgeMs: closestQuoteProviderAgeMs,
+        freshnessThresholdMs: this.#config.dataQuality.maxOptionQuoteAgeMs,
+        freshAtDecision: closestQuoteProviderAgeMs !== undefined &&
+          closestQuoteProviderAgeMs >= 0 &&
+          closestQuoteProviderAgeMs <= this.#config.dataQuality.maxOptionQuoteAgeMs,
       } : null,
       closestCandidate: closest ? {
         symbol: closest.symbol,
@@ -817,15 +844,27 @@ export class SpyOptionsTradingRuntime {
       ],
     };
     this.#pendingLateBullishGrindConfirmation = undefined;
-    const {
-      gammaAwareProjectedOptionMove: _staleProjectedOptionMove,
-      ...confirmedCandidate
-    } = pending.candidate;
-    await this.#submitSelectedEntry(confirmedSignal, {
-      ...confirmedCandidate,
-      mid: (quote.bidPrice + quote.askPrice) / 2,
-      spreadPct: (quote.askPrice - quote.bidPrice) / ((quote.bidPrice + quote.askPrice) / 2),
-    }, quote);
+    const confirmedCandidate = pending.candidate.contract
+      ? this.#selector.evaluate(
+          pending.candidate.contract,
+          this.#book.get(pending.candidate.symbol),
+          confirmedSignal,
+          decisionTimestamp,
+          this.#book,
+        )
+      : undefined;
+    if (!confirmedCandidate?.eligible) {
+      await this.#auditRuntime(feature.timestamp, "option_microstructure_confirmation_rejected", {
+        signalId: confirmedSignal.id,
+        symbol: pending.candidate.symbol,
+        reasons: confirmedCandidate?.rejectionReasons ?? ["MISSING_OPTION_CONTRACT"],
+        optionMicrostructure: confirmedCandidate?.optionMicrostructure ?? null,
+        chainConfirmation: confirmedCandidate?.chainConfirmation ?? null,
+      });
+      this.#synchronizeHistoryPriorities();
+      return false;
+    }
+    await this.#submitSelectedEntry(confirmedSignal, confirmedCandidate, quote);
     return true;
   }
 
@@ -841,6 +880,8 @@ export class SpyOptionsTradingRuntime {
         signal,
         candidate,
         quote,
+        ...(candidate.optionMicrostructure
+          ? { optionMicrostructure: candidate.optionMicrostructure } : {}),
         ...(this.#book.get(candidate.symbol)?.snapshot
           ? { optionSnapshot: this.#book.get(candidate.symbol)!.snapshot! }
           : {}),
@@ -904,6 +945,8 @@ export class SpyOptionsTradingRuntime {
       brokerRequired: this.#executionEnabled,
       optionDataFeed: "opra",
       receivedOptionQuotes: this.#optionQuoteCount,
+      receivedOptionTrades: this.#optionTradeCount,
+      receivedOptionAggregates: this.#optionAggregateCount,
       ...(optionQuoteSilenceAgeMs !== undefined
         ? { lastOptionQuoteAgeMs: optionQuoteSilenceAgeMs }
         : {}),
@@ -1163,6 +1206,61 @@ export class SpyOptionsTradingRuntime {
     await this.#onOptionQuotes([quote]);
   }
 
+  #onRawOptionEvents(events: readonly OptionStreamEvent[], activity: OptionStreamActivity): void {
+    if (this.#marketDataIdle || !this.#marketOpen) return;
+    const scoped = events.filter((event) =>
+      parseOccSymbol(event.value.symbol)?.underlying === this.#config.symbol &&
+      this.#subscribedSymbols.has(event.value.symbol));
+    if (scoped.length === 0) return;
+    const historyEvents: HistoricalMarketEvent[] = [];
+    const date = marketDate(activity.receiveWallTimestamp, this.#config.timeZone);
+    for (const event of scoped) {
+      this.#rawProcessedOptionEvents.add(event.value);
+      if (event.type === "quote") {
+        this.#optionQuoteCount += 1;
+        if (!this.#book.observeQuote(event.value)) this.#rejectedOptionQuotes += 1;
+      } else if (event.type === "trade") {
+        this.#optionTradeCount += 1;
+        if (!this.#book.updateTrade(event.value)) this.#rejectedOptionQuotes += 1;
+      } else {
+        this.#optionAggregateCount += 1;
+        if (!this.#book.updateAggregate(event.value)) this.#rejectedOptionQuotes += 1;
+      }
+      if (!this.#history) continue;
+      const providerTimestamp = event.type === "aggregate"
+        ? event.value.endTimestamp : event.value.timestamp;
+      const observation = event.type === "quote"
+        ? this.#rawObservedQuotes.get(event.value) : undefined;
+      historyEvents.push({
+        type: event.type === "quote"
+          ? "option_quote"
+          : event.type === "trade"
+            ? "option_trade"
+            : "option_aggregate",
+        providerTimestamp,
+        receivedTimestamp: activity.receiveWallTimestamp,
+        marketDate: date,
+        symbol: event.value.symbol,
+        data: {
+          ...event.value,
+          receiveMonotonicTimestamp: activity.receiveMonotonicTimestamp,
+          ...(observation?.websocketConnectionId !== undefined
+            ? { websocketConnectionId: observation.websocketConnectionId } : {}),
+          ...(observation?.subscriptionSymbols
+            ? { subscriptionSymbols: observation.subscriptionSymbols } : {}),
+          correctedProviderAgeMs: activity.receiveWallTimestamp - providerTimestamp -
+            this.#marketDataClockOffsetMs,
+          ...(event.type === "quote"
+            ? { messageFingerprint: optionQuoteFingerprint(event.value) } : {}),
+        },
+      });
+    }
+    if (historyEvents.length > 0) {
+      if (this.#history?.recordMarketEvents) this.#history.recordMarketEvents(historyEvents);
+      else for (const event of historyEvents) this.#history?.recordMarketEvent(event);
+    }
+  }
+
   async #onOptionQuotes(quotes: readonly OptionQuote[]): Promise<void> {
     const receiveWallTimestamp = this.#now();
     const receiveMonotonicTimestamp = this.#monotonicNow();
@@ -1176,7 +1274,8 @@ export class SpyOptionsTradingRuntime {
     try {
       await this.#queue.enqueue(async () => {
         if (this.#marketDataIdle || !this.#marketOpen) return;
-        this.#recordOptionHistory(quotes);
+        const fallbackQuotes = quotes.filter((quote) => !this.#rawProcessedOptionEvents.has(quote));
+        this.#recordOptionHistory(fallbackQuotes);
         const decisionTimestamp = this.#now();
         const activeSymbols = new Set(this.#activeExecutionSymbols());
         const latestActiveQuotes = new Map<string, OptionQuote>();
@@ -1185,7 +1284,10 @@ export class SpyOptionsTradingRuntime {
             this.#rejectedOptionQuotes += 1;
             continue;
           }
-          this.#optionQuoteCount += 1;
+          if (!this.#rawProcessedOptionEvents.has(quote)) {
+            this.#optionQuoteCount += 1;
+            this.#book.observeQuote(quote);
+          }
           const validation = validateOptionQuote(
             quote,
             decisionTimestamp,
@@ -1256,6 +1358,7 @@ export class SpyOptionsTradingRuntime {
       this.#optionQuoteStalled = false;
     }
     this.#subscribedSymbols = nextSymbols;
+    this.#book.retainMicrostructureSymbols(nextSymbols);
     this.#optionHealth.retainSymbols(nextSymbols);
     for (const snapshot of snapshots) {
       this.#book.updateSnapshot(snapshot);
@@ -1285,6 +1388,7 @@ export class SpyOptionsTradingRuntime {
       if (!this.#marketDataIdle && this.#marketOpen) {
         await this.#checkOptionQuoteLiveness(timestamp);
         this.#scheduleOptionRestRecovery(timestamp);
+        this.#scheduleOptionSnapshotRefresh(timestamp);
         if (this.#pendingOptionSelection) {
           await this.#advancePendingOptionSelection(timestamp);
         }
@@ -1292,6 +1396,44 @@ export class SpyOptionsTradingRuntime {
       }
     })
       .catch((error: unknown) => this.#recordError(error));
+  }
+
+  #scheduleOptionSnapshotRefresh(timestamp: number): void {
+    const intervalMs = this.#config.options.microstructure.snapshotRefreshSec * 1_000;
+    if (this.#optionSnapshotRefreshInFlight || this.#subscribedSymbols.size === 0 ||
+        timestamp - this.#lastOptionSnapshotRefresh < intervalMs ||
+        this.#marketDataIdle || !this.#marketOpen) return;
+    const symbols = [...this.#subscribedSymbols];
+    this.#lastOptionSnapshotRefresh = timestamp;
+    const refresh = this.#client.getOptionSnapshots(symbols)
+      .then(async (snapshots) => {
+        await this.#queue.enqueue(() => {
+          if (this.#stopping || this.#marketDataIdle || !this.#marketOpen) return;
+          const subscribed = this.#subscribedSymbols;
+          for (const snapshot of snapshots) {
+            if (!subscribed.has(snapshot.symbol)) continue;
+            this.#book.updateSnapshot(snapshot);
+            this.#recordHistory(
+              "option_snapshot",
+              snapshot.timestamp ?? this.#now(),
+              snapshot.symbol,
+              { ...snapshot },
+            );
+          }
+          this.#emit("option_snapshots_refreshed", {
+            requestedContracts: symbols.length,
+            refreshedContracts: snapshots.length,
+            intervalMs,
+          });
+        });
+      })
+      .catch((error: unknown) => this.#recordError(error))
+      .finally(() => {
+        if (this.#optionSnapshotRefreshInFlight === refresh) {
+          this.#optionSnapshotRefreshInFlight = undefined;
+        }
+      });
+    this.#optionSnapshotRefreshInFlight = refresh;
   }
 
   #scheduleOptionRestRecovery(timestamp: number): void {
@@ -1408,6 +1550,7 @@ export class SpyOptionsTradingRuntime {
           this.#optionHealth.onWebSocketQuote(observation);
         }
       },
+      onRawEvents: (events, activity) => this.#onRawOptionEvents(events, activity),
       onState: (connected) => {
         this.#optionConnected = connected;
         if (connected) {
@@ -1520,10 +1663,15 @@ export class SpyOptionsTradingRuntime {
       const snapshot = this.#book.get(symbol)?.snapshot;
       return snapshot ? [snapshot] : [];
     });
+    const optionMicrostructures = this.#activeExecutionSymbols().flatMap((symbol) => {
+      const snapshot = this.#book.microstructure(symbol, timestamp);
+      return snapshot ? [snapshot] : [];
+    });
     this.#execution = await this.#orders.tick({
       timestamp,
       ...(optionQuotes.length > 0 ? { optionQuotes } : {}),
       ...(optionSnapshots.length > 0 ? { optionSnapshots } : {}),
+      ...(optionMicrostructures.length > 0 ? { optionMicrostructures } : {}),
       ...(this.#lastFeature ? { feature: this.#lastFeature } : {}),
       ...(this.#lastRegime ? { regime: this.#lastRegime } : {}),
       killSwitch: this.#killSwitch,
@@ -1819,6 +1967,35 @@ function optionCandidateMetrics(candidate: OptionCandidateEvaluation): Record<st
       : {}),
     ...(candidate.requiredMoveBps !== undefined ? { requiredMoveBps: candidate.requiredMoveBps } : {}),
     ...(candidate.costMarginBps !== undefined ? { costMarginBps: candidate.costMarginBps } : {}),
+    ...(candidate.expectedThetaCostPerShare !== undefined
+      ? { expectedThetaCostPerShare: candidate.expectedThetaCostPerShare } : {}),
+    ...(candidate.expectedVegaRiskPerShare !== undefined
+      ? { expectedVegaRiskPerShare: candidate.expectedVegaRiskPerShare } : {}),
+    ...(candidate.expectedNetOptionMove !== undefined
+      ? { expectedNetOptionMove: candidate.expectedNetOptionMove } : {}),
+    ...(candidate.optionMicrostructure
+      ? {
+          optionMicrostructureScore: candidate.optionMicrostructure.confirmationScore,
+          optionQuoteOfi: candidate.optionMicrostructure.quoteOfi,
+          optionTradeImbalance: candidate.optionMicrostructure.tradeImbalance,
+          optionTradeEvents: candidate.optionMicrostructure.tradeEvents,
+          optionQualifiedTradeEvents: candidate.optionMicrostructure.qualifiedTradeEvents,
+          optionDirectionalTradeEvents: candidate.optionMicrostructure.directionalTradeEvents,
+          optionExcludedTradeEvents: candidate.optionMicrostructure.excludedTradeEvents,
+          optionExcludedTradeVolume: candidate.optionMicrostructure.excludedTradeVolume,
+          optionPremiumMomentumBps: candidate.optionMicrostructure.premiumMomentumBps,
+          optionSpreadExpansionRatio: candidate.optionMicrostructure.spreadExpansionRatio,
+        }
+      : {}),
+    ...(candidate.chainConfirmation
+      ? {
+          chainConfirmationScore: candidate.chainConfirmation.averageScore,
+          chainConfirmationFraction: candidate.chainConfirmation.confirmationFraction,
+          chainObservedContracts: candidate.chainConfirmation.observedContracts,
+        }
+      : {}),
+    ...(candidate.ivSkewVsNearby !== undefined
+      ? { ivSkewVsNearby: candidate.ivSkewVsNearby } : {}),
   };
 }
 

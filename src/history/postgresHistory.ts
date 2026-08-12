@@ -35,7 +35,8 @@ interface AuditRow extends QueryResultRow {
 }
 
 interface ReplayRow extends QueryResultRow {
-  event_type: "stock_quote" | "stock_trade" | "option_contract" | "option_quote" | "option_snapshot";
+  event_type: "stock_quote" | "stock_trade" | "option_contract" | "option_quote" |
+    "option_trade" | "option_aggregate" | "option_snapshot";
   received_timestamp: string | number;
   data: Record<string, unknown>;
 }
@@ -80,7 +81,7 @@ CREATE INDEX IF NOT EXISTS market_events_symbol_provider_idx
   ON market_events (symbol, provider_timestamp);
 CREATE INDEX IF NOT EXISTS market_events_quote_retention_idx
   ON market_events (market_date, id)
-  WHERE event_type IN ('stock_quote', 'option_quote');
+  WHERE event_type IN ('stock_quote', 'option_quote', 'option_trade', 'option_aggregate');
 CREATE INDEX IF NOT EXISTS market_events_stock_recovery_idx
   ON market_events (market_date, symbol, id)
   WHERE event_type IN ('stock_quote', 'stock_trade');
@@ -563,10 +564,10 @@ export class PostgresHistoryStore implements HistoryStore, AuditRecorder {
       `SELECT event_type, received_timestamp, data
        FROM market_events
        WHERE market_date = $1
-         AND event_type IN ('stock_quote','stock_trade','option_contract','option_quote','option_snapshot')
+         AND event_type IN ('stock_quote','stock_trade','option_contract','option_quote','option_trade','option_aggregate','option_snapshot')
          AND ($2::text IS NULL
            OR (event_type IN ('stock_quote','stock_trade') AND symbol = $2)
-           OR (event_type IN ('option_contract','option_quote','option_snapshot') AND symbol LIKE ($2 || '%')))
+           OR (event_type IN ('option_contract','option_quote','option_trade','option_aggregate','option_snapshot') AND symbol LIKE ($2 || '%')))
        ORDER BY id ASC`,
       [marketDate, underlying ?? null],
     );
@@ -713,7 +714,7 @@ export class PostgresHistoryStore implements HistoryStore, AuditRecorder {
          SELECT id FROM market_events, latest
          WHERE latest.market_date IS NOT NULL
            AND market_events.market_date < latest.market_date - $1::integer
-           AND event_type IN ('stock_quote', 'option_quote')
+           AND event_type IN ('stock_quote', 'option_quote', 'option_trade', 'option_aggregate')
          ORDER BY id ASC
          LIMIT 100000
        )

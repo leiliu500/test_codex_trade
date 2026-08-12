@@ -2,8 +2,10 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import type { AddressInfo } from "node:net";
 import { WebSocketServer, type RawData } from "ws";
+import type { OptionStreamEvent } from "../src/alpaca/optionStream.js";
 import {
-  adaptMassiveOptionQuote, fromMassiveOptionTicker, MassiveOptionWebSocket, toMassiveOptionTicker,
+  adaptMassiveOptionAggregate, adaptMassiveOptionQuote, adaptMassiveOptionTrade,
+  fromMassiveOptionTicker, MassiveOptionWebSocket, toMassiveOptionTicker,
 } from "../src/massive/optionStream.js";
 import {
   MassiveOptionRestClient,
@@ -28,6 +30,37 @@ test("Massive OPRA adapters normalize provider tickers, timestamps, and exchange
     askExchange: "303",
   });
   assert.throws(() => fromMassiveOptionTicker(symbol), /O: prefix/);
+  assert.deepEqual(adaptMassiveOptionTrade({
+    ev: "T", sym: `O:${symbol}`, t: 1_786_468_200_124,
+    p: 1.01, s: 4, x: 312, c: [227], q: 99,
+  }), {
+    symbol,
+    timestamp: 1_786_468_200_124,
+    price: 1.01,
+    size: 4,
+    exchange: "312",
+    conditions: [227],
+    sequenceNumber: 99,
+  });
+  assert.deepEqual(adaptMassiveOptionAggregate({
+    ev: "A", sym: `O:${symbol}`, s: 1_786_468_200_000, e: 1_786_468_200_999,
+    o: 1, h: 1.02, l: 0.99, c: 1.01, v: 12, av: 1_500, vw: 1.005,
+    a: 0.98, z: 3, op: 0.9,
+  }), {
+    symbol,
+    startTimestamp: 1_786_468_200_000,
+    endTimestamp: 1_786_468_200_999,
+    open: 1,
+    high: 1.02,
+    low: 0.99,
+    close: 1.01,
+    volume: 12,
+    accumulatedVolume: 1_500,
+    vwap: 1.005,
+    sessionVwap: 0.98,
+    averageTradeSize: 3,
+    officialOpen: 0.9,
+  });
 });
 
 test("Massive OPRA WebSocket authenticates and serializes subscription updates", async (context) => {
@@ -78,6 +111,7 @@ test("Massive OPRA WebSocket authenticates and serializes subscription updates",
   });
   const subscriptionSnapshots: string[][] = [];
   const observations: OptionQuote[] = [];
+  const rawEvents: OptionStreamEvent[] = [];
   let receivedQuote!: () => void;
   const quoteReceived = new Promise<void>((resolve) => { receivedQuote = resolve; });
   await stream.subscribe([call, put]);
@@ -91,6 +125,7 @@ test("Massive OPRA WebSocket authenticates and serializes subscription updates",
       assert.equal(items[0]?.subscriptionSymbols?.length, 2);
       assert.ok(Number.isFinite(items[0]?.receiveWallTimestamp));
     },
+    onRawEvents: (events) => rawEvents.push(...events),
     onSubscriptions: (symbols) => subscriptionSnapshots.push([...symbols].sort()),
   });
   await Promise.all([
@@ -98,9 +133,13 @@ test("Massive OPRA WebSocket authenticates and serializes subscription updates",
     stream.subscribe([nextCall]),
   ]);
   const socket = [...server.clients][0]!;
-  socket.send(JSON.stringify([{
-    ev: "Q", sym: `O:${nextCall}`, t: Date.now(), bp: 1, ap: 1.02, bs: 10, as: 12, bx: 302, ax: 303,
-  }]));
+  const eventTimestamp = Date.now();
+  socket.send(JSON.stringify([
+    { ev: "Q", sym: `O:${nextCall}`, t: eventTimestamp, bp: 1, ap: 1.02, bs: 10, as: 12, bx: 302, ax: 303 },
+    { ev: "T", sym: `O:${nextCall}`, t: eventTimestamp + 1, p: 1.01, s: 2, x: 312, c: [227] },
+    { ev: "A", sym: `O:${nextCall}`, s: eventTimestamp, e: eventTimestamp + 999,
+      o: 1, h: 1.02, l: 1, c: 1.01, v: 2, av: 2, vw: 1.01, a: 1.01, z: 2, op: 1 },
+  ]));
   await Promise.race([
     quoteReceived,
     new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error("quote timeout")), 1_000)),
@@ -108,13 +147,21 @@ test("Massive OPRA WebSocket authenticates and serializes subscription updates",
 
   assert.equal(updatesOverlapped, false);
   assert.deepEqual(actions.slice(1).map(({ action }) => action), ["subscribe", "unsubscribe", "subscribe"]);
-  assert.equal(actions[1]?.params, `Q.O:${call},Q.O:${put}`);
-  assert.equal(actions[2]?.params, `Q.O:${call}`);
-  assert.equal(actions[3]?.params, `Q.O:${nextCall}`);
+  assert.equal(actions[1]?.params, massiveSubscriptions(call, put));
+  assert.equal(actions[2]?.params, massiveSubscriptions(call));
+  assert.equal(actions[3]?.params, massiveSubscriptions(nextCall));
   assert.deepEqual(subscriptionSnapshots.at(-1), [nextCall, put].sort());
   assert.equal(observations[0]?.symbol, nextCall);
+  assert.deepEqual(rawEvents.map((event) => event.type), ["quote", "trade", "aggregate"]);
+  assert.equal(rawEvents[1]?.value.symbol, nextCall);
   await stream.close();
 });
+
+function massiveSubscriptions(...symbols: string[]): string {
+  return symbols.flatMap((symbol) => [
+    `Q.O:${symbol}`, `T.O:${symbol}`, `A.O:${symbol}`,
+  ]).join(",");
+}
 
 test("Massive option REST maps filtered real-time chain snapshots and diagnostic quotes", async () => {
   const call = "SPY260811C00640000";
@@ -195,6 +242,54 @@ test("Massive option REST accepts enabled GOOGL OCC symbols", async () => {
   const quotes = await client.getLatestOptionQuotes([symbol]);
   assert.equal(quotes[0]?.symbol, symbol);
   assert.equal(requests[0]?.pathname, "/v3/snapshot/options/GOOGL");
+});
+
+test("Massive option REST maps paginated historical Q/T/A data for causal replay", async () => {
+  const symbol = "SPY260811C00640000";
+  const requests: URL[] = [];
+  const mockFetch = (async (input: string | URL | Request): Promise<Response> => {
+    const url = new URL(String(input));
+    requests.push(url);
+    if (url.pathname.startsWith("/v3/quotes/")) return json({ status: "OK", results: [{
+      sip_timestamp: 1_786_468_200_123_000_000,
+      bid_price: 1, ask_price: 1.02, bid_size: 20, ask_size: 30,
+      bid_exchange: 302, ask_exchange: 303, sequence_number: 7,
+    }] });
+    if (url.pathname.startsWith("/v3/trades/")) return json({ status: "OK", results: [{
+      sip_timestamp: 1_786_468_200_124_000_000,
+      participant_timestamp: 1_786_468_200_123_000_000,
+      price: 1.01, size: 4, exchange: 312, conditions: [227], correction: 0, sequence_number: 8,
+    }] });
+    return json({ status: "OK", results: [{
+      t: 1_786_468_200_000, o: 1, h: 1.02, l: 0.99, c: 1.01, v: 12, vw: 1.005,
+    }] });
+  }) as typeof fetch;
+  const client = new MassiveOptionRestClient({
+    apiKey: "massive-key", baseUrl: "https://api.massive.test", fetch: mockFetch,
+    underlyings: ["SPY"],
+  });
+
+  const quotes = await client.getHistoricalOptionQuotes(symbol, 1_786_468_200_000, 1_786_468_201_000);
+  const trades = await client.getHistoricalOptionTrades(symbol, 1_786_468_200_000, 1_786_468_201_000);
+  const aggregates = await client.getHistoricalOptionAggregates(
+    symbol, 1_786_468_200_000, 1_786_468_201_000,
+  );
+
+  assert.deepEqual(quotes[0], {
+    symbol, timestamp: 1_786_468_200_123, bidPrice: 1, askPrice: 1.02,
+    bidSize: 20, askSize: 30, bidExchange: "302", askExchange: "303", sequenceNumber: 7,
+  });
+  assert.deepEqual(trades[0], {
+    symbol, timestamp: 1_786_468_200_124, participantTimestamp: 1_786_468_200_123,
+    price: 1.01, size: 4, exchange: "312", conditions: [227], correction: 0, sequenceNumber: 8,
+  });
+  assert.deepEqual(aggregates[0], {
+    symbol, startTimestamp: 1_786_468_200_000, endTimestamp: 1_786_468_200_999,
+    open: 1, high: 1.02, low: 0.99, close: 1.01, volume: 12, vwap: 1.005,
+  });
+  assert.equal(requests[0]?.searchParams.get("timestamp.gte"), "1786468200000000000");
+  assert.equal(requests[0]?.searchParams.get("timestamp.lte"), "1786468201000000000");
+  assert.equal(requests[2]?.pathname.includes("/range/1/second/"), true);
 });
 
 function massiveSnapshot(

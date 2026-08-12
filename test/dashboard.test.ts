@@ -45,6 +45,8 @@ test("dashboard exposes liveness and feed tabs before any entries, orders, or hi
   assert.match(html, /Live Feed Into System/);
   assert.match(html, /Entry Evaluations &amp; Decisions/);
   assert.match(html, /Potential Missed Entry Review/);
+  assert.match(html, /Executable Option-Rejection Review/);
+  assert.match(html, /stale decision\/forward quotes stay explicitly non-executable/);
   assert.match(html, /Entry Gate Blocks/);
   assert.match(html, /Strategy state/);
   assert.match(html, /Dashboard scope/);
@@ -105,7 +107,9 @@ test("dashboard exposes liveness and feed tabs before any entries, orders, or hi
   assert.match(html, /NO SAME-DAY OPTION CONTRACTS/);
   assert.match(html, /opraSubscriptionIdle/);
   assert.match(html, /ENTRY CUTOFF · NO ACTIVE EXPOSURE/);
-  assert.match(html, /session WS quotes/);
+  assert.match(html, /opraFlow/);
+  assert.match(html, /opraTrades/);
+  assert.match(html, /opraAggregates/);
   assert.match(html, /h\.stockWebsocketConnected/);
   assert.match(html, /strategyBuilding\?'BUILDING'/);
   assert.match(html, /h\.strategyOpeningRangeEnd/);
@@ -760,6 +764,83 @@ test("dashboard separates potential hindsight misses from routine no-signal eval
   safetyBlocked.record(event("live_entry_evaluation", noSignal(500.15), 5_000));
   assert.equal(safetyBlocked.snapshot().tuning.falseNegativeSummary.matureNoSignalEvaluations, 1);
   assert.equal(safetyBlocked.snapshot().tuning.falseNegativeSummary.potentialMisses, 0);
+});
+
+test("dashboard classifies rejected options from fresh executable ask-to-bid outcomes", () => {
+  const dashboard = historicalDashboard();
+  const winner = "SPY260722C00502000";
+  const loser = "SPY260722P00500000";
+  const stale = "SPY260722C00503000";
+  const rejection = (
+    signalId: string,
+    optionSymbol: string,
+    bidPrice: number,
+    askPrice: number,
+    providerAgeMs: number,
+    freshAtDecision: boolean,
+  ) => event("live_signal_selection", {
+    signalId,
+    timestamp,
+    decisionTimestamp: timestamp,
+    direction: optionSymbol.includes("C") ? "BULLISH" : "BEARISH",
+    kind: "IMPULSE",
+    regime: "STRONG_UP",
+    selectionStatus: "NO_ELIGIBLE_OPTION",
+    selectionReasons: ["LATE_ENTRY_OPTION_SPREAD_TOO_WIDE"],
+    candidate: null,
+    closestCandidate: { symbol: optionSymbol, rejectionReasons: ["LATE_ENTRY_OPTION_SPREAD_TOO_WIDE"] },
+    closestCandidateQuote: {
+      timestamp: timestamp - providerAgeMs,
+      bidPrice,
+      askPrice,
+      bidSize: 100,
+      askSize: 100,
+      correctedProviderAgeMs: providerAgeMs,
+      freshnessThresholdMs: 2_000,
+      freshAtDecision,
+    },
+  });
+
+  dashboard.record(rejection("winner", winner, 0.98, 1, 100, true));
+  dashboard.record(rejection("loser", loser, 0.98, 1, 100, true));
+  dashboard.record(rejection("stale", stale, 0.98, 1, 25_000, false));
+  dashboard.recordMarketEvents([{
+    type: "option_quote",
+    providerTimestamp: timestamp + 30_000,
+    receivedTimestamp: timestamp + 30_001,
+    marketDate: "2026-07-22",
+    symbol: winner,
+    data: { symbol: winner, timestamp: timestamp + 30_000, bidPrice: 1.10, askPrice: 1.12 },
+  }, {
+    type: "option_quote",
+    providerTimestamp: timestamp + 30_000,
+    receivedTimestamp: timestamp + 30_001,
+    marketDate: "2026-07-22",
+    symbol: loser,
+    data: { symbol: loser, timestamp: timestamp + 30_000, bidPrice: 0.95, askPrice: 0.97 },
+  }]);
+
+  const tuning = dashboard.snapshot().tuning;
+  assert.deepEqual(tuning.optionSelectionOpportunitySummary, {
+    rejectedSelections: 3,
+    pending: 0,
+    evaluated: 2,
+    profitableMisses: 1,
+    correctRejections: 1,
+    nonExecutable: 1,
+    profitableMissRate: 0.5,
+    horizonSec: 30,
+  });
+  const winningOutcome = tuning.optionSelectionOpportunities.find((item) => item.signalId === "winner");
+  assert.equal(winningOutcome?.status, "PROFITABLE_MISS");
+  assert.ok(Math.abs((winningOutcome?.grossExecutablePnlPerContract ?? 0) - 10) < 1e-9);
+  assert.equal(
+    tuning.optionSelectionOpportunities.find((item) => item.signalId === "loser")?.status,
+    "CORRECT_REJECTION",
+  );
+  const staleOutcome = tuning.optionSelectionOpportunities.find((item) => item.signalId === "stale");
+  assert.equal(staleOutcome?.status, "NON_EXECUTABLE");
+  assert.deepEqual(staleOutcome?.diagnosticReasons, ["STALE_DECISION_QUOTE"]);
 });
 
 test("dashboard reconstructs fired entries, broker execution, trades, and performance from audit history", () => {

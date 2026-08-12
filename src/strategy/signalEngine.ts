@@ -4,8 +4,9 @@ import { inSessionWindow, parseClock, secondsSinceMidnight } from "../utils/time
 import { hashString, stableStringify } from "../utils/statistics.js";
 import { boundedProjectionBps } from "./projection.js";
 import {
-  activeStaticEntryGuard, isBullishTrendContinuationFeature, lateEntryGuardActive,
-  morningEntryGuardActive, projectedMoveContinuationGuard,
+  activeStaticEntryGuard, isBullishTrendContinuationFeature,
+  isLateBearishCleanImpulseFeature, lateEntryGuardActive, morningEntryGuardActive,
+  projectedMoveContinuationGuard,
 } from "./lateEntryGuard.js";
 
 export interface SignalDirectionEvaluation {
@@ -431,18 +432,32 @@ export class SignalEngine {
       regime.regime,
       directionalProjection,
     );
+    const bearishCleanImpulse = isLateBearishCleanImpulseFeature(
+      this.#config,
+      direction,
+      f,
+      regime.regime,
+      directionalProjection,
+    );
     const projectedMoveException = staticEntryGuard !== undefined &&
       directionalProjection < staticEntryGuard.minProjectedMoveBps &&
-      bullishTrendContinuation;
+      (bullishTrendContinuation || bearishCleanImpulse);
     if (staticEntryGuard && directionalProjection < staticEntryGuard.minProjectedMoveBps &&
         !projectedMoveException) {
       blockedReasons.push(`${staticEntryGuard.reasonPrefix}PROJECTED_MOVE_BELOW_MINIMUM`);
       return undefined;
     }
-    const continuationReasons = projectedMoveException ? [
-      `aligned bullish continuation accepted ${directionalProjection.toFixed(3)} bps projection below ` +
-        `${staticEntryGuard!.minProjectedMoveBps.toFixed(3)} bps static minimum; causal confirmation required`,
-    ] : [];
+    const continuationReasons = projectedMoveException
+      ? bearishCleanImpulse
+        ? [
+            `late clean bearish impulse accepted ${directionalProjection.toFixed(3)} bps projection below ` +
+              `${staticEntryGuard!.minProjectedMoveBps.toFixed(3)} bps static minimum`,
+          ]
+        : [
+            `aligned bullish continuation accepted ${directionalProjection.toFixed(3)} bps projection below ` +
+              `${staticEntryGuard!.minProjectedMoveBps.toFixed(3)} bps static minimum; causal confirmation required`,
+          ]
+      : [];
 
     const votes: SignalVote[] = [
       { name: "FAST_SLOPE", passed: s * f.fast.normalizedSlope >= f.thresholds.fastSlope,
@@ -495,7 +510,7 @@ export class SignalEngine {
     if (impulsePassed) {
       return this.#makeSignal(direction, "IMPULSE", directionalProjection, votes, f, regime, [
         "structural gate passed", "opening-range break/proximity/retest", `${voteCount}/4 impulse votes passed`,
-        ...reentryReasons,
+        ...continuationReasons, ...reentryReasons,
       ]);
     }
 

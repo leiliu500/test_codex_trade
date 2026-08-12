@@ -41,6 +41,87 @@ export interface OptionQuote {
   bidExchange?: string;
   askExchange?: string;
   conditions?: string[];
+  /** Provider sequence is monotone per contract but is not guaranteed to be contiguous. */
+  sequenceNumber?: number;
+}
+
+export interface OptionTrade {
+  symbol: string;
+  /** OPRA/provider event time. */
+  timestamp: number;
+  /** Exchange event time when Massive supplies it (historical REST only). */
+  participantTimestamp?: number;
+  price: number;
+  size: number;
+  exchange?: string;
+  conditions?: number[];
+  /** Non-zero historical correction records are not eligible for live directional flow. */
+  correction?: number;
+  sequenceNumber?: number;
+}
+
+export interface OptionAggregate {
+  symbol: string;
+  startTimestamp: number;
+  endTimestamp: number;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume: number;
+  accumulatedVolume?: number;
+  vwap?: number;
+  sessionVwap?: number;
+  averageTradeSize?: number;
+  officialOpen?: number;
+}
+
+/** Causal, bounded-window option-market state used by selection and execution. */
+export interface OptionMicrostructureSnapshot {
+  symbol: string;
+  timestamp: number;
+  quoteTimestamp?: number;
+  tradeTimestamp?: number;
+  aggregateEndTimestamp?: number;
+  windowMs: number;
+  quoteEvents: number;
+  tradeEvents: number;
+  qualifiedTradeEvents: number;
+  directionalTradeEvents: number;
+  excludedTradeEvents: number;
+  mid?: number;
+  microprice?: number;
+  micropriceDisplacementBps: number;
+  quoteImbalance: number;
+  quoteOfi: number;
+  premiumMomentumBps: number;
+  bidMomentumBps: number;
+  spreadPct?: number;
+  spreadExpansionRatio: number;
+  bidDepthTrend: number;
+  askDepthTrend: number;
+  tradeVolume: number;
+  buyVolume: number;
+  sellVolume: number;
+  neutralVolume: number;
+  excludedTradeVolume: number;
+  tradeImbalance: number;
+  tradeVwap?: number;
+  aggregateVwap?: number;
+  vwapDisplacementBps: number;
+  /** Normalized to [-1, 1]; positive confirms buying the selected option. */
+  confirmationScore: number;
+  dataFresh: boolean;
+}
+
+export interface OptionChainConfirmation {
+  timestamp: number;
+  optionType: OptionType;
+  observedContracts: number;
+  confirmingContracts: number;
+  confirmationFraction: number;
+  averageScore: number;
+  nearbyIvMedian?: number;
 }
 
 export interface OptionSnapshot {
@@ -232,6 +313,12 @@ export interface OptionCandidateEvaluation {
   requiredMoveBps?: number;
   costMarginBps?: number;
   gammaAwareProjectedOptionMove?: number;
+  expectedThetaCostPerShare?: number;
+  expectedVegaRiskPerShare?: number;
+  expectedNetOptionMove?: number;
+  optionMicrostructure?: OptionMicrostructureSnapshot;
+  chainConfirmation?: OptionChainConfirmation;
+  ivSkewVsNearby?: number;
   score?: number;
   eligible: boolean;
   rejectionReasons: string[];
@@ -389,5 +476,7 @@ export type ReplayEvent =
   | { type: "stock_trade"; timestamp: number; data: StockTrade }
   | { type: "option_contract"; timestamp: number; data: OptionContract }
   | { type: "option_quote"; timestamp: number; data: OptionQuote }
+  | { type: "option_trade"; timestamp: number; data: OptionTrade }
+  | { type: "option_aggregate"; timestamp: number; data: OptionAggregate }
   | { type: "option_snapshot"; timestamp: number; data: OptionSnapshot }
   | { type: "prior_close"; timestamp: number; data: { symbol: UnderlyingSymbol; close: number } };

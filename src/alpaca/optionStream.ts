@@ -1,4 +1,4 @@
-import type { OptionQuote } from "../types.js";
+import type { OptionAggregate, OptionQuote, OptionTrade } from "../types.js";
 import { performance } from "node:perf_hooks";
 import WebSocket, { type RawData } from "ws";
 import { decode, encode } from "@msgpack/msgpack";
@@ -11,11 +11,18 @@ export interface OptionStreamActivity {
   receiveMonotonicTimestamp: number;
 }
 
+export type OptionStreamEvent =
+  | { type: "quote"; value: OptionQuote }
+  | { type: "trade"; value: OptionTrade }
+  | { type: "aggregate"; value: OptionAggregate };
+
 export interface OptionStreamHandlers {
   onQuote(quote: OptionQuote): void | Promise<void>;
   onQuotes?(quotes: readonly OptionQuote[]): void | Promise<void>;
   /** Synchronous raw-arrival observation, before coalescing or asynchronous consumers. */
   onQuoteObservations?(observations: readonly OpraQuoteObservation[]): void;
+  /** Synchronous raw provider events, before quote coalescing. Keep this handler non-blocking. */
+  onRawEvents?(events: readonly OptionStreamEvent[], activity: OptionStreamActivity): void;
   /** Any OPRA frame, including control frames and frames for other subscribed symbols. */
   onActivity?(activity: OptionStreamActivity): void;
   onState?(connected: boolean): void;
@@ -150,6 +157,10 @@ export class AlpacaOptionWebSocket implements OptionStream {
               websocketConnectionId: this.#activeConnectionId,
               subscriptionSymbols: [...this.#symbols],
             })));
+            handlers.onRawEvents?.(
+              quotes.map((quote) => ({ type: "quote" as const, value: quote })),
+              { receiveWallTimestamp, receiveMonotonicTimestamp },
+            );
             this.#enqueueQuotes(quotes);
           }
         } catch (error) {

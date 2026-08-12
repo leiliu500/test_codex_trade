@@ -9,6 +9,8 @@ export interface ActiveStaticEntryGuard {
   minProjectedMoveBps: number;
   minCostMarginBps: number;
   maxOptionSpreadPct: number;
+  maxOptionSpreadTicks?: number;
+  maxEntryQuoteAgeMs?: number;
 }
 
 export function morningEntryGuardActive(
@@ -50,6 +52,77 @@ export function activeStaticEntryGuard(
     };
   }
   return undefined;
+}
+
+/**
+ * Returns the execution guard for a fired signal. The narrow bearish profile
+ * is intentionally signal-aware: ordinary late entries retain the stricter
+ * static projection, spread, and cost requirements.
+ */
+export function activeSignalEntryGuard(
+  config: EngineConfig,
+  signal: TradeSignal,
+): ActiveStaticEntryGuard | undefined {
+  const guard = activeStaticEntryGuard(config, signal.timestamp);
+  if (!guard || !isLateBearishCleanImpulseSignal(config, signal)) return guard;
+  const profile = config.signals.lateEntryGuard.bearishCleanImpulse;
+  return {
+    reasonPrefix: "LATE_ENTRY_",
+    minProjectedMoveBps: profile.minDirectionalProjectionBps,
+    minCostMarginBps: profile.minCostMarginBps,
+    maxOptionSpreadPct: profile.maxOptionSpreadPct,
+    maxOptionSpreadTicks: profile.maxOptionSpreadTicks,
+    maxEntryQuoteAgeMs: profile.maxEntryQuoteAgeMs,
+  };
+}
+
+export function isLateBearishCleanImpulseFeature(
+  config: EngineConfig,
+  direction: Direction,
+  feature: FeatureSnapshot,
+  regime: RegimeDecision["regime"],
+  directionalProjectionBps: number,
+): boolean {
+  const profile = config.signals.lateEntryGuard.bearishCleanImpulse;
+  if (config.symbol !== "SPY" || !profile.enabled || direction !== "BEARISH" ||
+      !lateEntryGuardActive(config, feature.timestamp) || regime !== "UNCLASSIFIED" ||
+      directionalProjectionBps < profile.minDirectionalProjectionBps ||
+      directionalProjectionBps >= config.signals.lateEntryGuard.minProjectedMoveBps) {
+    return false;
+  }
+  const openingRange = feature.openingRange;
+  const breakoutMemoryMs = config.signals.breakoutMemorySec * 1_000;
+  const locationConfirmed = openingRange.nearLow || feature.price <= openingRange.low! ||
+    openingRange.bearishRetest ||
+    (openingRange.bearishBreakoutTimestamp !== undefined &&
+      feature.timestamp - openingRange.bearishBreakoutTimestamp <= breakoutMemoryMs);
+  const impulseVotes = [
+    -feature.fast.normalizedSlope >= feature.thresholds.fastSlope,
+    -feature.fast.normalizedAcceleration >= feature.thresholds.fastAcceleration,
+    -feature.ofi5 >= feature.thresholds.absoluteOfi5,
+    -feature.micropriceDisplacementBps > 0,
+  ].filter(Boolean).length;
+  return locationConfirmed && impulseVotes >= config.signals.impulseVotesRequired &&
+    feature.fast.efficiencyRatio >= profile.minFastEfficiency &&
+    -feature.fast.normalizedSlope >= profile.minFastNormalizedSlope &&
+    -feature.medium.normalizedSlope >= profile.minMediumNormalizedSlope &&
+    (feature.medium.regression.r2 ?? -Infinity) >= profile.minMediumR2 &&
+    -feature.slow.normalizedSlope >= profile.minSlowNormalizedSlope &&
+    (feature.slow.regression.r2 ?? -Infinity) >= profile.minSlowR2 &&
+    feature.efficiency60 >= profile.minEfficiency60;
+}
+
+export function isLateBearishCleanImpulseSignal(
+  config: EngineConfig,
+  signal: TradeSignal,
+): boolean {
+  return signal.kind === "IMPULSE" && isLateBearishCleanImpulseFeature(
+    config,
+    signal.direction,
+    signal.featureSnapshot,
+    signal.regime,
+    signal.projectedMoveBps,
+  );
 }
 
 export function isBullishTrendContinuationFeature(
@@ -158,6 +231,9 @@ export function lateEntryGuardAudit(
     },
     bullishGrindOptionConfirmation: {
       ...config.signals.lateEntryGuard.bullishGrindOptionConfirmation,
+    },
+    bearishCleanImpulse: {
+      ...config.signals.lateEntryGuard.bearishCleanImpulse,
     },
     bearishUnclassifiedImpulseFollowThroughStart:
       config.signals.lateEntryGuard.bearishUnclassifiedImpulseFollowThroughStart,

@@ -1,5 +1,5 @@
 import type { EngineConfig } from "../config.js";
-import type { OptionQuote } from "../types.js";
+import type { OptionMicrostructureSnapshot, OptionQuote } from "../types.js";
 import type { Direction, PositionState } from "../types.js";
 import type { RiskManager } from "../risk/riskManager.js";
 import { assertSameDayOptionOrder } from "../options/tradingInvariants.js";
@@ -23,6 +23,7 @@ export interface OrderState {
   urgency: number;
   actionTtlMs: number;
   priceCollar: number;
+  initialAggression?: number;
   intentId?: string;
   events: Array<{ timestamp: number; status: OrderStatus; detail: string }>;
 }
@@ -39,6 +40,7 @@ export interface OrderProposal {
   actionTtlMs?: number;
   priceCollar?: number;
   intentId?: string;
+  spreadFraction?: number;
 }
 
 export function aggressionAtReplacement(initial: number, replacement: number, maximumReplacements: number): number {
@@ -62,6 +64,42 @@ export function urgencyTtl(
   return Math.round((1 - bounded) * maximumMs + bounded * minimumMs);
 }
 
+export function entryAggressionFromMicrostructure(
+  config: EngineConfig,
+  microstructure: OptionMicrostructureSnapshot | undefined,
+): number {
+  const adjustment = config.execution.entryMicrostructureAggressionAdjustment *
+    (microstructure?.confirmationScore ?? 0);
+  return clamp(config.execution.entryLimitSpreadFraction + adjustment, 0.05, 1);
+}
+
+export function entryReplaceTtlFromMicrostructure(
+  config: EngineConfig,
+  microstructure: OptionMicrostructureSnapshot | undefined,
+): number {
+  const positivePressure = clamp(microstructure?.confirmationScore ?? 0, 0, 1);
+  return urgencyTtl(
+    positivePressure,
+    config.execution.entryReplaceMinMs,
+    config.execution.replaceAfterMs,
+  );
+}
+
+export function exitUrgencyFromMicrostructure(
+  config: EngineConfig,
+  baseUrgency: number,
+  microstructure: OptionMicrostructureSnapshot | undefined,
+): number {
+  const adversePressure = clamp(-(microstructure?.confirmationScore ?? 0), 0, 1);
+  const spreadPressure = clamp((microstructure?.spreadExpansionRatio ?? 1) - 1, 0, 1);
+  return clamp(
+    baseUrgency + config.execution.exitMicrostructureUrgencyAdjustment *
+      Math.max(adversePressure, spreadPressure),
+    0,
+    1,
+  );
+}
+
 /** Deterministic state machine used by replay and broker adapters. */
 export class OrderExecutor {
   readonly #config: EngineConfig;
@@ -71,9 +109,14 @@ export class OrderExecutor {
     assertSameDayOptionOrder(proposal.symbol, proposal.side, proposal.timestamp, this.#config);
     if (proposal.quote.symbol !== proposal.symbol) throw new Error("Option-only order rejected: quote symbol mismatch");
     if (!Number.isInteger(proposal.quantity) || proposal.quantity < 1) throw new Error("Option quantity must be a positive whole number");
-    const fraction = proposal.marketable ? 1 : proposal.side === "buy"
+    const configuredFraction = proposal.side === "buy"
       ? this.#config.execution.entryLimitSpreadFraction
       : this.#config.execution.exitLimitSpreadFraction;
+    const fraction = proposal.marketable ? 1 : clamp(
+      proposal.spreadFraction ?? configuredFraction,
+      0,
+      1,
+    );
     const limit = limitInsideSpread(
       proposal.quote.bidPrice, proposal.quote.askPrice, proposal.side, fraction, this.#config.execution.optionTickSize,
     );
@@ -112,6 +155,7 @@ export class OrderExecutor {
           : this.#config.execution.replaceAfterMs
       ),
       priceCollar,
+      initialAggression: fraction,
       ...(proposal.intentId ? { intentId: proposal.intentId } : {}),
       events: [{
         timestamp: proposal.timestamp,
@@ -171,12 +215,12 @@ export class OrderExecutor {
     if (timestamp - state.submittedAt >= this.#config.execution.cancelAfterMs) {
       return this.#transition(state, "CANCEL_PENDING", timestamp, "cancel deadline reached");
     }
-    if (timestamp - state.lastActionAt >= this.#config.execution.replaceAfterMs &&
+    if (timestamp - state.lastActionAt >= state.actionTtlMs &&
         state.replacements < this.#config.execution.maxReplaces && freshQuote &&
         timestamp - freshQuote.timestamp <= this.#config.dataQuality.maxOptionQuoteAgeMs) {
       state.replacements += 1;
-      const initial = state.marketable ? 1 : state.side === "buy"
-        ? this.#config.execution.entryLimitSpreadFraction : this.#config.execution.exitLimitSpreadFraction;
+      const initial = state.initialAggression ?? (state.marketable ? 1 : state.side === "buy"
+        ? this.#config.execution.entryLimitSpreadFraction : this.#config.execution.exitLimitSpreadFraction);
       const aggression = aggressionAtReplacement(initial, state.replacements, this.#config.execution.maxReplaces);
       state.limitPrice = limitInsideSpread(
         freshQuote.bidPrice, freshQuote.askPrice, state.side, aggression, this.#config.execution.optionTickSize,
@@ -212,6 +256,10 @@ export class OrderExecutor {
     state.events.push({ timestamp, status, detail });
     return state;
   }
+}
+
+function clamp(value: number, minimum: number, maximum: number): number {
+  return Math.min(maximum, Math.max(minimum, value));
 }
 
 /**

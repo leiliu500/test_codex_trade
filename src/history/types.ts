@@ -11,6 +11,8 @@ export type HistoricalMarketEventType =
   | "stock_trade"
   | "option_contract"
   | "option_quote"
+  | "option_trade"
+  | "option_aggregate"
   | "option_snapshot"
   | "feature_snapshot";
 

@@ -6,7 +6,7 @@ import type {
 } from "../src/alpaca/restClient.js";
 import type {
   AccountState, FeatureSnapshot, OptionCandidateEvaluation, OptionContract, OptionQuote, OptionSnapshot,
-  PositionState, TradeSignal,
+  OptionMicrostructureSnapshot, PositionState, TradeSignal,
 } from "../src/types.js";
 import { LiveOrderManager } from "../src/execution/liveOrderManager.js";
 import { MemoryRecorder } from "../src/ops/recorder.js";
@@ -127,6 +127,36 @@ function signal(timestamp = start): TradeSignal {
   };
 }
 
+function cleanBearishSignal(timestamp: number): TradeSignal {
+  return {
+    id: `sig-clean-bearish-${timestamp}`,
+    timestamp,
+    direction: "BEARISH",
+    kind: "IMPULSE",
+    regime: "UNCLASSIFIED",
+    projectedMoveBps: 1.84,
+    votes: [],
+    reasons: ["late clean bearish impulse accepted"],
+    featureSnapshot: {
+      symbol: "SPY",
+      timestamp,
+      price: 771.594,
+      openingRange: { complete: true, nearLow: true },
+      thresholds: { fastSlope: 0.42, fastAcceleration: 0.1, absoluteOfi5: 0.08 },
+      fast: {
+        efficiencyRatio: 0.75,
+        normalizedSlope: -4.4,
+        normalizedAcceleration: -3.2,
+      },
+      medium: { normalizedSlope: -4.5, regression: { r2: 0.9 } },
+      slow: { normalizedSlope: -1.6, regression: { r2: 0.6 } },
+      ofi5: -5,
+      micropriceDisplacementBps: 0.03,
+      efficiency60: 0.27,
+    } as FeatureSnapshot,
+  };
+}
+
 function candidate(): OptionCandidateEvaluation {
   return {
     symbol,
@@ -136,6 +166,28 @@ function candidate(): OptionCandidateEvaluation {
     mid: 2,
     eligible: true,
     rejectionReasons: [],
+  };
+}
+
+function optionMicrostructure(
+  timestamp: number,
+  confirmationScore: number,
+  spreadExpansionRatio = 1,
+): OptionMicrostructureSnapshot {
+  return {
+    symbol, timestamp, quoteTimestamp: timestamp, windowMs: 5_000,
+    quoteEvents: 5, tradeEvents: 2, qualifiedTradeEvents: 2,
+    directionalTradeEvents: 2, excludedTradeEvents: 0, mid: 2, microprice: 2,
+    micropriceDisplacementBps: 0, quoteImbalance: confirmationScore,
+    quoteOfi: confirmationScore, premiumMomentumBps: confirmationScore * 10,
+    bidMomentumBps: confirmationScore * 10, spreadPct: 0.01,
+    spreadExpansionRatio, bidDepthTrend: confirmationScore,
+    askDepthTrend: -confirmationScore, tradeVolume: 10,
+    buyVolume: confirmationScore > 0 ? 10 : 0,
+    sellVolume: confirmationScore < 0 ? 10 : 0,
+    neutralVolume: 0, excludedTradeVolume: 0, tradeImbalance: confirmationScore,
+    vwapDisplacementBps: confirmationScore * 10,
+    confirmationScore, dataFresh: true,
   };
 }
 
@@ -203,6 +255,30 @@ test("entry quote freshness is checked again immediately before broker submissio
   assert.deepEqual(result.reasons, ["ENTRY_QUOTE_TOO_OLD"]);
   assert.equal(client.requests.length, 0);
   assert.equal((await portfolioRisk.snapshot(start)).activePositions, 0);
+});
+
+test("clean bearish profile preserves selection freshness through bounded broker round trips", async () => {
+  const timestamp = zonedDateTimeToEpoch(date, "12:43:54");
+  const client = new FakeTradingClient();
+  client.clock.timestamp = timestamp;
+  client.advanceClockOnAccountMs = 500;
+  const manager = new LiveOrderManager({ config: defaultConfig, client });
+  await manager.initialize(timestamp);
+
+  const result = await manager.submitEntry({
+    timestamp,
+    signal: cleanBearishSignal(timestamp),
+    candidate: candidate(),
+    quote: optionQuote(timestamp - 1_900),
+  });
+
+  assert.equal(result.submitted, true);
+  assert.equal(client.requests.length, 1);
+  assert.equal(
+    defaultConfig.signals.lateEntryGuard.bearishCleanImpulse.maxEntryQuoteAgeMs,
+    3_000,
+  );
+  assert.equal(defaultConfig.execution.maxEntryQuoteAgeMs, 750);
 });
 
 test("live manager submits an option entry, reconciles partial fill, cancels remainder, and hard-stops exposure", async () => {
@@ -336,6 +412,34 @@ test("unfilled entry is replaced toward market and canceled at its deadline", as
   assert.equal(client.cancelCalls, 1);
   assert.equal(state.pending, undefined);
   assert.equal(state.position, undefined);
+});
+
+test("production entry is canceled immediately when Massive option flow reverses", async () => {
+  const client = new FakeTradingClient();
+  const recorder = new MemoryRecorder();
+  const manager = new LiveOrderManager({ config: defaultConfig, client, recorder });
+  await manager.initialize(start);
+  const initialMicrostructure = optionMicrostructure(start, 0.7);
+  await manager.submitEntry({
+    timestamp: start,
+    signal: signal(),
+    candidate: { ...candidate(), optionMicrostructure: initialMicrostructure },
+    quote: optionQuote(start),
+    optionMicrostructure: initialMicrostructure,
+  });
+
+  const state = await manager.tick({
+    timestamp: start + 100,
+    optionQuote: optionQuote(start + 100),
+    optionMicrostructure: optionMicrostructure(start + 100, -0.8),
+  });
+
+  assert.equal(client.cancelCalls, 1);
+  assert.equal(state.pending, undefined);
+  assert.equal(state.position, undefined);
+  assert.ok(recorder.events.some((event) =>
+    event.type === "entry_cancel_decision" &&
+    (event.data.reasons as string[]).includes("OPTION_MICROSTRUCTURE_REVERSED")));
 });
 
 test("forced session exit remains marketable and is repriced instead of canceled", async () => {

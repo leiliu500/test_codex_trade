@@ -1,6 +1,6 @@
 import type { EngineConfig } from "../config.js";
 import type {
-  OptionQuote, OptionSnapshot, PositionState,
+  OptionMicrostructureSnapshot, OptionQuote, OptionSnapshot, PositionState,
 } from "../types.js";
 import type {
   BrokerOrder, BrokerOrderRequest, BrokerPosition, TradingRestClient,
@@ -22,6 +22,7 @@ type ExitIntentSnapshot = NonNullable<LiveExecutionSnapshot["exitIntent"]>;
 export interface ConcurrentExecutionTick extends ExecutionTick {
   optionQuotes?: readonly OptionQuote[];
   optionSnapshots?: readonly OptionSnapshot[];
+  optionMicrostructures?: readonly OptionMicrostructureSnapshot[];
 }
 
 export interface ConcurrentLiveExecutionSnapshot extends LiveExecutionSnapshot {
@@ -134,8 +135,8 @@ export class ConcurrentLiveOrderManager {
     return this.#serialize(async () => {
       this.#assertInitialized();
       const {
-        optionQuotes, optionSnapshots, optionQuote: singleQuote,
-        optionSnapshot: singleSnapshot, ...tick
+        optionQuotes, optionSnapshots, optionMicrostructures, optionQuote: singleQuote,
+        optionSnapshot: singleSnapshot, optionMicrostructure: singleMicrostructure, ...tick
       } = request;
       for (const slot of this.#slots) {
         const state = slot.manager.snapshot();
@@ -144,10 +145,13 @@ export class ConcurrentLiveOrderManager {
           (singleQuote?.symbol === symbol ? singleQuote : undefined);
         const optionSnapshot = optionSnapshots?.find((snapshot) => snapshot.symbol === symbol) ??
           (singleSnapshot?.symbol === symbol ? singleSnapshot : undefined);
+        const optionMicrostructure = optionMicrostructures?.find((snapshot) => snapshot.symbol === symbol) ??
+          (singleMicrostructure?.symbol === symbol ? singleMicrostructure : undefined);
         await slot.manager.tick({
           ...tick,
           ...(optionQuote ? { optionQuote } : {}),
           ...(optionSnapshot ? { optionSnapshot } : {}),
+          ...(optionMicrostructure ? { optionMicrostructure } : {}),
         });
         this.#releaseFlatSlot(slot);
       }

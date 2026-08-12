@@ -85,6 +85,13 @@ test("configuration cannot enable later-dated or overnight option trading", () =
   const invalidLateBearishProfile = structuredClone(defaultConfig);
   invalidLateBearishProfile.signals.lateEntryGuard.bearishStrongDownImpulse.followThroughMinSec = 6;
   assert.throws(() => validateConfig(invalidLateBearishProfile), /Late-entry guard thresholds/);
+  const invalidLateCleanBearishProfile = structuredClone(defaultConfig);
+  invalidLateCleanBearishProfile.signals.lateEntryGuard.bearishCleanImpulse.minFastEfficiency = 1.01;
+  assert.throws(() => validateConfig(invalidLateCleanBearishProfile), /Late-entry guard thresholds/);
+  const invalidLateCleanBearishQuoteAge = structuredClone(defaultConfig);
+  invalidLateCleanBearishQuoteAge.signals.lateEntryGuard.bearishCleanImpulse.maxEntryQuoteAgeMs =
+    invalidLateCleanBearishQuoteAge.execution.entrySignalTtlMs + 1;
+  assert.throws(() => validateConfig(invalidLateCleanBearishQuoteAge), /Late-entry guard thresholds/);
   const invalidLateBearishPersistence = structuredClone(defaultConfig);
   invalidLateBearishPersistence.signals.lateEntryGuard
     .bearishUnclassifiedImpulseMinMediumToFastRatio = 1.01;

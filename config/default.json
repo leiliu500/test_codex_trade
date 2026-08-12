@@ -1,5 +1,5 @@
 {
-  "version": "spy-0dte-entry-confirmation-26-entry-quote-freshness",
+  "version": "spy-0dte-entry-confirmation-28-clean-bearish-capture",
   "symbol": "SPY",
   "timeZone": "America/New_York",
   "session": {
@@ -115,6 +115,21 @@
         "minimumBidImprovement": 0.03,
         "minimumProjectedMoveBps": 0.5
       },
+      "bearishCleanImpulse": {
+        "enabled": true,
+        "minDirectionalProjectionBps": 1.75,
+        "minFastEfficiency": 0.7,
+        "minFastNormalizedSlope": 4.0,
+        "minMediumNormalizedSlope": 4.0,
+        "minMediumR2": 0.8,
+        "minSlowNormalizedSlope": 1.0,
+        "minSlowR2": 0.5,
+        "minEfficiency60": 0.25,
+        "minCostMarginBps": 0.7,
+        "maxOptionSpreadPct": 0.012,
+        "maxOptionSpreadTicks": 1,
+        "maxEntryQuoteAgeMs": 3000
+      },
       "bearishUnclassifiedImpulseFollowThroughStart": "13:00:00",
       "bearishStrongDownImpulse": {
         "followThroughMinSec": 5,
@@ -155,7 +170,21 @@
     "dividendYield": 0.012,
     "maxImpliedVolatility": 5.0,
     "fallbackImpliedVolatility": 0.22,
-    "slippagePerSidePctOfSpread": 0.20
+    "slippagePerSidePctOfSpread": 0.20,
+    "microstructure": {
+      "enabled": true,
+      "windowSec": 5,
+      "snapshotRefreshSec": 10,
+      "minimumQuoteEvents": 1,
+      "minimumEntryScore": -0.35,
+      "maximumSpreadExpansionRatio": 2.0,
+      "minimumChainAverageScore": -0.35,
+      "minimumChainObservedContracts": 1,
+      "scoreWeight": 3.0,
+      "chainScoreWeight": 1.5,
+      "thetaCostMultiplier": 1.0,
+      "adverseIvMovePoints": 0.25
+    }
   },
   "execution": {
     "entryLimitSpreadFraction": 0.55,
@@ -172,7 +201,13 @@
     "exitTtlMinMs": 250,
     "exitTtlMaxMs": 1800,
     "exitPriceCollarPct": 0.15,
-    "exitMarketableOffsetTicks": 2
+    "exitMarketableOffsetTicks": 2,
+    "entryMicrostructureAggressionAdjustment": 0.25,
+    "entryMicrostructureCancelScore": -0.65,
+    "entrySpreadExpansionCancelRatio": 2.5,
+    "entryReplaceMinMs": 500,
+    "exitMicrostructureUrgencyAdjustment": 0.35,
+    "executionQualityProbeSec": [1, 5, 15]
   },
   "risk": {
     "riskFractionOfEquity": 0.0025,

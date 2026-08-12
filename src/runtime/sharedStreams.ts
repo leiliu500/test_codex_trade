@@ -191,6 +191,15 @@ export class SharedOptionStreamHub {
           catch (error) { channel.handlers.onError?.(error); }
         }
       },
+      onRawEvents: (events, activity) => {
+        for (const channel of this.#channels.values()) {
+          if (!channel.active || !channel.handlers?.onRawEvents) continue;
+          const scoped = events.filter((event) => channel.desired.has(event.value.symbol));
+          if (scoped.length === 0) continue;
+          try { channel.handlers.onRawEvents(scoped, activity); }
+          catch (error) { channel.handlers.onError?.(error); }
+        }
+      },
       onState: (connected) => {
         this.#connected = connected;
         if (!connected) {
