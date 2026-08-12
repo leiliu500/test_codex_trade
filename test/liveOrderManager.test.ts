@@ -28,6 +28,9 @@ class FakeTradingClient implements TradingRestClient {
   replaceCalls = 0;
   cancelCalls = 0;
   failNextSubmitAfterAccept = false;
+  failNextReplaceBeforeAccept = false;
+  failNextReplaceAfterAccept = false;
+  fillNextReplacementAfterAcceptPrice: number | undefined;
   advanceClockOnAccountMs = 0;
   #sequence = 0;
 
@@ -64,12 +67,28 @@ class FakeTradingClient implements TradingRestClient {
   async replaceOrder(orderId: string, _limitPrice: number): Promise<BrokerOrder> {
     const old = this.orders.get(orderId);
     if (!old) throw new Error(`missing order ${orderId}`);
-    old.status = "replaced";
     this.replaceCalls += 1;
+    if (this.failNextReplaceBeforeAccept) {
+      this.failNextReplaceBeforeAccept = false;
+      throw new Error("simulated definitive replacement rejection");
+    }
+    old.status = "replaced";
     const replacement: BrokerOrder = {
-      ...old, id: `order-${++this.#sequence}`, status: "new",
+      ...old, id: `order-${++this.#sequence}`, status: "new", replaces: old.id,
     };
+    old.replacedBy = replacement.id;
+    delete replacement.replacedBy;
     this.orders.set(replacement.id, replacement);
+    if (this.fillNextReplacementAfterAcceptPrice !== undefined) {
+      replacement.status = "filled";
+      replacement.filledQuantity = 1;
+      replacement.averageFillPrice = this.fillNextReplacementAfterAcceptPrice;
+      this.fillNextReplacementAfterAcceptPrice = undefined;
+    }
+    if (this.failNextReplaceAfterAccept) {
+      this.failNextReplaceAfterAccept = false;
+      throw new Error("simulated response timeout after replacement acceptance");
+    }
     return { ...replacement };
   }
   async cancelOrder(orderId: string): Promise<void> {
@@ -460,6 +479,114 @@ test("forced session exit remains marketable and is repriced instead of canceled
   assert.equal(state.pending?.purpose, "EXIT");
   assert.equal(client.cancelCalls, 0);
   assert.ok(client.replaceCalls >= 1);
+});
+
+test("rejected exit replacement keeps polling the original order and records its later fill", async () => {
+  const client = new FakeTradingClient();
+  const recorder = new MemoryRecorder();
+  const manager = new LiveOrderManager({ config: defaultConfig, client, recorder });
+  await manager.initialize(start);
+  const submitted = await manager.submitEntry({
+    timestamp: start, signal: signal(), candidate: candidate(), quote: optionQuote(start),
+  });
+  client.fill(submitted.brokerOrder!.id, 1, 2, "filled");
+  await manager.tick({ timestamp: start + 400, optionQuote: optionQuote(start + 400) });
+
+  const forceExit = zonedDateTimeToEpoch(date, defaultConfig.session.forceExit);
+  let state = await manager.tick({
+    timestamp: forceExit, optionQuote: optionQuote(forceExit, 2.10, 2.12),
+  });
+  const originalExitId = state.pending!.brokerOrderId;
+  client.failNextReplaceBeforeAccept = true;
+  state = await manager.tick({
+    timestamp: forceExit + 7_000,
+    optionQuote: optionQuote(forceExit + 7_000, 2.05, 2.07),
+  });
+
+  assert.equal(state.halted, false);
+  assert.equal(state.pending?.brokerOrderId, originalExitId);
+  assert.equal(state.pending?.order.limitPrice, 2.10);
+  assert.ok(recorder.events.some((event) => event.type === "broker_order_replace_not_applied"));
+
+  client.fill(originalExitId, 1, 2.10, "filled");
+  state = await manager.tick({
+    timestamp: forceExit + 7_400,
+    optionQuote: optionQuote(forceExit + 7_400, 2.04, 2.06),
+  });
+  assert.equal(state.halted, false);
+  assert.equal(state.position, undefined);
+  assert.equal(state.pending, undefined);
+  assert.ok(recorder.events.some((event) => event.type === "exit_fill"));
+});
+
+test("uncertain accepted exit replacement adopts its sole open successor", async () => {
+  const client = new FakeTradingClient();
+  const recorder = new MemoryRecorder();
+  const manager = new LiveOrderManager({ config: defaultConfig, client, recorder });
+  await manager.initialize(start);
+  const submitted = await manager.submitEntry({
+    timestamp: start, signal: signal(), candidate: candidate(), quote: optionQuote(start),
+  });
+  client.fill(submitted.brokerOrder!.id, 1, 2, "filled");
+  await manager.tick({ timestamp: start + 400, optionQuote: optionQuote(start + 400) });
+
+  const forceExit = zonedDateTimeToEpoch(date, defaultConfig.session.forceExit);
+  let state = await manager.tick({
+    timestamp: forceExit, optionQuote: optionQuote(forceExit, 2.10, 2.12),
+  });
+  const originalExitId = state.pending!.brokerOrderId;
+  client.failNextReplaceAfterAccept = true;
+  state = await manager.tick({
+    timestamp: forceExit + 7_000,
+    optionQuote: optionQuote(forceExit + 7_000, 2.05, 2.07),
+  });
+
+  assert.equal(state.halted, false);
+  assert.notEqual(state.pending?.brokerOrderId, originalExitId);
+  assert.ok(Math.abs(state.pending!.order.limitPrice - 2.03) < 1e-12);
+  assert.ok(recorder.events.some((event) =>
+    event.type === "broker_order_replaced" && event.data.recoveredFromBroker === true));
+
+  client.fill(state.pending!.brokerOrderId, 1, 2.03, "filled");
+  state = await manager.tick({
+    timestamp: forceExit + 7_400,
+    optionQuote: optionQuote(forceExit + 7_400, 2.02, 2.04),
+  });
+  assert.equal(state.halted, false);
+  assert.equal(state.position, undefined);
+  assert.equal(state.pending, undefined);
+});
+
+test("uncertain replacement response follows a successor that already filled", async () => {
+  const client = new FakeTradingClient();
+  const recorder = new MemoryRecorder();
+  const manager = new LiveOrderManager({ config: defaultConfig, client, recorder });
+  await manager.initialize(start);
+  const submitted = await manager.submitEntry({
+    timestamp: start, signal: signal(), candidate: candidate(), quote: optionQuote(start),
+  });
+  client.fill(submitted.brokerOrder!.id, 1, 2, "filled");
+  await manager.tick({ timestamp: start + 400, optionQuote: optionQuote(start + 400) });
+
+  const forceExit = zonedDateTimeToEpoch(date, defaultConfig.session.forceExit);
+  await manager.tick({
+    timestamp: forceExit, optionQuote: optionQuote(forceExit, 2.10, 2.12),
+  });
+  client.failNextReplaceAfterAccept = true;
+  client.fillNextReplacementAfterAcceptPrice = 2.03;
+  const state = await manager.tick({
+    timestamp: forceExit + 7_000,
+    optionQuote: optionQuote(forceExit + 7_000, 2.05, 2.07),
+  });
+
+  assert.equal(state.halted, false);
+  assert.equal(state.position, undefined);
+  assert.equal(state.pending, undefined);
+  assert.equal(state.lifecycle, "CLOSED");
+  assert.ok(recorder.events.some((event) =>
+    event.type === "broker_order_replaced" && event.data.recoveredFromBroker === true));
+  assert.ok(recorder.events.some((event) =>
+    event.type === "exit_fill" && Math.abs(Number(event.data.incrementalPrice) - 2.03) < 1e-12));
 });
 
 test("ambiguous submission is recovered by deterministic client order ID without a duplicate", async () => {

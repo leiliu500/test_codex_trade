@@ -49,6 +49,7 @@ interface PendingBrokerExecution {
   entrySnapshotTimestamp?: number;
   arrivalMid?: number;
   entryMicrostructureScore?: number;
+  replacementRecoveryState?: OrderState;
 }
 
 interface ExecutionQualityProbe {
@@ -711,6 +712,52 @@ export class LiveOrderManager {
   async #synchronizeBrokerOrder(broker: BrokerOrder, timestamp: number): Promise<void> {
     const pending = this.#pending;
     if (!pending) return;
+    if (broker.status.toLowerCase() === "replaced") {
+      let replacement: BrokerOrder | undefined;
+      if (broker.replacedBy) {
+        replacement = await this.#client.getOrder(broker.replacedBy).catch(
+          async (recoveryError: unknown) => await this.#halt(timestamp, "AMBIGUOUS_ORDER_REPLACEMENT", {
+            current: broker,
+            recoveryError: errorMessage(recoveryError),
+            action: "REPLACEMENT_SUCCESSOR_LOOKUP_FAILED",
+          }),
+        );
+      } else {
+        let openOrders: BrokerOrder[] = [];
+        try {
+          openOrders = (await this.#client.listOpenOrders()).filter((order) =>
+            order.symbol === pending.state.symbol && order.id !== broker.id);
+        } catch (recoveryError) {
+          await this.#halt(timestamp, "AMBIGUOUS_ORDER_REPLACEMENT", {
+            current: broker,
+            recoveryError: errorMessage(recoveryError),
+            action: "LIST_REPLACEMENT_ORDER_FAILED",
+          });
+        }
+        if (openOrders.length > 1) {
+          await this.#halt(timestamp, "AMBIGUOUS_ORDER_REPLACEMENT", {
+            current: broker,
+            replacementCandidates: openOrders,
+            action: "MULTIPLE_OPEN_REPLACEMENT_ORDERS",
+          });
+        }
+        replacement = openOrders[0];
+      }
+      if (replacement) {
+        if (pending.replacementRecoveryState) {
+          pending.state = pending.replacementRecoveryState;
+          delete pending.replacementRecoveryState;
+        }
+        pending.brokerOrderId = replacement.id;
+        await this.#audit(timestamp, "broker_order_replaced", {
+          purpose: pending.purpose,
+          replacement,
+          localOrder: pending.state,
+          recoveredFromBroker: true,
+        });
+        broker = replacement;
+      }
+    }
     pending.lastPolledAt = timestamp;
     if (broker.symbol !== pending.state.symbol) await this.#halt(timestamp, "BROKER_ORDER_SYMBOL_MISMATCH", { broker, pending });
     const totalFilled = broker.filledQuantity;
@@ -871,6 +918,7 @@ export class LiveOrderManager {
     const pending = this.#pending;
     if (!pending || pending.state.status === "CANCEL_PENDING") return;
     const quote = this.#quoteFor(pending.state.symbol);
+    const beforeState = cloneOrderState(pending.state);
     const beforeReplacements = pending.state.replacements;
     const beforeLimit = pending.state.limitPrice;
     const microstructure = this.#microstructureFor(pending.state.symbol, request.optionMicrostructure);
@@ -903,13 +951,36 @@ export class LiveOrderManager {
     if (pending.state.replacements !== beforeReplacements || pending.state.limitPrice !== beforeLimit) {
       try {
         const replacement = await this.#client.replaceOrder(pending.brokerOrderId, pending.state.limitPrice);
+        delete pending.replacementRecoveryState;
         pending.brokerOrderId = replacement.id;
         await this.#audit(timestamp, "broker_order_replaced", { purpose: pending.purpose, replacement, localOrder: pending.state });
         await this.#synchronizeBrokerOrder(replacement, timestamp);
       } catch (replaceError) {
-        const current = await this.#client.getOrder(pending.brokerOrderId);
+        const current = await this.#client.getOrder(pending.brokerOrderId).catch(
+          async (recoveryError: unknown) => await this.#halt(timestamp, "AMBIGUOUS_ORDER_REPLACEMENT", {
+            replaceError: errorMessage(replaceError),
+            recoveryError: errorMessage(recoveryError),
+            action: "CURRENT_ORDER_LOOKUP_FAILED",
+          }),
+        );
+        if (ACTIVE_BROKER_STATUSES.has(current.status.toLowerCase())) {
+          // The broker still recognizes the original order, so execution truth is not
+          // ambiguous. Roll back the optimistic local reprice and keep polling it. If an
+          // accepted-but-delayed replacement later appears, synchronizeBrokerOrder adopts
+          // its sole open successor and restores the attempted local state.
+          const attemptedState = cloneOrderState(pending.state);
+          pending.state = beforeState;
+          pending.state.lastActionAt = timestamp;
+          pending.replacementRecoveryState = attemptedState;
+          await this.#audit(timestamp, "broker_order_replace_not_applied", {
+            purpose: pending.purpose,
+            replaceError: errorMessage(replaceError),
+            current,
+            localOrder: pending.state,
+            action: "KEEP_POLLING_CURRENT_ORDER",
+          });
+        }
         await this.#synchronizeBrokerOrder(current, timestamp);
-        if (this.#pending) await this.#halt(timestamp, "AMBIGUOUS_ORDER_REPLACEMENT", { replaceError, current });
       }
     }
   }
@@ -1256,6 +1327,14 @@ export class LiveOrderManager {
     this.#tail = result.then(() => undefined, () => undefined);
     return result;
   }
+}
+
+function cloneOrderState(state: OrderState): OrderState {
+  return { ...state, events: state.events.map((event) => ({ ...event })) };
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function maximumEntryPremium(

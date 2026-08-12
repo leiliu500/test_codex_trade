@@ -33,6 +33,8 @@ export interface BrokerOrder {
   updatedAt?: number;
   filledAt?: number;
   canceledAt?: number;
+  replacedBy?: string;
+  replaces?: string;
 }
 
 export interface BrokerPosition {
@@ -86,6 +88,8 @@ interface RawOrder {
   updated_at?: string | null;
   filled_at?: string | null;
   canceled_at?: string | null;
+  replaced_by?: string | null;
+  replaces?: string | null;
 }
 
 export class AlpacaTradingRestClient implements MultiUnderlyingTradingRestClient {
@@ -471,6 +475,8 @@ function mapOrder(raw: RawOrder): BrokerOrder {
     ...(raw.updated_at ? { updatedAt: parseRfc3339ToMs(raw.updated_at) } : {}),
     ...(raw.filled_at ? { filledAt: parseRfc3339ToMs(raw.filled_at) } : {}),
     ...(raw.canceled_at ? { canceledAt: parseRfc3339ToMs(raw.canceled_at) } : {}),
+    ...(raw.replaced_by ? { replacedBy: raw.replaced_by } : {}),
+    ...(raw.replaces ? { replaces: raw.replaces } : {}),
   };
 }
 

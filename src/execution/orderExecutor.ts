@@ -188,10 +188,10 @@ export class OrderExecutor {
     if (state.marketable) {
       if (freshQuote && timestamp - state.lastActionAt >= state.actionTtlMs &&
           timestamp - freshQuote.timestamp <= this.#config.dataQuality.maxOptionQuoteAgeMs) {
-        state.replacements += 1;
+        const nextReplacement = state.replacements + 1;
         const extraTicks = Math.ceil(
           state.urgency * this.#config.execution.exitMarketableOffsetTicks *
-          Math.max(1, state.replacements),
+          Math.max(1, nextReplacement),
         );
         const rawLimit = state.side === "sell"
           ? freshQuote.bidPrice - extraTicks * this.#config.execution.optionTickSize
@@ -200,9 +200,22 @@ export class OrderExecutor {
         const rounded = state.side === "sell"
           ? Math.floor(ticks + 1e-10) * this.#config.execution.optionTickSize
           : Math.ceil(ticks - 1e-10) * this.#config.execution.optionTickSize;
-        state.limitPrice = state.side === "sell"
+        const bounded = state.side === "sell"
           ? Math.max(state.priceCollar, rounded)
           : Math.min(state.priceCollar, rounded);
+        const nextLimit = state.side === "sell"
+          ? Math.min(state.limitPrice, bounded)
+          : Math.max(state.limitPrice, bounded);
+        if (Math.abs(nextLimit - state.limitPrice) < this.#config.execution.optionTickSize / 2) {
+          // The order is already at least as aggressive as the fresh quote permits (often at
+          // its price collar). Do not send a PATCH with unchanged parameters: Alpaca rejects
+          // those requests, and a rejection is indistinguishable from an uncertain replace
+          // response at the execution boundary.
+          state.lastActionAt = timestamp;
+          return state;
+        }
+        state.replacements = nextReplacement;
+        state.limitPrice = nextLimit;
         return this.#transition(
           state,
           "SUBMITTED",

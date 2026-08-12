@@ -1209,6 +1209,43 @@ test("order state machine handles rounding, partial fill, replacement and cancel
   assert.equal(forced.marketable, true);
 });
 
+test("marketable exits never reprice backward or submit an unchanged collar price", () => {
+  const executor = new OrderExecutor(defaultConfig);
+  const timestamp = zonedDateTimeToEpoch("2026-07-22", "10:30:00");
+  const symbol = "SPY260722C00500000";
+  const quote = { symbol, timestamp, bidPrice: 1, askPrice: 1.02, bidSize: 10, askSize: 10 };
+  let state = executor.submit(executor.propose({
+    clientOrderId: "marketable-exit",
+    symbol,
+    side: "sell",
+    quantity: 1,
+    timestamp,
+    quote,
+    marketable: true,
+    urgency: 1,
+    priceCollar: 0.98,
+  }), timestamp);
+
+  state = executor.onTimer(state, timestamp + 1_000, {
+    ...quote, timestamp: timestamp + 1_000, bidPrice: 1.05, askPrice: 1.07,
+  });
+  assert.equal(state.limitPrice, 1);
+  assert.equal(state.replacements, 0);
+
+  state = executor.onTimer(state, timestamp + 2_000, {
+    ...quote, timestamp: timestamp + 2_000, bidPrice: 0.99, askPrice: 1.01,
+  });
+  assert.equal(state.limitPrice, 0.98);
+  assert.equal(state.replacements, 1);
+
+  state = executor.onTimer(state, timestamp + 3_000, {
+    ...quote, timestamp: timestamp + 3_000, bidPrice: 0.99, askPrice: 1.01,
+  });
+  assert.equal(state.limitPrice, 0.98);
+  assert.equal(state.replacements, 1);
+  assert.equal(state.lastActionAt, timestamp + 3_000);
+});
+
 test("order boundary permits only current-day SPY options and blocks late entries", () => {
   const executor = new OrderExecutor(defaultConfig);
   const timestamp = zonedDateTimeToEpoch("2026-07-22", "10:30:00");
