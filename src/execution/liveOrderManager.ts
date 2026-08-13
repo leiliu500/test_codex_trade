@@ -41,6 +41,7 @@ interface PendingBrokerExecution {
   underlyingEntryPrice?: number;
   exitReason?: ExitReason;
   cancelRequested?: boolean;
+  cancelRequestedAt?: number;
   lastPolledAt: number;
   signalTimestamp?: number;
   maxEntryPremium?: number;
@@ -418,6 +419,31 @@ export class LiveOrderManager {
         await this.#synchronizeBrokerOrder(brokerOrder, request.timestamp);
       }
 
+      if (this.#pending?.cancelRequestedAt !== undefined &&
+          request.timestamp - this.#pending.cancelRequestedAt >=
+            this.#config.execution.cancelAfterMs) {
+        await this.#halt(request.timestamp, "BROKER_CANCEL_CONFIRMATION_TIMEOUT", {
+          purpose: this.#pending.purpose,
+          brokerOrderId: this.#pending.brokerOrderId,
+          clientOrderId: this.#pending.state.clientOrderId,
+          cancelRequestedAt: this.#pending.cancelRequestedAt,
+          timeoutMs: this.#config.execution.cancelAfterMs,
+          order: this.#pending.state,
+          action: "PRESERVE_POSITION_AND_PREVENT_DUPLICATE_ORDER",
+        });
+      }
+
+      if (!this.#pending && this.#exitIntent && this.#position &&
+          request.timestamp - this.#exitIntent.createdAt >=
+            this.#config.execution.exitIntentTimeoutMs) {
+        await this.#halt(request.timestamp, "EXIT_INTENT_TIMEOUT", {
+          exitIntent: this.#exitIntent,
+          timeoutMs: this.#config.execution.exitIntentTimeoutMs,
+          position: this.#position,
+          action: "PRESERVE_POSITION_AND_STOP_EXIT_RETRY_LOOP",
+        });
+      }
+
       if (this.#pending?.purpose === "ENTRY" && this.#position) {
         const exit = await this.#evaluateExit(request);
         if (exit.exit) {
@@ -616,6 +642,14 @@ export class LiveOrderManager {
     if (!this.#position) return;
     const intent = this.#exitIntent;
     if (!intent) throw new Error("Cannot submit an exit order without a logical exit intent");
+    if (intent.attempts >= this.#config.execution.maxExitAttempts) {
+      await this.#halt(timestamp, "EXIT_ATTEMPT_LIMIT_EXCEEDED", {
+        exitIntent: intent,
+        maxExitAttempts: this.#config.execution.maxExitAttempts,
+        position: this.#position,
+        action: "PRESERVE_POSITION_AND_STOP_EXIT_RETRY_LOOP",
+      });
+    }
     const quote = this.#quoteFor(this.#position.symbol);
     if (!quote) {
       this.#safeMode = true;
@@ -991,6 +1025,7 @@ export class LiveOrderManager {
     if (pending.cancelRequested) return;
     this.#orders.requestCancel(pending.state, timestamp);
     pending.cancelRequested = true;
+    pending.cancelRequestedAt = timestamp;
     try {
       await this.#client.cancelOrder(pending.brokerOrderId);
     } catch (cancelError) {

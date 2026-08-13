@@ -27,6 +27,7 @@ class FakeTradingClient implements TradingRestClient {
   readonly requests: BrokerOrderRequest[] = [];
   replaceCalls = 0;
   cancelCalls = 0;
+  keepCancelPending = false;
   failNextSubmitAfterAccept = false;
   failNextReplaceBeforeAccept = false;
   failNextReplaceAfterAccept = false;
@@ -94,7 +95,7 @@ class FakeTradingClient implements TradingRestClient {
   async cancelOrder(orderId: string): Promise<void> {
     const order = this.orders.get(orderId);
     if (!order) throw new Error(`missing order ${orderId}`);
-    order.status = "canceled";
+    order.status = this.keepCancelPending ? "pending_cancel" : "canceled";
     this.cancelCalls += 1;
   }
   async listOpenOrders(): Promise<BrokerOrder[]> {
@@ -461,7 +462,7 @@ test("production entry is canceled immediately when Massive option flow reverses
     (event.data.reasons as string[]).includes("OPTION_MICROSTRUCTURE_REVERSED")));
 });
 
-test("forced session exit remains marketable and is repriced instead of canceled", async () => {
+test("forced session exit bounds each broker attempt and retries until filled", async () => {
   const client = new FakeTradingClient();
   const manager = new LiveOrderManager({ config: defaultConfig, client });
   await manager.initialize(start);
@@ -475,10 +476,31 @@ test("forced session exit remains marketable and is repriced instead of canceled
   assert.equal(state.pending?.order.marketable, true);
   assert.equal(state.pending?.order.limitPrice, 2.10);
 
-  state = await manager.tick({ timestamp: forceExit + 7000, optionQuote: optionQuote(forceExit + 7000, 2.05, 2.07) });
+  state = await manager.tick({
+    timestamp: forceExit + defaultConfig.execution.cancelAfterMs,
+    optionQuote: optionQuote(forceExit + defaultConfig.execution.cancelAfterMs, 2.05, 2.07),
+  });
+  assert.equal(state.pending, undefined);
+  assert.equal(state.lifecycle, "EXIT_PENDING");
+  assert.equal(client.cancelCalls, 1);
+  assert.equal(state.exitIntent?.attempts, 1);
+
+  state = await manager.tick({
+    timestamp: forceExit + defaultConfig.execution.cancelAfterMs + 400,
+    optionQuote: optionQuote(forceExit + defaultConfig.execution.cancelAfterMs + 400, 2.04, 2.06),
+  });
   assert.equal(state.pending?.purpose, "EXIT");
-  assert.equal(client.cancelCalls, 0);
-  assert.ok(client.replaceCalls >= 1);
+  assert.equal(state.exitIntent?.attempts, 2);
+  assert.equal(client.requests.filter((request) => request.side === "sell").length, 2);
+
+  client.fill(state.pending!.brokerOrderId, 1, 2.04, "filled");
+  state = await manager.tick({
+    timestamp: forceExit + defaultConfig.execution.cancelAfterMs + 800,
+    optionQuote: optionQuote(forceExit + defaultConfig.execution.cancelAfterMs + 800, 2.03, 2.05),
+  });
+  assert.equal(state.lifecycle, "CLOSED");
+  assert.equal(state.position, undefined);
+  assert.equal(state.pending, undefined);
 });
 
 test("rejected exit replacement keeps polling the original order and records its later fill", async () => {
@@ -499,8 +521,8 @@ test("rejected exit replacement keeps polling the original order and records its
   const originalExitId = state.pending!.brokerOrderId;
   client.failNextReplaceBeforeAccept = true;
   state = await manager.tick({
-    timestamp: forceExit + 7_000,
-    optionQuote: optionQuote(forceExit + 7_000, 2.05, 2.07),
+    timestamp: forceExit + 1_000,
+    optionQuote: optionQuote(forceExit + 1_000, 2.05, 2.07),
   });
 
   assert.equal(state.halted, false);
@@ -510,8 +532,8 @@ test("rejected exit replacement keeps polling the original order and records its
 
   client.fill(originalExitId, 1, 2.10, "filled");
   state = await manager.tick({
-    timestamp: forceExit + 7_400,
-    optionQuote: optionQuote(forceExit + 7_400, 2.04, 2.06),
+    timestamp: forceExit + 1_400,
+    optionQuote: optionQuote(forceExit + 1_400, 2.04, 2.06),
   });
   assert.equal(state.halted, false);
   assert.equal(state.position, undefined);
@@ -537,8 +559,8 @@ test("uncertain accepted exit replacement adopts its sole open successor", async
   const originalExitId = state.pending!.brokerOrderId;
   client.failNextReplaceAfterAccept = true;
   state = await manager.tick({
-    timestamp: forceExit + 7_000,
-    optionQuote: optionQuote(forceExit + 7_000, 2.05, 2.07),
+    timestamp: forceExit + 1_000,
+    optionQuote: optionQuote(forceExit + 1_000, 2.05, 2.07),
   });
 
   assert.equal(state.halted, false);
@@ -549,8 +571,8 @@ test("uncertain accepted exit replacement adopts its sole open successor", async
 
   client.fill(state.pending!.brokerOrderId, 1, 2.03, "filled");
   state = await manager.tick({
-    timestamp: forceExit + 7_400,
-    optionQuote: optionQuote(forceExit + 7_400, 2.02, 2.04),
+    timestamp: forceExit + 1_400,
+    optionQuote: optionQuote(forceExit + 1_400, 2.02, 2.04),
   });
   assert.equal(state.halted, false);
   assert.equal(state.position, undefined);
@@ -575,8 +597,8 @@ test("uncertain replacement response follows a successor that already filled", a
   client.failNextReplaceAfterAccept = true;
   client.fillNextReplacementAfterAcceptPrice = 2.03;
   const state = await manager.tick({
-    timestamp: forceExit + 7_000,
-    optionQuote: optionQuote(forceExit + 7_000, 2.05, 2.07),
+    timestamp: forceExit + 1_000,
+    optionQuote: optionQuote(forceExit + 1_000, 2.05, 2.07),
   });
 
   assert.equal(state.halted, false);
@@ -587,6 +609,141 @@ test("uncertain replacement response follows a successor that already filled", a
     event.type === "broker_order_replaced" && event.data.recoveredFromBroker === true));
   assert.ok(recorder.events.some((event) =>
     event.type === "exit_fill" && Math.abs(Number(event.data.incrementalPrice) - 2.03) < 1e-12));
+});
+
+test("stuck cancel acknowledgement halts instead of polling an exit card forever", async () => {
+  const client = new FakeTradingClient();
+  const recorder = new MemoryRecorder();
+  const manager = new LiveOrderManager({ config: defaultConfig, client, recorder });
+  await manager.initialize(start);
+  const submitted = await manager.submitEntry({
+    timestamp: start,
+    signal: signal(),
+    candidate: candidate(),
+    quote: optionQuote(start),
+  });
+  client.fill(submitted.brokerOrder!.id, 1, 2, "filled");
+  await manager.tick({ timestamp: start + 400, optionQuote: optionQuote(start + 400) });
+
+  const forceExit = zonedDateTimeToEpoch(date, defaultConfig.session.forceExit);
+  let state = await manager.tick({
+    timestamp: forceExit,
+    optionQuote: optionQuote(forceExit, 2.10, 2.12),
+  });
+  assert.equal(state.pending?.purpose, "EXIT");
+  client.keepCancelPending = true;
+
+  const cancelRequestedAt = forceExit + defaultConfig.execution.cancelAfterMs;
+  state = await manager.tick({
+    timestamp: cancelRequestedAt,
+    optionQuote: optionQuote(cancelRequestedAt, 2.05, 2.07),
+  });
+  assert.equal(state.pending?.order.status, "CANCEL_PENDING");
+  assert.equal(client.cancelCalls, 1);
+
+  const timeoutAt = cancelRequestedAt + defaultConfig.execution.cancelAfterMs;
+  await assert.rejects(
+    () => manager.tick({
+      timestamp: timeoutAt,
+      optionQuote: optionQuote(timeoutAt, 2.04, 2.06),
+    }),
+    /BROKER_CANCEL_CONFIRMATION_TIMEOUT/,
+  );
+  state = manager.snapshot();
+  assert.equal(state.halted, true);
+  assert.equal(state.lifecycle, "SAFE_MODE");
+  assert.equal(state.position?.quantity, 1);
+  assert.equal(client.requests.filter((request) => request.side === "sell").length, 1);
+  assert.ok(recorder.events.some((event) =>
+    event.type === "execution_halted" &&
+    event.data.reason === "BROKER_CANCEL_CONFIRMATION_TIMEOUT"));
+});
+
+test("repeated exit rejections halt at the logical attempt limit", async () => {
+  const client = new FakeTradingClient();
+  const recorder = new MemoryRecorder();
+  const manager = new LiveOrderManager({ config: defaultConfig, client, recorder });
+  await manager.initialize(start);
+  const submitted = await manager.submitEntry({
+    timestamp: start,
+    signal: signal(),
+    candidate: candidate(),
+    quote: optionQuote(start),
+  });
+  client.fill(submitted.brokerOrder!.id, 1, 2, "filled");
+  await manager.tick({ timestamp: start + 400, optionQuote: optionQuote(start + 400) });
+
+  const forceExit = zonedDateTimeToEpoch(date, defaultConfig.session.forceExit);
+  let state = await manager.tick({
+    timestamp: forceExit,
+    optionQuote: optionQuote(forceExit, 2.10, 2.12),
+  });
+
+  for (let attempt = 1; attempt <= defaultConfig.execution.maxExitAttempts; attempt += 1) {
+    client.orders.get(state.pending!.brokerOrderId)!.status = "rejected";
+    const timestamp = forceExit + attempt * defaultConfig.execution.orderPollMs;
+    if (attempt < defaultConfig.execution.maxExitAttempts) {
+      state = await manager.tick({
+        timestamp,
+        optionQuote: optionQuote(timestamp, 2.10 - attempt * 0.01, 2.12 - attempt * 0.01),
+      });
+      assert.equal(state.exitIntent?.attempts, attempt + 1);
+    } else {
+      await assert.rejects(
+        () => manager.tick({
+          timestamp,
+          optionQuote: optionQuote(timestamp, 2.05, 2.07),
+        }),
+        /EXIT_ATTEMPT_LIMIT_EXCEEDED/,
+      );
+    }
+  }
+
+  state = manager.snapshot();
+  assert.equal(state.halted, true);
+  assert.equal(state.lifecycle, "SAFE_MODE");
+  assert.equal(state.position?.quantity, 1);
+  assert.equal(state.exitIntent?.attempts, defaultConfig.execution.maxExitAttempts);
+  assert.equal(
+    client.requests.filter((request) => request.side === "sell").length,
+    defaultConfig.execution.maxExitAttempts,
+  );
+  assert.ok(recorder.events.some((event) =>
+    event.type === "execution_halted" &&
+    event.data.reason === "EXIT_ATTEMPT_LIMIT_EXCEEDED"));
+});
+
+test("an exit intent without a usable quote halts at its total timeout", async () => {
+  const client = new FakeTradingClient();
+  const manualOrder = await client.submitOrder({
+    clientOrderId: "manual-position",
+    symbol,
+    side: "buy",
+    quantity: 1,
+    limitPrice: 2,
+    timeInForce: "day",
+  });
+  client.fill(manualOrder.id, 1, 2, "filled");
+  const recorder = new MemoryRecorder();
+  const manager = new LiveOrderManager({ config: defaultConfig, client, recorder });
+  let state = await manager.initialize(start);
+  assert.equal(state.exitIntent?.attempts, 0);
+  assert.equal(state.position?.quantity, 1);
+
+  const timeoutAt = start + defaultConfig.execution.exitIntentTimeoutMs;
+  await assert.rejects(
+    () => manager.tick({ timestamp: timeoutAt }),
+    /EXIT_INTENT_TIMEOUT/,
+  );
+
+  state = manager.snapshot();
+  assert.equal(state.halted, true);
+  assert.equal(state.lifecycle, "SAFE_MODE");
+  assert.equal(state.position?.quantity, 1);
+  assert.equal(client.requests.filter((request) => request.side === "sell").length, 0);
+  assert.ok(recorder.events.some((event) =>
+    event.type === "execution_halted" &&
+    event.data.reason === "EXIT_INTENT_TIMEOUT"));
 });
 
 test("ambiguous submission is recovered by deterministic client order ID without a duplicate", async () => {

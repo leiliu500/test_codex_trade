@@ -186,6 +186,23 @@ export class OrderExecutor {
   onTimer(state: OrderState, timestamp: number, freshQuote?: OptionQuote): OrderState {
     if (!["SUBMITTED", "PARTIAL"].includes(state.status)) return state;
     if (state.marketable) {
+      if (timestamp - state.submittedAt >= this.#config.execution.cancelAfterMs) {
+        return this.#transition(
+          state,
+          "CANCEL_PENDING",
+          timestamp,
+          "marketable order attempt deadline reached",
+        );
+      }
+      if (timestamp - state.lastActionAt >= state.actionTtlMs &&
+          state.replacements >= this.#config.execution.maxReplaces) {
+        return this.#transition(
+          state,
+          "CANCEL_PENDING",
+          timestamp,
+          "marketable replacement limit reached",
+        );
+      }
       if (freshQuote && timestamp - state.lastActionAt >= state.actionTtlMs &&
           timestamp - freshQuote.timestamp <= this.#config.dataQuality.maxOptionQuoteAgeMs) {
         const nextReplacement = state.replacements + 1;

@@ -31,6 +31,13 @@ test("configuration cannot enable later-dated or overnight option trading", () =
   invalidEntryQuoteAge.execution.maxEntryQuoteAgeMs =
     invalidEntryQuoteAge.dataQuality.maxOptionQuoteAgeMs + 1;
   assert.throws(() => validateConfig(invalidEntryQuoteAge), /Order-management TTL/);
+  const invalidExitAttempts = structuredClone(defaultConfig);
+  invalidExitAttempts.execution.maxExitAttempts = 0;
+  assert.throws(() => validateConfig(invalidExitAttempts), /Order-management TTL/);
+  const invalidExitIntentTimeout = structuredClone(defaultConfig);
+  invalidExitIntentTimeout.execution.exitIntentTimeoutMs =
+    invalidExitIntentTimeout.execution.cancelAfterMs - 1;
+  assert.throws(() => validateConfig(invalidExitIntentTimeout), /Order-management TTL/);
   const invalidConfirmation = structuredClone(defaultConfig);
   invalidConfirmation.signals.followThroughMinSec = 16;
   invalidConfirmation.signals.followThroughMaxSec = 15;
@@ -1209,7 +1216,7 @@ test("order state machine handles rounding, partial fill, replacement and cancel
   assert.equal(forced.marketable, true);
 });
 
-test("marketable exits never reprice backward or submit an unchanged collar price", () => {
+test("marketable exits never reprice backward and terminate a collar-bound attempt", () => {
   const executor = new OrderExecutor(defaultConfig);
   const timestamp = zonedDateTimeToEpoch("2026-07-22", "10:30:00");
   const symbol = "SPY260722C00500000";
@@ -1244,6 +1251,15 @@ test("marketable exits never reprice backward or submit an unchanged collar pric
   assert.equal(state.limitPrice, 0.98);
   assert.equal(state.replacements, 1);
   assert.equal(state.lastActionAt, timestamp + 3_000);
+
+  state = executor.onTimer(state, timestamp + defaultConfig.execution.cancelAfterMs, {
+    ...quote,
+    timestamp: timestamp + defaultConfig.execution.cancelAfterMs,
+    bidPrice: 0.99,
+    askPrice: 1.01,
+  });
+  assert.equal(state.status, "CANCEL_PENDING");
+  assert.ok(state.replacements <= defaultConfig.execution.maxReplaces);
 });
 
 test("order boundary permits only current-day SPY options and blocks late entries", () => {

@@ -192,6 +192,8 @@
     "replaceAfterMs": 1800,
     "maxReplaces": 2,
     "cancelAfterMs": 6500,
+    "maxExitAttempts": 5,
+    "exitIntentTimeoutMs": 120000,
     "orderPollMs": 350,
     "optionTickSize": 0.01,
     "entrySignalTtlMs": 6500,
