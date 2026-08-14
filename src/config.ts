@@ -531,8 +531,8 @@ export function validateConfig(config: EngineConfig): void {
     throw new Error("The daily safety entry limit must be a positive integer");
   }
   if (!(Number.isInteger(config.risk.maxContracts) &&
-        config.risk.maxContracts >= 1 && config.risk.maxContracts <= 10)) {
-    throw new Error("Maximum contracts per entry must be an integer in [1, 10]");
+        config.risk.maxContracts >= 1 && config.risk.maxContracts <= 3)) {
+    throw new Error("Maximum contracts per entry must be an integer in [1, 3]");
   }
   if (!(Number.isInteger(config.risk.maxPositionsPerUnderlying) &&
         config.risk.maxPositionsPerUnderlying > 0 &&

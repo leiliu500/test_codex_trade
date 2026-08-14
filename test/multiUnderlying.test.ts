@@ -33,8 +33,8 @@ test("QQQ has an independent configuration and rejects SPY contracts without mut
   assert.equal(defaultConfig.symbol, "SPY");
   assert.equal(qqqConfig.symbol, "QQQ");
   assert.notEqual(qqqConfig.version, defaultConfig.version);
-  assert.equal(defaultConfig.risk.maxContracts, 10);
-  assert.equal(qqqConfig.risk.maxContracts, 10);
+  assert.equal(defaultConfig.risk.maxContracts, 3);
+  assert.equal(qqqConfig.risk.maxContracts, 3);
   assert.equal(qqqConfig.risk.onePositionAtATime, true);
   const qqq: OptionContract = {
     symbol: qqqOption, underlying: "QQQ", expirationDate: date, strike: 600,
@@ -275,7 +275,7 @@ test("QQQ serializes concurrent entries to one risk-sized broker order", async (
   assert.equal(second.submitted, false);
   assert.ok(second.reasons.includes("ORDER_ALREADY_PENDING"));
   assert.equal(broker.requests.length, 1);
-  assert.equal(broker.requests[0]?.quantity, 4);
+  assert.equal(broker.requests[0]?.quantity, 3);
 });
 
 test("dashboard forward-move diagnostics never compare QQQ evaluations with SPY prices", () => {

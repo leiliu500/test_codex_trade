@@ -221,7 +221,7 @@ function optionMicrostructure(
   };
 }
 
-test("production sizing submits the risk-limited quantity below the ten-contract cap", async () => {
+test("production sizing submits no more than the three-contract cap", async () => {
   const client = new FakeTradingClient();
   const manager = new LiveOrderManager({ config: defaultConfig, client });
   await manager.initialize(start);
@@ -234,8 +234,8 @@ test("production sizing submits the risk-limited quantity below the ten-contract
   });
 
   assert.equal(submitted.submitted, true);
-  assert.equal(submitted.risk?.quantity, 5);
-  assert.equal(client.requests[0]?.quantity, 5);
+  assert.equal(submitted.risk?.quantity, 3);
+  assert.equal(client.requests[0]?.quantity, 3);
 });
 
 test("entry submission rejects a selected quote older than the strict execution limit", async () => {
@@ -316,13 +316,13 @@ test("live manager submits an option entry, reconciles partial fill, cancels rem
   const recorder = new MemoryRecorder();
   const partialFillConfig = structuredClone(defaultConfig);
   // Exercise partial-fill reconciliation with the production multi-contract cap.
-  partialFillConfig.risk.maxContracts = 5;
+  partialFillConfig.risk.maxContracts = 3;
   const manager = new LiveOrderManager({ config: partialFillConfig, client, recorder });
   await manager.initialize(start);
 
   const submitted = await manager.submitEntry({ timestamp: start, signal: signal(), candidate: candidate(), quote: optionQuote(start) });
   assert.equal(submitted.submitted, true);
-  assert.equal(submitted.risk?.quantity, 5);
+  assert.equal(submitted.risk?.quantity, 3);
   assert.equal(client.requests[0]?.symbol, symbol);
   assert.equal(client.requests[0]?.timeInForce, "day");
 
@@ -386,7 +386,7 @@ test("trailing protection locks a configured profit floor after activation", asy
     entryTimestamp: start + 400,
     direction: "BULLISH",
     reason: "PROFIT_FLOOR_EXIT",
-    realizedPnl: 10.000000000000009,
+    realizedPnl: 6.000000000000005,
   }]);
 });
 
@@ -662,7 +662,7 @@ test("stuck cancel acknowledgement halts instead of polling an exit card forever
   state = manager.snapshot();
   assert.equal(state.halted, true);
   assert.equal(state.lifecycle, "SAFE_MODE");
-  assert.equal(state.position?.quantity, 5);
+  assert.equal(state.position?.quantity, 3);
   assert.equal(client.requests.filter((request) => request.side === "sell").length, 1);
   assert.ok(recorder.events.some((event) =>
     event.type === "execution_halted" &&
@@ -712,7 +712,7 @@ test("repeated exit rejections halt at the logical attempt limit", async () => {
   state = manager.snapshot();
   assert.equal(state.halted, true);
   assert.equal(state.lifecycle, "SAFE_MODE");
-  assert.equal(state.position?.quantity, 5);
+  assert.equal(state.position?.quantity, 3);
   assert.equal(state.exitIntent?.attempts, defaultConfig.execution.maxExitAttempts);
   assert.equal(
     client.requests.filter((request) => request.side === "sell").length,

@@ -1,7 +1,7 @@
 {
-  "version": "qqq-0dte-isolated-baseline-4-ten-contract-cap",
+  "version": "qqq-0dte-isolated-baseline-5-three-contract-cap",
   "symbol": "QQQ",
   "risk": {
-    "maxContracts": 10
+    "maxContracts": 3
   }
 }
