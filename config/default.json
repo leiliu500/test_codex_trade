@@ -1,5 +1,5 @@
 {
-  "version": "spy-0dte-entry-confirmation-28-clean-bearish-capture",
+  "version": "spy-0dte-entry-confirmation-29-ten-contract-cap",
   "symbol": "SPY",
   "timeZone": "America/New_York",
   "session": {
@@ -215,7 +215,7 @@
     "riskFractionOfEquity": 0.0025,
     "maxRiskDollarsPerTrade": 500,
     "maxPremiumDollarsPerTrade": 1500,
-    "maxContracts": 1,
+    "maxContracts": 10,
     "maxPositionsPerUnderlying": 3,
     "maxTradesPerDay": 1000,
     "maxDailyLossDollars": 1000,

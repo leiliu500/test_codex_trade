@@ -1,4 +1,7 @@
 {
-  "version": "qqq-0dte-isolated-baseline-3-massive-option-microstructure",
-  "symbol": "QQQ"
+  "version": "qqq-0dte-isolated-baseline-4-ten-contract-cap",
+  "symbol": "QQQ",
+  "risk": {
+    "maxContracts": 10
+  }
 }

@@ -1542,6 +1542,39 @@ test("paper runtime fails closed when current-session SIP recovery is unavailabl
   await runtime.close();
 });
 
+test("a complete current-day checkpoint preserves readiness when quote replay starts late", async () => {
+  const client = new FakeRuntimeClient();
+  const recorder = new MemoryRecorder();
+  let quoteWarmupStart: number | undefined;
+  const runtime = new SpyOptionsTradingRuntime({
+    config: defaultConfig,
+    client,
+    stockStream: new FakeStockStream(),
+    optionStream: new FakeOptionStream(),
+    executionEnabled: true,
+    executionMode: "paper",
+    requireStrategyRecovery: true,
+    restoredFeatureCheckpoint: bullishFeature(),
+    loadStockHistory: async function* (_marketDate, _start, _end, quoteStart) {
+      quoteWarmupStart = quoteStart;
+      yield [];
+    },
+    now: () => now,
+    executionTickMs: 60_000,
+    recorder,
+  });
+
+  await runtime.start();
+
+  assert.equal(quoteWarmupStart, now - 190_000);
+  assert.equal(runtime.healthState().strategyStateReady, true);
+  assert.equal(runtime.healthState().strategyStateStatus, "READY");
+  const recovery = recorder.events.find((event) => event.type === "strategy_state_recovery");
+  assert.equal(recovery?.data.checkpointUsed, true);
+  assert.equal(recovery?.data.coverageStartedAtOpen, true);
+  await runtime.close();
+});
+
 test("transient invalid SIP features do not erase recovered session readiness", async () => {
   let decisionTime = now;
   const client = new FakeRuntimeClient();

@@ -1,4 +1,7 @@
 {
   "version": "googl-0dte-isolated-paper-validation-2-massive-option-microstructure",
-  "symbol": "GOOGL"
+  "symbol": "GOOGL",
+  "risk": {
+    "maxContracts": 1
+  }
 }

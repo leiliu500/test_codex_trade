@@ -1108,7 +1108,9 @@ export class SpyOptionsTradingRuntime {
     }
     const start = zonedDateTimeToEpoch(date, this.#config.session.marketOpen, this.#config.timeZone);
     const checkpoint = this.#lastFeature;
-    const quoteWarmupStart = checkpoint?.openingRange.complete ? Math.max(start, timestamp - 190_000) : undefined;
+    const completeCurrentCheckpoint = checkpoint?.marketDate === date && checkpoint.openingRange.complete &&
+      checkpoint.vwap.sessionVwap !== undefined ? checkpoint : undefined;
+    const quoteWarmupStart = completeCurrentCheckpoint ? Math.max(start, timestamp - 190_000) : undefined;
     try {
       const summary = await this.#stockReceiver.restore(
         this.#loadStockHistory(date, start, timestamp, quoteWarmupStart),
@@ -1117,12 +1119,14 @@ export class SpyOptionsTradingRuntime {
       this.#restoredFeatureBars = summary.bars;
       const firstSecond = summary.firstProviderTimestamp === undefined
         ? Number.POSITIVE_INFINITY : secondsSinceMidnight(summary.firstProviderTimestamp, this.#config.timeZone);
-      this.#strategyCoverageStartedAtOpen = firstSecond <= parseClock(this.#config.session.marketOpen) + 60;
-      if (summary.latestFeature) {
-        this.#lastFeature = summary.latestFeature;
-        this.#lastSpot = summary.latestFeature.price;
-        this.#lastRegime = classifyRegime(summary.latestFeature, this.#config.regimes);
-        this.#updateStrategyState(summary.latestFeature);
+      this.#strategyCoverageStartedAtOpen = completeCurrentCheckpoint !== undefined ||
+        firstSecond <= parseClock(this.#config.session.marketOpen) + 60;
+      const recoveredFeature = summary.latestFeature ?? completeCurrentCheckpoint;
+      if (recoveredFeature) {
+        this.#lastFeature = recoveredFeature;
+        this.#lastSpot = recoveredFeature.price;
+        this.#lastRegime = classifyRegime(recoveredFeature, this.#config.regimes);
+        this.#updateStrategyState(recoveredFeature);
       }
       if (!this.#strategyStateReady) this.#strategyStateStatus = "RESTORED_STATE_INCOMPLETE";
       await this.#auditRuntime(timestamp, "strategy_state_recovery", {
@@ -1135,9 +1139,9 @@ export class SpyOptionsTradingRuntime {
         bars: summary.bars,
         rejectedEvents: summary.rejectedEvents,
         coverageStartedAtOpen: this.#strategyCoverageStartedAtOpen,
-        latestFeatureTimestamp: summary.latestFeature?.timestamp ?? null,
-        openingRangeComplete: summary.latestFeature?.openingRange.complete ?? false,
-        sessionVwapAvailable: summary.latestFeature?.vwap.sessionVwap !== undefined,
+        latestFeatureTimestamp: recoveredFeature?.timestamp ?? null,
+        openingRangeComplete: recoveredFeature?.openingRange.complete ?? false,
+        sessionVwapAvailable: recoveredFeature?.vwap.sessionVwap !== undefined,
         checkpointUsed: quoteWarmupStart !== undefined,
       });
     } catch (error) {

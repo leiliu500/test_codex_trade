@@ -82,7 +82,8 @@ class FakeTradingClient implements TradingRestClient {
     this.orders.set(replacement.id, replacement);
     if (this.fillNextReplacementAfterAcceptPrice !== undefined) {
       replacement.status = "filled";
-      replacement.filledQuantity = 1;
+      replacement.filledQuantity = this.requests.find((request) =>
+        request.clientOrderId === replacement.clientOrderId)?.quantity ?? 1;
       replacement.averageFillPrice = this.fillNextReplacementAfterAcceptPrice;
       this.fillNextReplacementAfterAcceptPrice = undefined;
     }
@@ -132,6 +133,15 @@ class FakeTradingClient implements TradingRestClient {
     order.filledQuantity = filledQuantity;
     order.averageFillPrice = averageFillPrice;
     order.status = status;
+  }
+
+  fillCompletely(orderId: string, averageFillPrice: number): void {
+    const order = this.orders.get(orderId);
+    if (!order) throw new Error(`missing order ${orderId}`);
+    const quantity = this.requests.find((request) =>
+      request.clientOrderId === order.clientOrderId)?.quantity;
+    if (quantity === undefined) throw new Error(`missing request for order ${orderId}`);
+    this.fill(orderId, quantity, averageFillPrice, "filled");
   }
 }
 
@@ -211,7 +221,7 @@ function optionMicrostructure(
   };
 }
 
-test("production sizing submits exactly one option contract per entry order", async () => {
+test("production sizing submits the risk-limited quantity below the ten-contract cap", async () => {
   const client = new FakeTradingClient();
   const manager = new LiveOrderManager({ config: defaultConfig, client });
   await manager.initialize(start);
@@ -224,8 +234,8 @@ test("production sizing submits exactly one option contract per entry order", as
   });
 
   assert.equal(submitted.submitted, true);
-  assert.equal(submitted.risk?.quantity, 1);
-  assert.equal(client.requests[0]?.quantity, 1);
+  assert.equal(submitted.risk?.quantity, 5);
+  assert.equal(client.requests[0]?.quantity, 5);
 });
 
 test("entry submission rejects a selected quote older than the strict execution limit", async () => {
@@ -305,7 +315,7 @@ test("live manager submits an option entry, reconciles partial fill, cancels rem
   const client = new FakeTradingClient();
   const recorder = new MemoryRecorder();
   const partialFillConfig = structuredClone(defaultConfig);
-  // Exercise multi-fill reconciliation independently of the production one-contract configuration invariant.
+  // Exercise partial-fill reconciliation with the production multi-contract cap.
   partialFillConfig.risk.maxContracts = 5;
   const manager = new LiveOrderManager({ config: partialFillConfig, client, recorder });
   await manager.initialize(start);
@@ -338,7 +348,7 @@ test("live manager submits an option entry, reconciles partial fill, cancels rem
   assert.deepEqual(management?.data.triggers, ["HARD_LOSS_BOUNDARY"]);
   assert.ok(Number(management?.data.executablePnl) < 0);
 
-  client.fill(state.pending!.brokerOrderId, 2, 1.48, "filled");
+  client.fillCompletely(state.pending!.brokerOrderId, 1.48);
   state = await manager.tick({ timestamp: start + 1400, optionQuote: optionQuote(start + 1400, 1.47, 1.49) });
   assert.equal(state.position, undefined);
   assert.equal(state.pending, undefined);
@@ -368,7 +378,7 @@ test("trailing protection locks a configured profit floor after activation", asy
   assert.equal(state.pending?.exitReason, "PROFIT_FLOOR_EXIT");
   assert.equal(state.pending?.order.marketable, true);
 
-  client.fill(state.pending!.brokerOrderId, 1, 2.02, "filled");
+  client.fillCompletely(state.pending!.brokerOrderId, 2.02);
   state = await manager.tick({ timestamp: start + 1_000, optionQuote: optionQuote(start + 1_000, 2.01, 2.03) });
   assert.equal(state.position, undefined);
   assert.deepEqual(completedExits, [{
@@ -376,7 +386,7 @@ test("trailing protection locks a configured profit floor after activation", asy
     entryTimestamp: start + 400,
     direction: "BULLISH",
     reason: "PROFIT_FLOOR_EXIT",
-    realizedPnl: 2.0000000000000018,
+    realizedPnl: 10.000000000000009,
   }]);
 });
 
@@ -391,7 +401,7 @@ test("unchanged quote-batch evaluations do not flood durable management history"
     candidate: candidate(),
     quote: optionQuote(start),
   });
-  client.fill(submitted.brokerOrder!.id, 1, 2, "filled");
+  client.fillCompletely(submitted.brokerOrder!.id, 2);
   await manager.tick({
     timestamp: start + 400,
     optionQuote: optionQuote(start + 400),
@@ -493,7 +503,7 @@ test("forced session exit bounds each broker attempt and retries until filled", 
   assert.equal(state.exitIntent?.attempts, 2);
   assert.equal(client.requests.filter((request) => request.side === "sell").length, 2);
 
-  client.fill(state.pending!.brokerOrderId, 1, 2.04, "filled");
+  client.fillCompletely(state.pending!.brokerOrderId, 2.04);
   state = await manager.tick({
     timestamp: forceExit + defaultConfig.execution.cancelAfterMs + 800,
     optionQuote: optionQuote(forceExit + defaultConfig.execution.cancelAfterMs + 800, 2.03, 2.05),
@@ -511,7 +521,7 @@ test("rejected exit replacement keeps polling the original order and records its
   const submitted = await manager.submitEntry({
     timestamp: start, signal: signal(), candidate: candidate(), quote: optionQuote(start),
   });
-  client.fill(submitted.brokerOrder!.id, 1, 2, "filled");
+  client.fillCompletely(submitted.brokerOrder!.id, 2);
   await manager.tick({ timestamp: start + 400, optionQuote: optionQuote(start + 400) });
 
   const forceExit = zonedDateTimeToEpoch(date, defaultConfig.session.forceExit);
@@ -530,7 +540,7 @@ test("rejected exit replacement keeps polling the original order and records its
   assert.equal(state.pending?.order.limitPrice, 2.10);
   assert.ok(recorder.events.some((event) => event.type === "broker_order_replace_not_applied"));
 
-  client.fill(originalExitId, 1, 2.10, "filled");
+  client.fillCompletely(originalExitId, 2.10);
   state = await manager.tick({
     timestamp: forceExit + 1_400,
     optionQuote: optionQuote(forceExit + 1_400, 2.04, 2.06),
@@ -549,7 +559,7 @@ test("uncertain accepted exit replacement adopts its sole open successor", async
   const submitted = await manager.submitEntry({
     timestamp: start, signal: signal(), candidate: candidate(), quote: optionQuote(start),
   });
-  client.fill(submitted.brokerOrder!.id, 1, 2, "filled");
+  client.fillCompletely(submitted.brokerOrder!.id, 2);
   await manager.tick({ timestamp: start + 400, optionQuote: optionQuote(start + 400) });
 
   const forceExit = zonedDateTimeToEpoch(date, defaultConfig.session.forceExit);
@@ -569,7 +579,7 @@ test("uncertain accepted exit replacement adopts its sole open successor", async
   assert.ok(recorder.events.some((event) =>
     event.type === "broker_order_replaced" && event.data.recoveredFromBroker === true));
 
-  client.fill(state.pending!.brokerOrderId, 1, 2.03, "filled");
+  client.fillCompletely(state.pending!.brokerOrderId, 2.03);
   state = await manager.tick({
     timestamp: forceExit + 1_400,
     optionQuote: optionQuote(forceExit + 1_400, 2.02, 2.04),
@@ -587,7 +597,7 @@ test("uncertain replacement response follows a successor that already filled", a
   const submitted = await manager.submitEntry({
     timestamp: start, signal: signal(), candidate: candidate(), quote: optionQuote(start),
   });
-  client.fill(submitted.brokerOrder!.id, 1, 2, "filled");
+  client.fillCompletely(submitted.brokerOrder!.id, 2);
   await manager.tick({ timestamp: start + 400, optionQuote: optionQuote(start + 400) });
 
   const forceExit = zonedDateTimeToEpoch(date, defaultConfig.session.forceExit);
@@ -622,7 +632,7 @@ test("stuck cancel acknowledgement halts instead of polling an exit card forever
     candidate: candidate(),
     quote: optionQuote(start),
   });
-  client.fill(submitted.brokerOrder!.id, 1, 2, "filled");
+  client.fillCompletely(submitted.brokerOrder!.id, 2);
   await manager.tick({ timestamp: start + 400, optionQuote: optionQuote(start + 400) });
 
   const forceExit = zonedDateTimeToEpoch(date, defaultConfig.session.forceExit);
@@ -652,7 +662,7 @@ test("stuck cancel acknowledgement halts instead of polling an exit card forever
   state = manager.snapshot();
   assert.equal(state.halted, true);
   assert.equal(state.lifecycle, "SAFE_MODE");
-  assert.equal(state.position?.quantity, 1);
+  assert.equal(state.position?.quantity, 5);
   assert.equal(client.requests.filter((request) => request.side === "sell").length, 1);
   assert.ok(recorder.events.some((event) =>
     event.type === "execution_halted" &&
@@ -670,7 +680,7 @@ test("repeated exit rejections halt at the logical attempt limit", async () => {
     candidate: candidate(),
     quote: optionQuote(start),
   });
-  client.fill(submitted.brokerOrder!.id, 1, 2, "filled");
+  client.fillCompletely(submitted.brokerOrder!.id, 2);
   await manager.tick({ timestamp: start + 400, optionQuote: optionQuote(start + 400) });
 
   const forceExit = zonedDateTimeToEpoch(date, defaultConfig.session.forceExit);
@@ -702,7 +712,7 @@ test("repeated exit rejections halt at the logical attempt limit", async () => {
   state = manager.snapshot();
   assert.equal(state.halted, true);
   assert.equal(state.lifecycle, "SAFE_MODE");
-  assert.equal(state.position?.quantity, 1);
+  assert.equal(state.position?.quantity, 5);
   assert.equal(state.exitIntent?.attempts, defaultConfig.execution.maxExitAttempts);
   assert.equal(
     client.requests.filter((request) => request.side === "sell").length,
@@ -723,7 +733,7 @@ test("an exit intent without a usable quote halts at its total timeout", async (
     limitPrice: 2,
     timeInForce: "day",
   });
-  client.fill(manualOrder.id, 1, 2, "filled");
+  client.fillCompletely(manualOrder.id, 2);
   const recorder = new MemoryRecorder();
   const manager = new LiveOrderManager({ config: defaultConfig, client, recorder });
   let state = await manager.initialize(start);
@@ -884,7 +894,7 @@ test("rejected exits retain one logical intent and retry until broker-confirmed 
     candidate: candidate(),
     quote: optionQuote(start),
   });
-  client.fill(submitted.brokerOrder!.id, 1, 2, "filled");
+  client.fillCompletely(submitted.brokerOrder!.id, 2);
   await manager.tick({ timestamp: start + 400, optionQuote: optionQuote(start + 400) });
 
   let state = await manager.tick({
@@ -907,7 +917,7 @@ test("rejected exits retain one logical intent and retry until broker-confirmed 
   assert.notEqual(state.pending?.brokerOrderId, rejectedOrderId);
   assert.equal(client.requests.filter((request) => request.side === "sell").length, 2);
 
-  client.fill(state.pending!.brokerOrderId, 1, 1.38, "filled");
+  client.fillCompletely(state.pending!.brokerOrderId, 1.38);
   state = await manager.tick({
     timestamp: start + 1_600,
     optionQuote: optionQuote(start + 1_600, 1.37, 1.39),
