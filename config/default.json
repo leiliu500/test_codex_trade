@@ -1,5 +1,5 @@
 {
-  "version": "spy-0dte-entry-confirmation-25-option-selection-retry",
+  "version": "spy-0dte-entry-confirmation-26-alpaca-option-exits",
   "symbol": "SPY",
   "timeZone": "America/New_York",
   "session": {
@@ -219,6 +219,12 @@
     "protectedGreeksExitGraceSec": 0.5,
     "continuationConfidenceZ": 1,
     "continuationSpreadCostFraction": 0.25,
-    "ivCrushThreshold": 0.03
+    "ivCrushThreshold": 0.03,
+    "alpacaOptionFeatures": {
+      "windowMs": 5000,
+      "minimumQuoteEvents": 3,
+      "minimumTradeEvents": 1,
+      "flowAdjustmentSpreadFraction": 0.5
+    }
   }
 }

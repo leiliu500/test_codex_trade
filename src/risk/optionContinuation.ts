@@ -1,5 +1,6 @@
 import type { EngineConfig } from "../config.js";
 import type { FeatureSnapshot, OptionQuote, OptionSnapshot, PositionState } from "../types.js";
+import type { AlpacaOptionFeatures } from "../alpaca/optionFeatures.js";
 import { blackScholes, impliedVolatility } from "../options/blackScholes.js";
 import { parseOccSymbol } from "../options/occSymbol.js";
 import { zonedDateTimeToEpoch } from "../utils/time.js";
@@ -12,6 +13,9 @@ export interface OptionContinuationEstimate {
   holdingCostDollars: number;
   uncertaintyDollars: number;
   expectedChangeDollars: number;
+  alpacaFlowAdjustmentDollars: number;
+  alpacaFlowScore?: number;
+  alpacaFlowEvidenceUsed: boolean;
   lcbDollars: number;
   ivCrushDetected: boolean;
   /** Whether fresh provider Greeks make this estimate eligible to arm an exit. */
@@ -36,6 +40,7 @@ export function estimateOptionContinuation(
   feature: FeatureSnapshot | undefined,
   timestamp: number,
   config: EngineConfig,
+  alpacaOptionFeatures?: AlpacaOptionFeatures,
 ): OptionContinuationResult {
   const position: PositionState = { ...original };
   if (snapshot && snapshot.symbol !== position.symbol) {
@@ -123,7 +128,22 @@ export function estimateOptionContinuation(
     Math.sqrt(Math.max(0, position.pnlEwmaVariancePerSec) * horizonSec);
   const expectedChangeDollars =
     deltaDollars + gammaDollars + vegaDollars + thetaDollars;
-  const lcbDollars = expectedChangeDollars - holdingCostDollars - uncertaintyDollars;
+  const alpacaFlowEvidenceUsed = alpacaOptionFeatures?.symbol === position.symbol &&
+    alpacaOptionFeatures.dataFresh === true &&
+    alpacaOptionFeatures.timestamp <= timestamp &&
+    timestamp - alpacaOptionFeatures.timestamp <= config.dataQuality.maxOptionQuoteAgeMs &&
+    alpacaOptionFeatures.quoteAgeMs <= config.dataQuality.maxOptionQuoteAgeMs &&
+    alpacaOptionFeatures.quoteEvents >= config.risk.alpacaOptionFeatures.minimumQuoteEvents &&
+    alpacaOptionFeatures.tradeEvents >= config.risk.alpacaOptionFeatures.minimumTradeEvents &&
+    Number.isFinite(alpacaOptionFeatures.confirmationScore) &&
+    Math.abs(alpacaOptionFeatures.confirmationScore) <= 1;
+  const alpacaFlowAdjustmentDollars = alpacaFlowEvidenceUsed
+    ? quantityMultiplier * Math.max(config.execution.optionTickSize, quote.askPrice - quote.bidPrice) *
+      config.risk.alpacaOptionFeatures.flowAdjustmentSpreadFraction *
+      alpacaOptionFeatures!.confirmationScore
+    : 0;
+  const lcbDollars = expectedChangeDollars - holdingCostDollars - uncertaintyDollars +
+    alpacaFlowAdjustmentDollars;
   const ivCrushDetected =
     currentIv !== undefined &&
     position.entryImpliedVolatility !== undefined &&
@@ -137,6 +157,9 @@ export function estimateOptionContinuation(
     holdingCostDollars,
     uncertaintyDollars,
     expectedChangeDollars,
+    alpacaFlowAdjustmentDollars,
+    ...(alpacaOptionFeatures ? { alpacaFlowScore: alpacaOptionFeatures.confirmationScore } : {}),
+    alpacaFlowEvidenceUsed,
     lcbDollars,
     ivCrushDetected,
     providerGreeksAvailable: hasProviderGreeks,

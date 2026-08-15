@@ -1,5 +1,6 @@
 import type { EngineConfig, FollowThroughScope } from "../config.js";
 import type { OptionStream } from "../alpaca/optionStream.js";
+import { AlpacaOptionFeatureEngine } from "../alpaca/optionFeatures.js";
 import type { StockStream } from "../alpaca/stockStream.js";
 import type { StockStreamEvent } from "../alpaca/stockStream.js";
 import type { TradingRestClient } from "../alpaca/restClient.js";
@@ -132,6 +133,7 @@ export class SpyOptionsTradingRuntime {
   readonly #stockReceiver: SpySipReceiver;
   readonly #restoredRuntimeState: RestoredRuntimeState;
   readonly #optionHealth: OpraQuoteHealthMonitor;
+  readonly #alpacaOptionFeatures: AlpacaOptionFeatureEngine;
   readonly #optionRestCircuit = new StaleQuoteCircuitBreaker();
   readonly #rawObservedQuotes = new WeakMap<OptionQuote, OpraQuoteObservation>();
   readonly #lastOptionRestFingerprints = new Map<string, string>();
@@ -195,6 +197,10 @@ export class SpyOptionsTradingRuntime {
     this.#optionHealth = new OpraQuoteHealthMonitor({
       executionMaxQuoteAgeMs: options.config.dataQuality.maxOptionQuoteAgeMs,
       transportTimeoutMs: OPTION_QUOTE_STALL_TIMEOUT_MS,
+    });
+    this.#alpacaOptionFeatures = new AlpacaOptionFeatureEngine({
+      windowMs: options.config.risk.alpacaOptionFeatures.windowMs,
+      maximumQuoteAgeMs: options.config.dataQuality.maxOptionQuoteAgeMs,
     });
     this.#executionTickMs = options.executionTickMs ?? 250;
     this.#onEvent = options.onEvent;
@@ -1210,8 +1216,10 @@ export class SpyOptionsTradingRuntime {
     }
     this.#subscribedSymbols = nextSymbols;
     this.#optionHealth.retainSymbols(nextSymbols);
+    this.#alpacaOptionFeatures.retainSymbols(nextSymbols);
     for (const snapshot of snapshots) {
       this.#book.updateSnapshot(snapshot);
+      this.#alpacaOptionFeatures.observeSnapshot(snapshot);
       this.#recordHistory("option_snapshot", snapshot.timestamp ?? timestamp, snapshot.symbol, { ...snapshot });
     }
     this.#emit("option_universe_refreshed", {
@@ -1351,6 +1359,13 @@ export class SpyOptionsTradingRuntime {
     await this.#optionStream.connect({
       onQuote: (quote) => this.#onOptionQuote(quote),
       onQuotes: (quotes) => this.#onOptionQuotes(quotes),
+      onRawEvents: (events) => {
+        for (const event of events) {
+          if (parseOccSymbol(event.value.symbol)?.underlying !== this.#config.symbol) continue;
+          if (event.type === "quote") this.#alpacaOptionFeatures.observeQuote(event.value);
+          else this.#alpacaOptionFeatures.observeTrade(event.value);
+        }
+      },
       onActivity: (activity) => this.#optionHealth.onAnyFrame(activity.receiveMonotonicTimestamp),
       onQuoteObservations: (observations) => {
         for (const observation of observations) {
@@ -1468,10 +1483,14 @@ export class SpyOptionsTradingRuntime {
     if (this.#marketDataIdle || !this.#marketOpen || !this.#executionEnabled || this.#execution.halted) return;
     const activeSymbol = this.#execution.position?.symbol ?? this.#execution.pending?.order.symbol;
     const optionSnapshot = activeSymbol ? this.#book.get(activeSymbol)?.snapshot : undefined;
+    const alpacaOptionFeatures = activeSymbol
+      ? this.#alpacaOptionFeatures.snapshot(activeSymbol, timestamp)
+      : undefined;
     this.#execution = await this.#orders.tick({
       timestamp,
       ...(optionQuote ? { optionQuote } : {}),
       ...(optionSnapshot ? { optionSnapshot } : {}),
+      ...(alpacaOptionFeatures ? { alpacaOptionFeatures } : {}),
       ...(this.#lastFeature ? { feature: this.#lastFeature } : {}),
       ...(this.#lastRegime ? { regime: this.#lastRegime } : {}),
       killSwitch: this.#killSwitch,

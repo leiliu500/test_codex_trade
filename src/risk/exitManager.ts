@@ -6,6 +6,7 @@ import type {
 import { isAtOrAfter } from "../utils/time.js";
 import { estimateOptionContinuation } from "./optionContinuation.js";
 import { firstPassageUpperProbability, TradeStateEstimator } from "./tradeStateEstimator.js";
+import type { AlpacaOptionFeatures } from "../alpaca/optionFeatures.js";
 
 export interface ExitContext {
   timestamp: number;
@@ -20,6 +21,7 @@ export interface ExitContext {
   continuationLcbDollars?: number;
   trendProbability?: number;
   optionSnapshot?: OptionSnapshot;
+  alpacaOptionFeatures?: AlpacaOptionFeatures;
 }
 
 /**
@@ -224,6 +226,7 @@ export class ExitManager {
         context.feature,
         context.timestamp,
         this.#config,
+        context.alpacaOptionFeatures,
       );
       position = continuation.position;
       if (continuation.exitReady) {

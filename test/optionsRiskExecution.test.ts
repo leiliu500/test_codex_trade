@@ -6,6 +6,8 @@ import { evaluateOptionCost, gammaAwareProjectedOptionMove } from "../src/option
 import { formatOccSymbol, parseOccSymbol } from "../src/options/occSymbol.js";
 import { RiskManager } from "../src/risk/riskManager.js";
 import { ExitManager } from "../src/risk/exitManager.js";
+import { estimateOptionContinuation } from "../src/risk/optionContinuation.js";
+import type { AlpacaOptionFeatures } from "../src/alpaca/optionFeatures.js";
 import { TradeStateEstimator } from "../src/risk/tradeStateEstimator.js";
 import { OrderExecutor, aggressionAtReplacement, limitInsideSpread, reconcileEntryExposure } from "../src/execution/orderExecutor.js";
 import { zonedDateTimeToEpoch } from "../src/utils/time.js";
@@ -258,6 +260,35 @@ test("the high late-entry cap leaves six restored fills executable", () => {
 const exitContext = (position: PositionState, timestamp: number, mid: number) => ({
   timestamp, position, optionQuote: { symbol: position.symbol, timestamp, bidPrice: mid - 0.01, askPrice: mid + 0.01, bidSize: 10, askSize: 10 }, killSwitch: false,
 });
+
+function alpacaFlow(symbol: string, timestamp: number, confirmationScore: number): AlpacaOptionFeatures {
+  return {
+    symbol,
+    timestamp,
+    windowMs: 5_000,
+    dataFresh: true,
+    quoteAgeMs: 0,
+    tradeAgeMs: 0,
+    quoteEvents: 3,
+    tradeEvents: 2,
+    mid: 2,
+    microprice: 2,
+    micropriceDisplacementBps: 0,
+    quoteImbalance: confirmationScore,
+    quoteOfi: confirmationScore,
+    spreadPct: 0.02,
+    spreadExpansionRatio: 1,
+    premiumMomentumBps: 0,
+    bidMomentumBps: 0,
+    tradeVolume: 100,
+    buyVolume: confirmationScore > 0 ? 100 : 0,
+    sellVolume: confirmationScore < 0 ? 100 : 0,
+    neutralVolume: 0,
+    tradeImbalance: confirmationScore,
+    tradeMomentumBps: 0,
+    confirmationScore,
+  };
+}
 
 function unifiedPosition(entryTimestamp: number, overrides: Partial<PositionState> = {}): PositionState {
   return {
@@ -1005,6 +1036,74 @@ test("Greeks continuation exits IV crush and theta drag despite a still-valid SP
   });
   assert.equal(decision.reason, "GREEKS_CONTINUATION_LCB_NON_POSITIVE");
   assert.ok(decision.triggers?.includes("CONTINUATION_LCB_NON_POSITIVE"));
+});
+
+test("fresh Alpaca option flow makes a bounded adjustment to the continuation LCB", () => {
+  const config = structuredClone(defaultConfig);
+  const timestamp = zonedDateTimeToEpoch("2026-07-22", "11:00:00");
+  const position = new RiskManager(config).createFilledPosition(
+    "SPY260722C00500000", "BULLISH", 1, 2, timestamp, 500,
+  );
+  const quote = {
+    symbol: position.symbol, timestamp: timestamp + 1_000,
+    bidPrice: 1.98, askPrice: 2.02, bidSize: 100, askSize: 100,
+  };
+  const snapshot = {
+    symbol: position.symbol,
+    timestamp: timestamp + 1_000,
+    impliedVolatility: 0.30,
+    greeks: { delta: 0, gamma: 0, theta: 0, vega: 0 },
+  };
+  const positive = estimateOptionContinuation(
+    position, quote, snapshot, undefined, timestamp + 1_000, config,
+    alpacaFlow(position.symbol, timestamp + 1_000, 1),
+  ).estimate!;
+  const negative = estimateOptionContinuation(
+    position, quote, snapshot, undefined, timestamp + 1_000, config,
+    alpacaFlow(position.symbol, timestamp + 1_000, -1),
+  ).estimate!;
+  const stale = estimateOptionContinuation(
+    position, quote, snapshot, undefined, timestamp + 1_000, config,
+    { ...alpacaFlow(position.symbol, timestamp + 1_000, 1), dataFresh: false },
+  ).estimate!;
+  const wrongContract = estimateOptionContinuation(
+    position, quote, snapshot, undefined, timestamp + 1_000, config,
+    alpacaFlow("SPY260722P00500000", timestamp + 1_000, 1),
+  ).estimate!;
+
+  assert.equal(positive.alpacaFlowEvidenceUsed, true);
+  assert.ok(positive.alpacaFlowAdjustmentDollars > 0);
+  assert.ok(negative.alpacaFlowAdjustmentDollars < 0);
+  assert.ok(positive.lcbDollars > negative.lcbDollars);
+  assert.equal(stale.alpacaFlowEvidenceUsed, false);
+  assert.equal(stale.alpacaFlowAdjustmentDollars, 0);
+  assert.equal(wrongContract.alpacaFlowEvidenceUsed, false);
+  assert.equal(wrongContract.alpacaFlowAdjustmentDollars, 0);
+  const maximumAdjustment = 100 * (quote.askPrice - quote.bidPrice) *
+    config.risk.alpacaOptionFeatures.flowAdjustmentSpreadFraction;
+  assert.ok(Math.abs(positive.alpacaFlowAdjustmentDollars) <= maximumAdjustment + 1e-9);
+});
+
+test("positive Alpaca option flow cannot override the hard loss boundary", () => {
+  const config = structuredClone(defaultConfig);
+  const timestamp = zonedDateTimeToEpoch("2026-07-22", "11:00:00");
+  const position = new RiskManager(config).createFilledPosition(
+    "SPY260722C00500000", "BULLISH", 1, 2, timestamp, 500,
+  );
+  const decision = new ExitManager(config).evaluate({
+    ...exitContext(position, timestamp + 1_000, position.stopPrice - 0.01),
+    optionSnapshot: {
+      symbol: position.symbol,
+      timestamp: timestamp + 1_000,
+      impliedVolatility: 0.30,
+      greeks: { delta: 1, gamma: 1, theta: 1, vega: 1 },
+    },
+    alpacaOptionFeatures: alpacaFlow(position.symbol, timestamp + 1_000, 1),
+  });
+
+  assert.equal(decision.exit, true);
+  assert.equal(decision.reason, "HARD_STOP");
+  assert.ok(decision.triggers?.includes("HARD_LOSS_BOUNDARY"));
 });
 
 test("a protected winner confirms negative option continuation faster", () => {

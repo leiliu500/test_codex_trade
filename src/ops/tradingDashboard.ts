@@ -1933,6 +1933,15 @@ function orderManagementFields(
     ...(numberValue(option.expectedChangeDollars) !== undefined
       ? { expectedChangeDollars: numberValue(option.expectedChangeDollars)! }
       : {}),
+    ...(numberValue(option.alpacaFlowAdjustmentDollars) !== undefined
+      ? { alpacaFlowAdjustmentDollars: numberValue(option.alpacaFlowAdjustmentDollars)! }
+      : {}),
+    ...(numberValue(option.alpacaFlowScore) !== undefined
+      ? { alpacaFlowScore: numberValue(option.alpacaFlowScore)! }
+      : {}),
+    ...(typeof option.alpacaFlowEvidenceUsed === "boolean"
+      ? { alpacaFlowEvidenceUsed: option.alpacaFlowEvidenceUsed }
+      : {}),
     ...(numberValue(option.lcbDollars) !== undefined
       ? { lcbDollars: numberValue(option.lcbDollars)! }
       : {}),
@@ -2194,7 +2203,7 @@ field('Observations',(x.pnlObservationCount??0)+' · '+(x.zeroCrossings??0)+' cr
 const managementDetails=[];
 if(x.managementReason)managementDetails.push('Reason: '+x.managementReason.replaceAll('_',' '));
 if((x.exitTriggers||[]).length)managementDetails.push('Triggers: '+x.exitTriggers.map(value=>value.replaceAll('_',' ')).join(' · '));
-if(x.optionContinuation){const o=x.optionContinuation,greeksStatus=o.providerGreeksAvailable===false?' · MODELED ONLY · NOT EXIT ELIGIBLE':o.providerGreeksAvailable===true?' · PROVIDER GREEKS':'';managementDetails.push('Greeks $: Δ '+optionalMoney(o.deltaDollars)+' · Γ '+optionalMoney(o.gammaDollars)+' · Vega '+optionalMoney(o.vegaDollars)+' · Theta '+optionalMoney(o.thetaDollars)+' · cost '+optionalMoney(o.holdingCostDollars)+' · uncertainty '+optionalMoney(o.uncertaintyDollars)+(o.ivCrushDetected?' · IV CRUSH':'')+greeksStatus)}
+if(x.optionContinuation){const o=x.optionContinuation,greeksStatus=o.providerGreeksAvailable===false?' · MODELED ONLY · NOT EXIT ELIGIBLE':o.providerGreeksAvailable===true?' · PROVIDER GREEKS':'',alpacaStatus=o.alpacaFlowEvidenceUsed?' · Alpaca flow '+percent(100*(o.alpacaFlowScore||0),1)+' · adjustment '+optionalMoney(o.alpacaFlowAdjustmentDollars):o.alpacaFlowScore===undefined?'':' · Alpaca flow warming';managementDetails.push('Greeks $: Δ '+optionalMoney(o.deltaDollars)+' · Γ '+optionalMoney(o.gammaDollars)+' · Vega '+optionalMoney(o.vegaDollars)+' · Theta '+optionalMoney(o.thetaDollars)+' · cost '+optionalMoney(o.holdingCostDollars)+' · uncertainty '+optionalMoney(o.uncertaintyDollars)+(o.ivCrushDetected?' · IV CRUSH':'')+greeksStatus+alpacaStatus)}
 management.append(managementHead,managementGrid);
 if(managementDetails.length)management.append(node('div','management-detail',managementDetails.join(' | ')));
 const fields=node('div','live-fields');

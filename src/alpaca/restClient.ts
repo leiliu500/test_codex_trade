@@ -1,5 +1,6 @@
 import type {
-  AccountState, OptionContract, OptionQuote, OptionSnapshot, PositionState, StockQuote, UnderlyingSymbol,
+  AccountState, OptionBar, OptionContract, OptionQuote, OptionSnapshot, PositionState, StockQuote,
+  UnderlyingSymbol,
 } from "../types.js";
 import type { OrderSide } from "../execution/orderExecutor.js";
 import { parseOccSymbol } from "../options/occSymbol.js";
@@ -10,6 +11,7 @@ import { marketDate } from "../utils/time.js";
 import { defaultConfig } from "../config.js";
 import { adaptAlpacaStockQuote } from "./stockStream.js";
 import { parseRfc3339ToMs } from "../marketData/opraQuoteHealth.js";
+import { adaptAlpacaOptionQuote, adaptAlpacaOptionTrade } from "./optionStream.js";
 
 export interface BrokerOrderRequest {
   clientOrderId: string;
@@ -182,10 +184,26 @@ export class AlpacaTradingRestClient implements MultiUnderlyingTradingRestClient
         this.#assertSameDaySymbol(symbol);
         const greeks = item.greeks as Record<string, unknown> | undefined;
         const dailyBar = item.dailyBar as Record<string, unknown> | undefined;
+        const minuteBar = item.minuteBar as Record<string, unknown> | undefined;
+        const previousDailyBar = item.prevDailyBar as Record<string, unknown> | undefined;
         const latestQuote = item.latestQuote as Record<string, unknown> | undefined;
+        const latestTrade = item.latestTrade as Record<string, unknown> | undefined;
+        const mappedLatestQuote = latestQuote
+          ? adaptAlpacaOptionQuote({ ...latestQuote, S: symbol }) : undefined;
+        const mappedLatestTrade = latestTrade
+          ? adaptAlpacaOptionTrade({ ...latestTrade, S: symbol }) : undefined;
+        const mappedMinuteBar = adaptAlpacaOptionBar(minuteBar);
+        const mappedDailyBar = adaptAlpacaOptionBar(dailyBar);
+        const mappedPreviousDailyBar = adaptAlpacaOptionBar(previousDailyBar);
+        const latestMarketTimestamp = [mappedLatestQuote?.timestamp, mappedLatestTrade?.timestamp]
+          .filter((value): value is number => value !== undefined)
+          .reduce<number | undefined>(
+            (latest, value) => latest === undefined ? value : Math.max(latest, value),
+            undefined,
+          );
         snapshots.push({
           symbol,
-          ...(latestQuote?.t ? { timestamp: Date.parse(String(latestQuote.t)) } : {}),
+          ...(latestMarketTimestamp !== undefined ? { timestamp: latestMarketTimestamp } : {}),
           ...(Number.isFinite(Number(item.impliedVolatility)) ? { impliedVolatility: Number(item.impliedVolatility) } : {}),
           ...(greeks ? { greeks: {
             ...(Number.isFinite(Number(greeks.delta)) ? { delta: Number(greeks.delta) } : {}),
@@ -193,7 +211,11 @@ export class AlpacaTradingRestClient implements MultiUnderlyingTradingRestClient
             ...(Number.isFinite(Number(greeks.theta)) ? { theta: Number(greeks.theta) } : {}),
             ...(Number.isFinite(Number(greeks.vega)) ? { vega: Number(greeks.vega) } : {}),
           } } : {}),
-          ...(Number.isFinite(Number(dailyBar?.v)) ? { dailyVolume: Number(dailyBar?.v) } : {}),
+          ...(mappedDailyBar ? { dailyVolume: mappedDailyBar.volume, dailyBar: mappedDailyBar } : {}),
+          ...(mappedLatestQuote ? { latestQuote: mappedLatestQuote } : {}),
+          ...(mappedLatestTrade ? { latestTrade: mappedLatestTrade } : {}),
+          ...(mappedMinuteBar ? { minuteBar: mappedMinuteBar } : {}),
+          ...(mappedPreviousDailyBar ? { previousDailyBar: mappedPreviousDailyBar } : {}),
         });
       }
     }
@@ -360,6 +382,24 @@ export class AlpacaTradingRestClient implements MultiUnderlyingTradingRestClient
     if (response.status === 204) return undefined as T;
     return await response.json() as T;
   }
+}
+
+function adaptAlpacaOptionBar(raw: Record<string, unknown> | undefined): OptionBar | undefined {
+  if (!raw) return undefined;
+  const timestamp = raw.t instanceof Date ? raw.t.getTime() :
+    typeof raw.t === "string" ? parseRfc3339ToMs(raw.t) : Number(raw.t);
+  const bar = {
+    timestamp,
+    open: Number(raw.o),
+    high: Number(raw.h),
+    low: Number(raw.l),
+    close: Number(raw.c),
+    volume: Number(raw.v),
+    ...(Number.isFinite(Number(raw.n)) ? { tradeCount: Number(raw.n) } : {}),
+    ...(Number.isFinite(Number(raw.vw)) ? { vwap: Number(raw.vw) } : {}),
+  };
+  return [bar.timestamp, bar.open, bar.high, bar.low, bar.close, bar.volume].every(Number.isFinite)
+    ? bar : undefined;
 }
 
 /**

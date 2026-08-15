@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { defaultConfig, qqqConfig } from "../src/config.js";
 import type {
-  AccountState, FeatureSnapshot, OptionContract, OptionQuote, OptionSnapshot, StockQuote, StockTrade,
+  AccountState, FeatureSnapshot, OptionContract, OptionQuote, OptionSnapshot, OptionTrade, StockQuote, StockTrade,
   TradeSignal, UnderlyingSymbol, WindowMetrics,
 } from "../src/types.js";
 import type {
@@ -97,6 +97,8 @@ test("shared SIP and OPRA hubs route events and union subscriptions without cros
   const qqqOptions: string[] = [];
   const spyObservations: string[] = [];
   const qqqObservations: string[] = [];
+  const spyRawEvents: string[] = [];
+  const qqqRawEvents: string[] = [];
   let spyActivities = 0;
   let qqqActivities = 0;
   const spyOptionChannel = optionHub.channel("SPY");
@@ -107,11 +109,13 @@ test("shared SIP and OPRA hubs route events and union subscriptions without cros
     spyOptionChannel.connect({
       ...optionCollector(spyOptions),
       onQuoteObservations: (observations) => spyObservations.push(...observations.map(({ quote }) => quote.symbol)),
+      onRawEvents: (events) => spyRawEvents.push(...events.map((event) => `${event.type}:${event.value.symbol}`)),
       onActivity: () => { spyActivities += 1; },
     }),
     qqqOptionChannel.connect({
       ...optionCollector(qqqOptions),
       onQuoteObservations: (observations) => qqqObservations.push(...observations.map(({ quote }) => quote.symbol)),
+      onRawEvents: (events) => qqqRawEvents.push(...events.map((event) => `${event.type}:${event.value.symbol}`)),
       onActivity: () => { qqqActivities += 1; },
     }),
   ]);
@@ -122,6 +126,12 @@ test("shared SIP and OPRA hubs route events and union subscriptions without cros
   assert.deepEqual(qqqOptions, [qqqOption]);
   assert.deepEqual(spyObservations, [spyOption]);
   assert.deepEqual(qqqObservations, [qqqOption]);
+  await option.emitTrades([
+    { symbol: spyOption, timestamp, price: 1.01, size: 10 },
+    { symbol: qqqOption, timestamp, price: 1.01, size: 20 },
+  ]);
+  assert.deepEqual(spyRawEvents, [`quote:${spyOption}`, `trade:${spyOption}`]);
+  assert.deepEqual(qqqRawEvents, [`quote:${qqqOption}`, `trade:${qqqOption}`]);
   assert.equal(spyActivities, 1);
   assert.equal(qqqActivities, 1);
   await spyOptionChannel.close();
@@ -415,7 +425,17 @@ class FakeOptionStream implements OptionStream {
     this.handlers?.onQuoteObservations?.(quotes.map((quote) => ({
       quote, receiveWallTimestamp: timestamp, receiveMonotonicTimestamp: timestamp,
     })));
+    this.handlers?.onRawEvents?.(
+      quotes.map((quote) => ({ type: "quote" as const, value: quote })),
+      { receiveWallTimestamp: timestamp, receiveMonotonicTimestamp: timestamp },
+    );
     await this.handlers?.onQuotes?.(quotes);
+  }
+  async emitTrades(trades: readonly OptionTrade[]): Promise<void> {
+    this.handlers?.onRawEvents?.(
+      trades.map((trade) => ({ type: "trade" as const, value: trade })),
+      { receiveWallTimestamp: timestamp, receiveMonotonicTimestamp: timestamp },
+    );
   }
 }
 

@@ -8,6 +8,7 @@ import { reconcileBrokerState } from "../alpaca/restClient.js";
 import { validateOptionQuote } from "../features/quoteSanitizer.js";
 import { sameDayOptionContractReasons } from "../options/tradingInvariants.js";
 import { ExitManager } from "../risk/exitManager.js";
+import type { AlpacaOptionFeatures } from "../alpaca/optionFeatures.js";
 import { RiskManager } from "../risk/riskManager.js";
 import type { DailyRiskState } from "../risk/riskManager.js";
 import type { PortfolioRiskCoordinator } from "../risk/portfolioRiskCoordinator.js";
@@ -79,6 +80,7 @@ export interface ExecutionTick {
   continuationLcbDollars?: number;
   trendProbability?: number;
   optionSnapshot?: OptionSnapshot;
+  alpacaOptionFeatures?: AlpacaOptionFeatures;
 }
 
 export interface EntryExecutionResult {
@@ -440,6 +442,9 @@ export class LiveOrderManager {
         ? { trendProbability: request.trendProbability }
         : {}),
       ...(request.optionSnapshot ? { optionSnapshot: request.optionSnapshot } : {}),
+      ...(request.alpacaOptionFeatures
+        ? { alpacaOptionFeatures: request.alpacaOptionFeatures }
+        : {}),
     };
     const decision = this.#exits.evaluate(context);
     this.#position = decision.updatedPosition;

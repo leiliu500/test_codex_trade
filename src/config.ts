@@ -230,6 +230,12 @@ export interface EngineConfig {
     continuationConfidenceZ: number;
     continuationSpreadCostFraction: number;
     ivCrushThreshold: number;
+    alpacaOptionFeatures: {
+      windowMs: number;
+      minimumQuoteEvents: number;
+      minimumTradeEvents: number;
+      flowAdjustmentSpreadFraction: number;
+    };
   };
 }
 
@@ -273,9 +279,18 @@ export function validateConfig(config: EngineConfig): void {
     config.risk.recoveredRetentionBonus,
     config.risk.timeRetentionBonus,
     config.risk.continuationSpreadCostFraction,
+    config.risk.alpacaOptionFeatures.flowAdjustmentSpreadFraction,
   ];
   if (fractions.some((x) => !Number.isFinite(x) || x < 0 || x > 1)) {
     throw new Error("Configuration contains a fraction outside [0, 1]");
+  }
+  if (!(Number.isFinite(config.risk.alpacaOptionFeatures.windowMs) &&
+        config.risk.alpacaOptionFeatures.windowMs >= 1_000 &&
+        Number.isInteger(config.risk.alpacaOptionFeatures.minimumQuoteEvents) &&
+        config.risk.alpacaOptionFeatures.minimumQuoteEvents >= 2 &&
+        Number.isInteger(config.risk.alpacaOptionFeatures.minimumTradeEvents) &&
+        config.risk.alpacaOptionFeatures.minimumTradeEvents >= 0)) {
+    throw new Error("Alpaca option exit feature thresholds are invalid");
   }
   if (!(config.regression.fastWindowSec < config.regression.mediumWindowSec &&
         config.regression.mediumWindowSec < config.regression.slowWindowSec)) {

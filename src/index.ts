@@ -43,6 +43,7 @@ export * from "./history/postgresHistory.js";
 export * from "./marketData/opraQuoteHealth.js";
 export * from "./alpaca/stockStream.js";
 export * from "./alpaca/optionStream.js";
+export * from "./alpaca/optionFeatures.js";
 export * from "./alpaca/restClient.js";
 export * from "./runtime/spySipReceiver.js";
 export * from "./runtime/spyOptionsTradingRuntime.js";
