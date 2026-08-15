@@ -10,7 +10,6 @@ import type {
 } from "../src/types.js";
 import { LiveOrderManager } from "../src/execution/liveOrderManager.js";
 import { MemoryRecorder } from "../src/ops/recorder.js";
-import { PortfolioRiskCoordinator } from "../src/risk/portfolioRiskCoordinator.js";
 import { RiskManager } from "../src/risk/riskManager.js";
 import { zonedDateTimeToEpoch } from "../src/utils/time.js";
 
@@ -28,13 +27,9 @@ class FakeTradingClient implements TradingRestClient {
   replaceCalls = 0;
   cancelCalls = 0;
   failNextSubmitAfterAccept = false;
-  advanceClockOnAccountMs = 0;
   #sequence = 0;
 
-  async getAccount(): Promise<AccountState> {
-    this.clock.timestamp += this.advanceClockOnAccountMs;
-    return { ...this.account };
-  }
+  async getAccount(): Promise<AccountState> { return { ...this.account }; }
   async getMarketClock(): Promise<{ timestamp: number; isOpen: boolean }> { return { ...this.clock }; }
   async listOptionContracts(): Promise<OptionContract[]> { return []; }
   async getOptionSnapshots(_symbols: readonly string[]): Promise<OptionSnapshot[]> { return []; }
@@ -154,55 +149,6 @@ test("production sizing submits exactly one option contract per entry order", as
   assert.equal(submitted.submitted, true);
   assert.equal(submitted.risk?.quantity, 1);
   assert.equal(client.requests[0]?.quantity, 1);
-});
-
-test("entry submission rejects a selected quote older than the strict execution limit", async () => {
-  const client = new FakeTradingClient();
-  const recorder = new MemoryRecorder();
-  const manager = new LiveOrderManager({ config: defaultConfig, client, recorder });
-  await manager.initialize(start);
-
-  const result = await manager.submitEntry({
-    timestamp: start,
-    signal: signal(),
-    candidate: candidate(),
-    quote: optionQuote(start - defaultConfig.execution.maxEntryQuoteAgeMs - 1),
-  });
-
-  assert.equal(result.submitted, false);
-  assert.deepEqual(result.reasons, ["ENTRY_QUOTE_TOO_OLD"]);
-  assert.equal(client.requests.length, 0);
-  assert.ok(recorder.events.some((event) =>
-    event.type === "entry_blocked" &&
-    event.data.stage === "PRE_SUBMISSION" &&
-    event.data.quoteAgeMs === defaultConfig.execution.maxEntryQuoteAgeMs + 1));
-});
-
-test("entry quote freshness is checked again immediately before broker submission", async () => {
-  const client = new FakeTradingClient();
-  client.advanceClockOnAccountMs = defaultConfig.execution.maxEntryQuoteAgeMs + 1;
-  const portfolioRisk = new PortfolioRiskCoordinator({
-    timeZone: defaultConfig.timeZone,
-    maxConcurrentPositions: 6,
-    maxPositionsPerUnderlying: 3,
-    maxAggregateRiskDollars: 3_000,
-    maxAggregatePremiumDollars: 9_000,
-    maxDailyLossDollars: 1_000,
-  }, start);
-  const manager = new LiveOrderManager({ config: defaultConfig, client, portfolioRisk });
-  await manager.initialize(start);
-
-  const result = await manager.submitEntry({
-    timestamp: start,
-    signal: signal(),
-    candidate: candidate(),
-    quote: optionQuote(start),
-  });
-
-  assert.equal(result.submitted, false);
-  assert.deepEqual(result.reasons, ["ENTRY_QUOTE_TOO_OLD"]);
-  assert.equal(client.requests.length, 0);
-  assert.equal((await portfolioRisk.snapshot(start)).activePositions, 0);
 });
 
 test("live manager submits an option entry, reconciles partial fill, cancels remainder, and hard-stops exposure", async () => {

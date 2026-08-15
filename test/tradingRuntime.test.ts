@@ -458,38 +458,6 @@ test("OPRA quote silence fails readiness and reconnects the option stream", asyn
   await runtime.close();
 });
 
-test("runtime OPRA health applies the configured clock correction", async () => {
-  let decisionTime = now;
-  const client = new FakeRuntimeClient();
-  const optionStream = new FakeOptionStream();
-  const runtime = new SpyOptionsTradingRuntime({
-    config: defaultConfig,
-    client,
-    stockStream: new FakeStockStream(),
-    optionStream,
-    executionEnabled: true,
-    executionMode: "paper",
-    now: () => decisionTime,
-    monotonicNow: () => decisionTime,
-    marketDataClockOffsetMs: 75,
-    executionTickMs: 10,
-  });
-  await runtime.start();
-  await optionStream.quote({
-    symbol: callSymbol,
-    timestamp: decisionTime - 100,
-    bidPrice: 1.995,
-    askPrice: 2.005,
-    bidSize: 100,
-    askSize: 100,
-  });
-
-  const health = runtime.healthState();
-  assert.equal(health.lastOptionQuoteProviderAgeMs, 25);
-  assert.equal(health.optionMedianArrivalLagMs, 25);
-  await runtime.close();
-});
-
 test("an inactive exact OPRA contract is distinguished from provider delay and does not reconnect globally", async () => {
   let decisionTime = now;
   const client = new FakeRuntimeClient();

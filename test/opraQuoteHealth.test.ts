@@ -2,7 +2,6 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   assessRestQuote,
-  correctedProviderLatencyMs,
   OpraQuoteHealthMonitor,
   parseRfc3339ToMs,
   StaleQuoteCircuitBreaker,
@@ -22,26 +21,6 @@ test("RFC-3339 option timestamps retain millisecond meaning when Alpaca supplies
     Date.parse("2026-08-10T13:41:11.791Z"),
   );
   assert.throws(() => parseRfc3339ToMs("not-a-timestamp"), /Invalid RFC-3339/);
-});
-
-test("provider latency uses one signed local-minus-provider clock correction", () => {
-  assert.equal(correctedProviderLatencyMs(1_000_100, 1_000_000, 75), 25);
-  assert.equal(correctedProviderLatencyMs(1_000_050, 1_000_000, 75), -25);
-
-  const monitor = new OpraQuoteHealthMonitor({
-    executionMaxQuoteAgeMs: 2_000,
-    clockOffsetMs: 75,
-  });
-  monitor.reset(0);
-  monitor.onWebSocketQuote({
-    quote: quote("SPY1", 1_000_000),
-    receiveWallTimestamp: 1_000_100,
-    receiveMonotonicTimestamp: 100,
-  });
-  const health = monitor.diagnose("SPY1", 1_000_100, 100);
-  assert.equal(health.latestProviderAgeMs, 25);
-  assert.equal(health.medianArrivalLagMs, 25);
-  assert.equal(assessRestQuote(quote("SPY1", 1_000_000), 1_000_100, 2_000, 75).providerAgeMs, 25);
 });
 
 test("OPRA health separates no data, fresh data, exact-contract inactivity, and transport silence", () => {

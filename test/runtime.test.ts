@@ -18,12 +18,10 @@ test("runtime environment is paper-safe and validates the health listener", () =
     marketDataEnabled: false,
     stockDataFeed: "sip",
     optionDataFeed: "opra",
-    optionDataProvider: "massive",
     tradingSymbols: ["SPY"],
     historyDatabaseEnabled: false,
     historyQuoteSampleMs: 250,
     historyRetentionDays: 7,
-    marketDataClockOffsetMs: 0,
     killSwitch: false,
     healthHost: "127.0.0.1",
     healthPort: 3001,
@@ -32,11 +30,8 @@ test("runtime environment is paper-safe and validates the health listener", () =
   assert.throws(() => readEnvironment({ HEALTH_PORT: "not-a-port" }), /HEALTH_PORT/);
   assert.throws(() => readEnvironment({ MARKET_HISTORY_QUOTE_SAMPLE_MS: "-1" }), /QUOTE_SAMPLE/);
   assert.throws(() => readEnvironment({ MARKET_HISTORY_RETENTION_DAYS: "3.5" }), /RETENTION_DAYS/);
-  assert.throws(() => readEnvironment({ MARKET_DATA_CLOCK_OFFSET_MS: "NaN" }), /CLOCK_OFFSET/);
-  assert.throws(() => readEnvironment({ MARKET_DATA_CLOCK_OFFSET_MS: "10001" }), /CLOCK_OFFSET/);
   assert.throws(() => readEnvironment({ STOCK_DATA_FEED: "iex" }), /hard-limited.*SIP/i);
   assert.throws(() => readEnvironment({ OPTION_DATA_FEED: "indicative" }), /OPRA/i);
-  assert.throws(() => readEnvironment({ OPTION_DATA_PROVIDER: "unknown" }), /OPTION_DATA_PROVIDER/);
   assert.throws(() => readEnvironment({ ENABLE_LIVE_ORDERS: "true" }), /MARKET_DATA_ENABLED/);
   assert.throws(() => readEnvironment({ HISTORY_DATABASE_ENABLED: "true" }), /DATABASE_URL/);
   assert.throws(() => readEnvironment({ MARKET_DATA_ENABLED: "true" }), /ALPACA_API_KEY/);
@@ -44,19 +39,6 @@ test("runtime environment is paper-safe and validates the health listener", () =
   assert.equal(readEnvironment({
     MARKET_DATA_ENABLED: "true", ALPACA_API_KEY: "key", ALPACA_API_SECRET: "secret",
   }).marketDataEnabled, true);
-  assert.equal(readEnvironment({ MARKET_DATA_CLOCK_OFFSET_MS: "-12.5" }).marketDataClockOffsetMs, -12.5);
-  assert.throws(() => readEnvironment({
-    MARKET_DATA_ENABLED: "true", ENABLE_LIVE_ORDERS: "true",
-    ALPACA_API_KEY: "key", ALPACA_API_SECRET: "secret",
-  }), /MASSIVE_API_KEY/);
-  assert.equal(readEnvironment({
-    MARKET_DATA_ENABLED: "true", ENABLE_LIVE_ORDERS: "true",
-    ALPACA_API_KEY: "key", ALPACA_API_SECRET: "secret", MASSIVE_API_KEY: "massive-key",
-  }).optionDataProvider, "massive");
-  assert.equal(readEnvironment({
-    MARKET_DATA_ENABLED: "true", ENABLE_LIVE_ORDERS: "true", OPTION_DATA_PROVIDER: "alpaca",
-    ALPACA_API_KEY: "key", ALPACA_API_SECRET: "secret",
-  }).optionDataProvider, "alpaca");
 });
 
 test("health server exposes liveness while paper-idle readiness is degraded", async (context) => {

@@ -27,10 +27,6 @@ test("configuration cannot enable later-dated or overnight option trading", () =
   invalidOptionSelectionRetry.execution.optionSelectionRetryMs =
     invalidOptionSelectionRetry.execution.entrySignalTtlMs + 1;
   assert.throws(() => validateConfig(invalidOptionSelectionRetry), /Order-management TTL/);
-  const invalidEntryQuoteAge = structuredClone(defaultConfig);
-  invalidEntryQuoteAge.execution.maxEntryQuoteAgeMs =
-    invalidEntryQuoteAge.dataQuality.maxOptionQuoteAgeMs + 1;
-  assert.throws(() => validateConfig(invalidEntryQuoteAge), /Order-management TTL/);
   const invalidConfirmation = structuredClone(defaultConfig);
   invalidConfirmation.signals.followThroughMinSec = 16;
   invalidConfirmation.signals.followThroughMaxSec = 15;
