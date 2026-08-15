@@ -54,7 +54,7 @@ test("startup history recovery converts a broker-filled exit into durable termin
   const result = await recoverTerminalDashboardOrders(
     client,
     [exitCard()],
-    { SPY: "spy-test", QQQ: "qqq-test", GOOGL: "googl-test" },
+    { SPY: "spy-test", QQQ: "qqq-test" },
     "America/New_York",
   );
 
@@ -82,7 +82,7 @@ test("terminal unfilled orders update status without inventing an exit fill", as
   const result = await recoverTerminalDashboardOrders(
     client,
     [exitCard()],
-    { SPY: "spy-test", QQQ: "qqq-test", GOOGL: "googl-test" },
+    { SPY: "spy-test", QQQ: "qqq-test" },
     "America/New_York",
   );
   assert.deepEqual(result.events.map((event) => event.type), ["broker_order_state"]);

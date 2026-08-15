@@ -1,13 +1,7 @@
 export type Direction = "BULLISH" | "BEARISH";
 export type SignalKind = "IMPULSE" | "GRIND";
 export type OptionType = "call" | "put";
-export const UNDERLYING_SYMBOLS = ["SPY", "QQQ", "GOOGL"] as const;
-export type UnderlyingSymbol = typeof UNDERLYING_SYMBOLS[number];
-
-export function isUnderlyingSymbol(value: unknown): value is UnderlyingSymbol {
-  return typeof value === "string" &&
-    (UNDERLYING_SYMBOLS as readonly string[]).includes(value);
-}
+export type UnderlyingSymbol = "SPY" | "QQQ";
 
 export interface StockQuote {
   symbol: UnderlyingSymbol;

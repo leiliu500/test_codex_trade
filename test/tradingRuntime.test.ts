@@ -37,7 +37,6 @@ test("option universe readiness follows the 0DTE cutoff while protecting open ex
   assert.equal(optionUniverseRequired(afterCutoff, true, false, defaultConfig), false);
   assert.equal(optionUniverseRequired(afterCutoff, true, true, defaultConfig), true);
   assert.equal(optionUniverseRequired(beforeCutoff, false, true, defaultConfig), false);
-  assert.equal(optionUniverseRequired(beforeCutoff, true, false, defaultConfig, false), false);
 });
 
 class FakeStockStream implements StockStream {
@@ -290,38 +289,6 @@ test("market-closed startup remains idle without SIP, OPRA, universe, or strateg
   await runtime.ingestFeature({ ...bullishFeature(), timestamp: closedAt });
   assert.equal(recorder.events.length, eventCount);
   assert.ok(recorder.events.some((event) => event.type === "market_session_idle"));
-  await runtime.close();
-});
-
-test("an empty same-day option chain is a healthy non-trading runtime state", async () => {
-  const client = new FakeRuntimeClient();
-  client.contractList = [];
-  const recorder = new MemoryRecorder();
-  const emitted: Array<{ type: string; data: Record<string, unknown> }> = [];
-  const runtime = new SpyOptionsTradingRuntime({
-    config: defaultConfig,
-    client,
-    stockStream: new FakeStockStream(),
-    optionStream: new FakeOptionStream(),
-    executionEnabled: true,
-    executionMode: "paper",
-    now: () => now,
-    monotonicNow: () => now,
-    executionTickMs: 10,
-    recorder,
-    onEvent: (type, data) => emitted.push({ type, data }),
-    requireStrategyRecovery: true,
-  });
-  await runtime.start();
-  const health = runtime.healthState();
-  assert.equal(health.ready, true);
-  assert.equal(health.optionSameDayContractsAvailable, false);
-  assert.equal(health.optionSubscriptionsRequired, false);
-  assert.equal(health.subscribedOptionContracts, 0);
-  assert.equal(health.strategyStateReady, true);
-  assert.equal(health.strategyStateStatus, "NO_SAME_DAY_OPTION_CONTRACTS");
-  assert.ok(emitted.some((event) => event.type === "option_universe_refreshed" &&
-    event.data.sameDayOptionContractsAvailable === false));
   await runtime.close();
 });
 

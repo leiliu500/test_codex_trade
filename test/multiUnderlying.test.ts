@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { defaultConfig, googlConfig, qqqConfig } from "../src/config.js";
+import { defaultConfig, qqqConfig } from "../src/config.js";
 import type {
   AccountState, FeatureSnapshot, OptionContract, OptionQuote, OptionSnapshot, StockQuote, StockTrade,
   TradeSignal, UnderlyingSymbol, WindowMetrics,
@@ -27,7 +27,6 @@ const date = "2026-07-22";
 const timestamp = zonedDateTimeToEpoch(date, "10:20:00");
 const spyOption = "SPY260722C00500000";
 const qqqOption = "QQQ260722C00600000";
-const googlOption = "GOOGL260722C00190000";
 
 test("QQQ has an independent configuration and rejects SPY contracts without mutating SPY", () => {
   assert.equal(defaultConfig.symbol, "SPY");
@@ -46,22 +45,6 @@ test("QQQ has an independent configuration and rejects SPY contracts without mut
   assert.deepEqual(sameDayOptionContractReasons(qqq, timestamp, qqqConfig.timeZone, "QQQ"), []);
   assert.deepEqual(sameDayOptionContractReasons(spy, timestamp, qqqConfig.timeZone, "QQQ"), ["WRONG_UNDERLYING"]);
   assert.deepEqual(sameDayOptionContractReasons(spy, timestamp, defaultConfig.timeZone, "SPY"), []);
-});
-
-test("GOOGL has an isolated options-only paper configuration", () => {
-  assert.equal(googlConfig.symbol, "GOOGL");
-  assert.notEqual(googlConfig.version, defaultConfig.version);
-  assert.equal(googlConfig.options.expirationDaysMin, 0);
-  assert.equal(googlConfig.options.expirationDaysMax, 0);
-  assert.equal(googlConfig.risk.maxContracts, 1);
-  assert.equal(googlConfig.risk.maxPositionsPerUnderlying, 3);
-  const contract: OptionContract = {
-    symbol: googlOption, underlying: "GOOGL", expirationDate: date, strike: 190,
-    type: "call", active: true, tradable: true,
-  };
-  assert.deepEqual(sameDayOptionContractReasons(
-    contract, timestamp, googlConfig.timeZone, "GOOGL",
-  ), []);
 });
 
 test("feature engines stamp their own underlying and restoration state remains isolated", () => {
@@ -289,7 +272,7 @@ test("dashboard forward-move diagnostics never compare QQQ evaluations with SPY 
   assert.equal(misses[0]?.forwardPrice, 601);
 });
 
-test("dashboard exposes complete independent SPY, QQQ, and GOOGL views", () => {
+test("dashboard exposes complete independent SPY and QQQ views", () => {
   const store = new TradingDashboardStore(timestamp, false, 0, 0, () => timestamp + 5_000);
   store.record(audit("live_signal_selection", "SPY", {
     signalId: "spy-dashboard-signal", timestamp, direction: "BULLISH", kind: "IMPULSE",
@@ -338,7 +321,6 @@ test("dashboard exposes complete independent SPY, QQQ, and GOOGL views", () => {
   assert.equal(snapshot.performance.signalsFired, 2);
   assert.equal(snapshot.underlyingViews.SPY.performance.signalsFired, 1);
   assert.equal(snapshot.underlyingViews.QQQ.performance.signalsFired, 1);
-  assert.equal(snapshot.underlyingViews.GOOGL.performance.signalsFired, 0);
   assert.equal(snapshot.performance.realizedPnl, 15);
   assert.equal(snapshot.underlyingViews.SPY.performance.realizedPnl, 20);
   assert.equal(snapshot.underlyingViews.QQQ.performance.realizedPnl, -5);

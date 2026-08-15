@@ -100,9 +100,6 @@ test("dashboard exposes liveness and feed tabs before any entries, orders, or hi
   assert.match(html, /REST diagnostic/);
   assert.match(html, /h\.optionQuoteStalled/);
   assert.match(html, /h\.optionSubscriptionsRequired/);
-  assert.match(html, /h\.optionSameDayContractsAvailable/);
-  assert.match(html, /GOOGL only/);
-  assert.match(html, /NO SAME-DAY OPTION CONTRACTS/);
   assert.match(html, /opraSubscriptionIdle/);
   assert.match(html, /ENTRY CUTOFF · NO ACTIVE EXPOSURE/);
   assert.match(html, /session WS quotes/);

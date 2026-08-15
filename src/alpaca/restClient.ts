@@ -1,7 +1,5 @@
-import {
-  isUnderlyingSymbol,
-  type AccountState, type OptionContract, type OptionQuote, type OptionSnapshot, type PositionState,
-  type StockQuote, type UnderlyingSymbol,
+import type {
+  AccountState, OptionContract, OptionQuote, OptionSnapshot, PositionState, StockQuote, UnderlyingSymbol,
 } from "../types.js";
 import type { OrderSide } from "../execution/orderExecutor.js";
 import { parseOccSymbol } from "../options/occSymbol.js";
@@ -338,7 +336,7 @@ export class AlpacaTradingRestClient implements MultiUnderlyingTradingRestClient
       throw new Error(`Broker state contains a non-compliant position/order ${symbol}: ${reasons.join(",")}`);
     }
     const underlying = parsed?.underlying;
-    if (!isUnderlyingSymbol(underlying)) {
+    if (underlying !== "SPY" && underlying !== "QQQ") {
       throw new Error(`Broker state contains a non-compliant position/order ${symbol}: WRONG_UNDERLYING`);
     }
     this.#assertEnabledUnderlying(underlying);

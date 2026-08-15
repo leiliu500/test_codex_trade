@@ -2,7 +2,7 @@ import type { MultiUnderlyingTradingRestClient } from "../alpaca/restClient.js";
 import type { AuditEvent } from "../ops/recorder.js";
 import type { DashboardOrderCard } from "../ops/orderCards.js";
 import { parseOccSymbol } from "../options/occSymbol.js";
-import { isUnderlyingSymbol, type UnderlyingSymbol } from "../types.js";
+import type { UnderlyingSymbol } from "../types.js";
 import { marketDate } from "../utils/time.js";
 
 const TERMINAL_ORDER_STATUSES = new Set([
@@ -38,7 +38,7 @@ export async function recoverTerminalDashboardOrders(
       const status = broker.status.toLowerCase();
       if (!TERMINAL_ORDER_STATUSES.has(status)) continue;
       const underlying = parseOccSymbol(card.symbol)?.underlying;
-      if (!isUnderlyingSymbol(underlying)) {
+      if (underlying !== "SPY" && underlying !== "QQQ") {
         errors.push(`Cannot recover non-OCC dashboard order ${card.symbol}`);
         continue;
       }

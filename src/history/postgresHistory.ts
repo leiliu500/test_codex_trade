@@ -81,9 +81,6 @@ CREATE INDEX IF NOT EXISTS market_events_symbol_provider_idx
 CREATE INDEX IF NOT EXISTS market_events_quote_retention_idx
   ON market_events (market_date, id)
   WHERE event_type IN ('stock_quote', 'option_quote');
-CREATE INDEX IF NOT EXISTS market_events_stock_recovery_idx
-  ON market_events (market_date, symbol, id)
-  WHERE event_type IN ('stock_quote', 'stock_trade');
 
 CREATE TABLE IF NOT EXISTS audit_events (
   id BIGSERIAL PRIMARY KEY,
@@ -583,12 +580,13 @@ export class PostgresHistoryStore implements HistoryStore, AuditRecorder {
     endReceivedTimestamp: number,
     quoteStartReceivedTimestamp?: number,
     batchSize = 20_000,
-    underlying?: UnderlyingSymbol,
   ): AsyncIterable<readonly HistoricalMarketEvent[]> {
     if (!(endReceivedTimestamp >= startReceivedTimestamp)) return;
     const boundedBatchSize = Math.max(100, Math.min(50_000, Math.floor(batchSize)));
     let afterId = 0;
     while (true) {
+      const quoteFilter = quoteStartReceivedTimestamp === undefined
+        ? "" : "AND (event_type = 'stock_trade' OR received_timestamp >= $6)";
       const result = await this.#client.query<StockHistoryRow>(
         `SELECT id, event_type, received_timestamp, provider_timestamp, market_date, symbol, data
          FROM market_events
@@ -597,12 +595,11 @@ export class PostgresHistoryStore implements HistoryStore, AuditRecorder {
            AND received_timestamp >= $2
            AND received_timestamp <= $3
            AND id > $4
-           AND ($6::bigint IS NULL OR event_type = 'stock_trade' OR received_timestamp >= $6)
-           AND ($7::text IS NULL OR symbol = $7)
+           ${quoteFilter}
          ORDER BY id ASC
          LIMIT $5`,
         [marketDate, startReceivedTimestamp, endReceivedTimestamp, afterId, boundedBatchSize,
-          quoteStartReceivedTimestamp ?? null, underlying ?? null],
+          ...(quoteStartReceivedTimestamp !== undefined ? [quoteStartReceivedTimestamp] : [])],
       );
       if (result.rows.length === 0) return;
       const events = result.rows.map((row) => {

@@ -2,7 +2,7 @@ import { createWriteStream } from "node:fs";
 import { once } from "node:events";
 import { loadDotEnv } from "../utils/loadDotEnv.js";
 import { PostgresHistoryStore } from "../history/postgresHistory.js";
-import { isUnderlyingSymbol } from "../types.js";
+import type { UnderlyingSymbol } from "../types.js";
 
 loadDotEnv();
 
@@ -14,10 +14,10 @@ const positional = args.filter((argument) => !argument.startsWith("--symbol="));
 const marketDate = positional[0];
 const outputPath = positional[1];
 if (!marketDate || !/^\d{4}-\d{2}-\d{2}$/.test(marketDate)) {
-  throw new Error("Usage: npm run export:history -- YYYY-MM-DD [output.jsonl] [--symbol=SPY|QQQ|GOOGL]");
+  throw new Error("Usage: npm run export:history -- YYYY-MM-DD [output.jsonl] [--symbol=SPY|QQQ]");
 }
-if (!isUnderlyingSymbol(symbolValue)) throw new Error(`Unknown export symbol: ${symbolValue}`);
-const underlying = symbolValue;
+if (symbolValue !== "SPY" && symbolValue !== "QQQ") throw new Error(`Unknown export symbol: ${symbolValue}`);
+const underlying = symbolValue as UnderlyingSymbol;
 const connectionString = process.env.DATABASE_URL;
 if (!connectionString) throw new Error("DATABASE_URL is required to export PostgreSQL history");
 
