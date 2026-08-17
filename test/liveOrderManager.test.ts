@@ -134,7 +134,7 @@ function candidate(): OptionCandidateEvaluation {
   };
 }
 
-test("production sizing submits exactly one option contract per entry order", async () => {
+test("production sizing submits no more than the three-contract cap", async () => {
   const client = new FakeTradingClient();
   const manager = new LiveOrderManager({ config: defaultConfig, client });
   await manager.initialize(start);
@@ -147,22 +147,22 @@ test("production sizing submits exactly one option contract per entry order", as
   });
 
   assert.equal(submitted.submitted, true);
-  assert.equal(submitted.risk?.quantity, 1);
-  assert.equal(client.requests[0]?.quantity, 1);
+  assert.equal(submitted.risk?.quantity, 3);
+  assert.equal(client.requests[0]?.quantity, 3);
 });
 
 test("live manager submits an option entry, reconciles partial fill, cancels remainder, and hard-stops exposure", async () => {
   const client = new FakeTradingClient();
   const recorder = new MemoryRecorder();
   const partialFillConfig = structuredClone(defaultConfig);
-  // Exercise multi-fill reconciliation independently of the production one-contract configuration invariant.
-  partialFillConfig.risk.maxContracts = 5;
+  // Exercise multi-fill reconciliation with the production multi-contract cap.
+  partialFillConfig.risk.maxContracts = 3;
   const manager = new LiveOrderManager({ config: partialFillConfig, client, recorder });
   await manager.initialize(start);
 
   const submitted = await manager.submitEntry({ timestamp: start, signal: signal(), candidate: candidate(), quote: optionQuote(start) });
   assert.equal(submitted.submitted, true);
-  assert.equal(submitted.risk?.quantity, 5);
+  assert.equal(submitted.risk?.quantity, 3);
   assert.equal(client.requests[0]?.symbol, symbol);
   assert.equal(client.requests[0]?.timeInForce, "day");
 
@@ -218,7 +218,7 @@ test("trailing protection locks a configured profit floor after activation", asy
   assert.equal(state.pending?.exitReason, "PROFIT_FLOOR_EXIT");
   assert.equal(state.pending?.order.marketable, true);
 
-  client.fill(state.pending!.brokerOrderId, 1, 2.02, "filled");
+  client.fill(state.pending!.brokerOrderId, state.pending!.order.requestedQuantity, 2.02, "filled");
   state = await manager.tick({ timestamp: start + 1_000, optionQuote: optionQuote(start + 1_000, 2.01, 2.03) });
   assert.equal(state.position, undefined);
   assert.deepEqual(completedExits, [{
@@ -226,7 +226,7 @@ test("trailing protection locks a configured profit floor after activation", asy
     entryTimestamp: start + 400,
     direction: "BULLISH",
     reason: "PROFIT_FLOOR_EXIT",
-    realizedPnl: 2.0000000000000018,
+    realizedPnl: 6.000000000000005,
   }]);
 });
 
@@ -241,7 +241,7 @@ test("unchanged quote-batch evaluations do not flood durable management history"
     candidate: candidate(),
     quote: optionQuote(start),
   });
-  client.fill(submitted.brokerOrder!.id, 1, 2, "filled");
+  client.fill(submitted.brokerOrder!.id, submitted.risk!.quantity, 2, "filled");
   await manager.tick({
     timestamp: start + 400,
     optionQuote: optionQuote(start + 400),
@@ -442,7 +442,7 @@ test("rejected exits retain one logical intent and retry until broker-confirmed 
     candidate: candidate(),
     quote: optionQuote(start),
   });
-  client.fill(submitted.brokerOrder!.id, 1, 2, "filled");
+  client.fill(submitted.brokerOrder!.id, submitted.risk!.quantity, 2, "filled");
   await manager.tick({ timestamp: start + 400, optionQuote: optionQuote(start + 400) });
 
   let state = await manager.tick({
@@ -465,7 +465,7 @@ test("rejected exits retain one logical intent and retry until broker-confirmed 
   assert.notEqual(state.pending?.brokerOrderId, rejectedOrderId);
   assert.equal(client.requests.filter((request) => request.side === "sell").length, 2);
 
-  client.fill(state.pending!.brokerOrderId, 1, 1.38, "filled");
+  client.fill(state.pending!.brokerOrderId, state.pending!.order.requestedQuantity, 1.38, "filled");
   state = await manager.tick({
     timestamp: start + 1_600,
     optionQuote: optionQuote(start + 1_600, 1.37, 1.39),

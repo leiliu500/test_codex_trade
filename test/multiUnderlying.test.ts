@@ -32,7 +32,8 @@ test("QQQ has an independent configuration and rejects SPY contracts without mut
   assert.equal(defaultConfig.symbol, "SPY");
   assert.equal(qqqConfig.symbol, "QQQ");
   assert.notEqual(qqqConfig.version, defaultConfig.version);
-  assert.equal(qqqConfig.risk.maxContracts, 1);
+  assert.equal(defaultConfig.risk.maxContracts, 3);
+  assert.equal(qqqConfig.risk.maxContracts, 3);
   assert.equal(qqqConfig.risk.onePositionAtATime, true);
   const qqq: OptionContract = {
     symbol: qqqOption, underlying: "QQQ", expirationDate: date, strike: 600,
@@ -227,7 +228,7 @@ test("live order managers share the portfolio reservation before broker submissi
   const coordinator = new PortfolioRiskCoordinator({
     timeZone: defaultConfig.timeZone,
     maxConcurrentUnderlyings: 2,
-    maxAggregateRiskDollars: 75,
+    maxAggregateRiskDollars: 225,
     maxAggregatePremiumDollars: 1_000,
     maxDailyLossDollars: 1_000,
   }, timestamp);
@@ -245,7 +246,7 @@ test("live order managers share the portfolio reservation before broker submissi
   assert.equal(qqqBroker.requests.length, 0);
 });
 
-test("QQQ serializes concurrent entries to one one-contract broker order", async () => {
+test("QQQ serializes concurrent entries to one three-contract broker order", async () => {
   const broker = new FlatUnderlyingBroker("QQQ", qqqOption);
   const manager = new LiveOrderManager({ config: qqqConfig, client: broker });
   await manager.initialize(timestamp);
@@ -267,7 +268,7 @@ test("QQQ serializes concurrent entries to one one-contract broker order", async
   assert.equal(second.submitted, false);
   assert.ok(second.reasons.includes("ORDER_ALREADY_PENDING"));
   assert.equal(broker.requests.length, 1);
-  assert.equal(broker.requests[0]?.quantity, 1);
+  assert.equal(broker.requests[0]?.quantity, 3);
 });
 
 test("dashboard forward-move diagnostics never compare QQQ evaluations with SPY prices", () => {

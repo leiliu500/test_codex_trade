@@ -1,5 +1,5 @@
 {
-  "version": "spy-0dte-entry-confirmation-26-alpaca-option-exits",
+  "version": "spy-0dte-entry-confirmation-27-three-contract-cap",
   "symbol": "SPY",
   "timeZone": "America/New_York",
   "session": {
@@ -177,7 +177,7 @@
     "riskFractionOfEquity": 0.0025,
     "maxRiskDollarsPerTrade": 500,
     "maxPremiumDollarsPerTrade": 1500,
-    "maxContracts": 1,
+    "maxContracts": 3,
     "maxTradesPerDay": 1000,
     "maxDailyLossDollars": 1000,
     "hardOptionStopPct": 0.25,
