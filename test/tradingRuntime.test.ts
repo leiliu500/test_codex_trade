@@ -37,7 +37,6 @@ test("option universe readiness follows the 0DTE cutoff while protecting open ex
   assert.equal(optionUniverseRequired(afterCutoff, true, false, defaultConfig), false);
   assert.equal(optionUniverseRequired(afterCutoff, true, true, defaultConfig), true);
   assert.equal(optionUniverseRequired(beforeCutoff, false, true, defaultConfig), false);
-  assert.equal(optionUniverseRequired(beforeCutoff, true, false, defaultConfig, false), false);
 });
 
 class FakeStockStream implements StockStream {
@@ -293,38 +292,6 @@ test("market-closed startup remains idle without SIP, OPRA, universe, or strateg
   await runtime.close();
 });
 
-test("an empty same-day option chain is a healthy non-trading runtime state", async () => {
-  const client = new FakeRuntimeClient();
-  client.contractList = [];
-  const recorder = new MemoryRecorder();
-  const emitted: Array<{ type: string; data: Record<string, unknown> }> = [];
-  const runtime = new SpyOptionsTradingRuntime({
-    config: defaultConfig,
-    client,
-    stockStream: new FakeStockStream(),
-    optionStream: new FakeOptionStream(),
-    executionEnabled: true,
-    executionMode: "paper",
-    now: () => now,
-    monotonicNow: () => now,
-    executionTickMs: 10,
-    recorder,
-    onEvent: (type, data) => emitted.push({ type, data }),
-    requireStrategyRecovery: true,
-  });
-  await runtime.start();
-  const health = runtime.healthState();
-  assert.equal(health.ready, true);
-  assert.equal(health.optionSameDayContractsAvailable, false);
-  assert.equal(health.optionSubscriptionsRequired, false);
-  assert.equal(health.subscribedOptionContracts, 0);
-  assert.equal(health.strategyStateReady, true);
-  assert.equal(health.strategyStateStatus, "NO_SAME_DAY_OPTION_CONTRACTS");
-  assert.ok(emitted.some((event) => event.type === "option_universe_refreshed" &&
-    event.data.sameDayOptionContractsAvailable === false));
-  await runtime.close();
-});
-
 test("transient closed-market clock failures degrade safely and recover without halting the decision queue", async () => {
   let decisionTime = zonedDateTimeToEpoch(date, "16:30:00");
   const client = new FakeRuntimeClient();
@@ -488,38 +455,6 @@ test("OPRA quote silence fails readiness and reconnects the option stream", asyn
   assert.equal(runtime.healthState().lastOptionQuoteProviderAgeMs, 0);
   assert.equal(runtime.healthState().optionQuotePrimed, true);
   assert.equal(runtime.healthState().ready, true);
-  await runtime.close();
-});
-
-test("runtime OPRA health applies the configured clock correction", async () => {
-  let decisionTime = now;
-  const client = new FakeRuntimeClient();
-  const optionStream = new FakeOptionStream();
-  const runtime = new SpyOptionsTradingRuntime({
-    config: defaultConfig,
-    client,
-    stockStream: new FakeStockStream(),
-    optionStream,
-    executionEnabled: true,
-    executionMode: "paper",
-    now: () => decisionTime,
-    monotonicNow: () => decisionTime,
-    marketDataClockOffsetMs: 75,
-    executionTickMs: 10,
-  });
-  await runtime.start();
-  await optionStream.quote({
-    symbol: callSymbol,
-    timestamp: decisionTime - 100,
-    bidPrice: 1.995,
-    askPrice: 2.005,
-    bidSize: 100,
-    askSize: 100,
-  });
-
-  const health = runtime.healthState();
-  assert.equal(health.lastOptionQuoteProviderAgeMs, 25);
-  assert.equal(health.optionMedianArrivalLagMs, 25);
   await runtime.close();
 });
 

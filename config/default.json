@@ -1,5 +1,5 @@
 {
-  "version": "spy-0dte-entry-confirmation-26-entry-quote-freshness",
+  "version": "spy-0dte-entry-confirmation-26-alpaca-option-exits",
   "symbol": "SPY",
   "timeZone": "America/New_York",
   "session": {
@@ -166,7 +166,6 @@
     "orderPollMs": 350,
     "optionTickSize": 0.01,
     "entrySignalTtlMs": 6500,
-    "maxEntryQuoteAgeMs": 750,
     "optionSelectionRetryMs": 1000,
     "adverseFillSpreadFraction": 0.25,
     "exitTtlMinMs": 250,
@@ -179,7 +178,6 @@
     "maxRiskDollarsPerTrade": 500,
     "maxPremiumDollarsPerTrade": 1500,
     "maxContracts": 1,
-    "maxPositionsPerUnderlying": 3,
     "maxTradesPerDay": 1000,
     "maxDailyLossDollars": 1000,
     "hardOptionStopPct": 0.25,
@@ -221,6 +219,12 @@
     "protectedGreeksExitGraceSec": 0.5,
     "continuationConfidenceZ": 1,
     "continuationSpreadCostFraction": 0.25,
-    "ivCrushThreshold": 0.03
+    "ivCrushThreshold": 0.03,
+    "alpacaOptionFeatures": {
+      "windowMs": 5000,
+      "minimumQuoteEvents": 3,
+      "minimumTradeEvents": 1,
+      "flowAdjustmentSpreadFraction": 0.5
+    }
   }
 }

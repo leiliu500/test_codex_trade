@@ -1,8 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { defaultConfig, googlConfig, qqqConfig } from "../src/config.js";
+import { defaultConfig, qqqConfig } from "../src/config.js";
 import type {
-  AccountState, FeatureSnapshot, OptionContract, OptionQuote, OptionSnapshot, StockQuote, StockTrade,
+  AccountState, FeatureSnapshot, OptionContract, OptionQuote, OptionSnapshot, OptionTrade, StockQuote, StockTrade,
   TradeSignal, UnderlyingSymbol, WindowMetrics,
 } from "../src/types.js";
 import type {
@@ -27,7 +27,6 @@ const date = "2026-07-22";
 const timestamp = zonedDateTimeToEpoch(date, "10:20:00");
 const spyOption = "SPY260722C00500000";
 const qqqOption = "QQQ260722C00600000";
-const googlOption = "GOOGL260722C00190000";
 
 test("QQQ has an independent configuration and rejects SPY contracts without mutating SPY", () => {
   assert.equal(defaultConfig.symbol, "SPY");
@@ -46,22 +45,6 @@ test("QQQ has an independent configuration and rejects SPY contracts without mut
   assert.deepEqual(sameDayOptionContractReasons(qqq, timestamp, qqqConfig.timeZone, "QQQ"), []);
   assert.deepEqual(sameDayOptionContractReasons(spy, timestamp, qqqConfig.timeZone, "QQQ"), ["WRONG_UNDERLYING"]);
   assert.deepEqual(sameDayOptionContractReasons(spy, timestamp, defaultConfig.timeZone, "SPY"), []);
-});
-
-test("GOOGL has an isolated options-only paper configuration", () => {
-  assert.equal(googlConfig.symbol, "GOOGL");
-  assert.notEqual(googlConfig.version, defaultConfig.version);
-  assert.equal(googlConfig.options.expirationDaysMin, 0);
-  assert.equal(googlConfig.options.expirationDaysMax, 0);
-  assert.equal(googlConfig.risk.maxContracts, 1);
-  assert.equal(googlConfig.risk.maxPositionsPerUnderlying, 3);
-  const contract: OptionContract = {
-    symbol: googlOption, underlying: "GOOGL", expirationDate: date, strike: 190,
-    type: "call", active: true, tradable: true,
-  };
-  assert.deepEqual(sameDayOptionContractReasons(
-    contract, timestamp, googlConfig.timeZone, "GOOGL",
-  ), []);
 });
 
 test("feature engines stamp their own underlying and restoration state remains isolated", () => {
@@ -114,6 +97,8 @@ test("shared SIP and OPRA hubs route events and union subscriptions without cros
   const qqqOptions: string[] = [];
   const spyObservations: string[] = [];
   const qqqObservations: string[] = [];
+  const spyRawEvents: string[] = [];
+  const qqqRawEvents: string[] = [];
   let spyActivities = 0;
   let qqqActivities = 0;
   const spyOptionChannel = optionHub.channel("SPY");
@@ -124,11 +109,13 @@ test("shared SIP and OPRA hubs route events and union subscriptions without cros
     spyOptionChannel.connect({
       ...optionCollector(spyOptions),
       onQuoteObservations: (observations) => spyObservations.push(...observations.map(({ quote }) => quote.symbol)),
+      onRawEvents: (events) => spyRawEvents.push(...events.map((event) => `${event.type}:${event.value.symbol}`)),
       onActivity: () => { spyActivities += 1; },
     }),
     qqqOptionChannel.connect({
       ...optionCollector(qqqOptions),
       onQuoteObservations: (observations) => qqqObservations.push(...observations.map(({ quote }) => quote.symbol)),
+      onRawEvents: (events) => qqqRawEvents.push(...events.map((event) => `${event.type}:${event.value.symbol}`)),
       onActivity: () => { qqqActivities += 1; },
     }),
   ]);
@@ -139,6 +126,12 @@ test("shared SIP and OPRA hubs route events and union subscriptions without cros
   assert.deepEqual(qqqOptions, [qqqOption]);
   assert.deepEqual(spyObservations, [spyOption]);
   assert.deepEqual(qqqObservations, [qqqOption]);
+  await option.emitTrades([
+    { symbol: spyOption, timestamp, price: 1.01, size: 10 },
+    { symbol: qqqOption, timestamp, price: 1.01, size: 20 },
+  ]);
+  assert.deepEqual(spyRawEvents, [`quote:${spyOption}`, `trade:${spyOption}`]);
+  assert.deepEqual(qqqRawEvents, [`quote:${qqqOption}`, `trade:${qqqOption}`]);
   assert.equal(spyActivities, 1);
   assert.equal(qqqActivities, 1);
   await spyOptionChannel.close();
@@ -289,7 +282,7 @@ test("dashboard forward-move diagnostics never compare QQQ evaluations with SPY 
   assert.equal(misses[0]?.forwardPrice, 601);
 });
 
-test("dashboard exposes complete independent SPY, QQQ, and GOOGL views", () => {
+test("dashboard exposes complete independent SPY and QQQ views", () => {
   const store = new TradingDashboardStore(timestamp, false, 0, 0, () => timestamp + 5_000);
   store.record(audit("live_signal_selection", "SPY", {
     signalId: "spy-dashboard-signal", timestamp, direction: "BULLISH", kind: "IMPULSE",
@@ -338,7 +331,6 @@ test("dashboard exposes complete independent SPY, QQQ, and GOOGL views", () => {
   assert.equal(snapshot.performance.signalsFired, 2);
   assert.equal(snapshot.underlyingViews.SPY.performance.signalsFired, 1);
   assert.equal(snapshot.underlyingViews.QQQ.performance.signalsFired, 1);
-  assert.equal(snapshot.underlyingViews.GOOGL.performance.signalsFired, 0);
   assert.equal(snapshot.performance.realizedPnl, 15);
   assert.equal(snapshot.underlyingViews.SPY.performance.realizedPnl, 20);
   assert.equal(snapshot.underlyingViews.QQQ.performance.realizedPnl, -5);
@@ -433,7 +425,17 @@ class FakeOptionStream implements OptionStream {
     this.handlers?.onQuoteObservations?.(quotes.map((quote) => ({
       quote, receiveWallTimestamp: timestamp, receiveMonotonicTimestamp: timestamp,
     })));
+    this.handlers?.onRawEvents?.(
+      quotes.map((quote) => ({ type: "quote" as const, value: quote })),
+      { receiveWallTimestamp: timestamp, receiveMonotonicTimestamp: timestamp },
+    );
     await this.handlers?.onQuotes?.(quotes);
+  }
+  async emitTrades(trades: readonly OptionTrade[]): Promise<void> {
+    this.handlers?.onRawEvents?.(
+      trades.map((trade) => ({ type: "trade" as const, value: trade })),
+      { receiveWallTimestamp: timestamp, receiveMonotonicTimestamp: timestamp },
+    );
   }
 }
 

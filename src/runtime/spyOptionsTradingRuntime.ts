@@ -1,21 +1,19 @@
 import type { EngineConfig, FollowThroughScope } from "../config.js";
 import type { OptionStream } from "../alpaca/optionStream.js";
+import { AlpacaOptionFeatureEngine } from "../alpaca/optionFeatures.js";
 import type { StockStream } from "../alpaca/stockStream.js";
 import type { StockStreamEvent } from "../alpaca/stockStream.js";
 import type { TradingRestClient } from "../alpaca/restClient.js";
-import {
-  isUnderlyingSymbol,
-  type AccountState, type FeatureSnapshot, type OptionCandidateEvaluation, type OptionContract,
-  type OptionQuote, type RegimeDecision, type StockQuote, type TradeSignal, type UnderlyingSymbol,
+import type {
+  AccountState, FeatureSnapshot, OptionCandidateEvaluation, OptionContract, OptionQuote, RegimeDecision,
+  StockQuote, TradeSignal, UnderlyingSymbol,
 } from "../types.js";
 import type { HealthState } from "../ops/healthServer.js";
 import type { AuditEvent, AuditRecorder } from "../ops/recorder.js";
 import type { HistoricalMarketEvent, MarketHistorySink, HistoricalMarketEventType } from "../history/types.js";
 import { MemoryRecorder } from "../ops/recorder.js";
 import { SerializedDecisionQueue } from "../execution/tradingEngine.js";
-import {
-  ConcurrentLiveOrderManager, type ConcurrentLiveExecutionSnapshot,
-} from "../execution/concurrentLiveOrderManager.js";
+import { LiveOrderManager, type LiveExecutionSnapshot } from "../execution/liveOrderManager.js";
 import { OptionBook } from "../options/optionBook.js";
 import {
   OptionSelector, relevantOptionEvaluations, retryableOptionEvaluations, type SelectionResult,
@@ -32,7 +30,6 @@ import type { PortfolioRiskCoordinator } from "../risk/portfolioRiskCoordinator.
 import { lateEntryGuardAudit, morningEntryGuardAudit } from "../strategy/lateEntryGuard.js";
 import { validateOptionQuote } from "../features/quoteSanitizer.js";
 import { parseOccSymbol } from "../options/occSymbol.js";
-import { sameDayOptionContractReasons } from "../options/tradingInvariants.js";
 import {
   currentBullishProjectionBps, evaluateLateBullishGrindOptionConfirmation,
   requiresLateBullishGrindOptionConfirmation,
@@ -66,8 +63,6 @@ export interface SpyOptionsTradingRuntimeOptions {
   history?: MarketHistorySink;
   now?: () => number;
   monotonicNow?: () => number;
-  marketDataClockOffsetMs?: number;
-  optionDataProvider?: "massive" | "alpaca";
   executionTickMs?: number;
   onEvent?: (type: string, data: Record<string, unknown>) => void;
   onError?: (error: unknown) => void;
@@ -83,12 +78,10 @@ export interface SpyOptionsTradingRuntimeOptions {
 
 export function optionUniverseRequired(
   now: number, marketOpen: boolean, hasOptionExposure: boolean, config: EngineConfig,
-  sameDayOptionContractsAvailable = true,
 ): boolean {
   return marketOpen && (
     hasOptionExposure ||
-    sameDayOptionContractsAvailable &&
-      secondsSinceMidnight(now, config.timeZone) <= parseClock(config.options.zeroDteEntryCutoff)
+    secondsSinceMidnight(now, config.timeZone) <= parseClock(config.options.zeroDteEntryCutoff)
   );
 }
 
@@ -124,8 +117,6 @@ export class SpyOptionsTradingRuntime {
   readonly #killSwitch: boolean;
   readonly #now: () => number;
   readonly #monotonicNow: () => number;
-  readonly #marketDataClockOffsetMs: number;
-  readonly #optionDataProvider: "massive" | "alpaca";
   readonly #executionTickMs: number;
   readonly #onEvent: ((type: string, data: Record<string, unknown>) => void) | undefined;
   readonly #onError: ((error: unknown) => void) | undefined;
@@ -138,16 +129,16 @@ export class SpyOptionsTradingRuntime {
   readonly #signals: SignalEngine;
   readonly #lateEntryBaselineSignals: SignalEngine | undefined;
   readonly #shadowSignals = new Map<FollowThroughScope, SignalEngine>();
-  readonly #orders: ConcurrentLiveOrderManager;
+  readonly #orders: LiveOrderManager;
   readonly #stockReceiver: SpySipReceiver;
   readonly #restoredRuntimeState: RestoredRuntimeState;
   readonly #optionHealth: OpraQuoteHealthMonitor;
+  readonly #alpacaOptionFeatures: AlpacaOptionFeatureEngine;
   readonly #optionRestCircuit = new StaleQuoteCircuitBreaker();
   readonly #rawObservedQuotes = new WeakMap<OptionQuote, OpraQuoteObservation>();
   readonly #lastOptionRestFingerprints = new Map<string, string>();
   #contracts: OptionContract[] = [];
   #subscribedSymbols = new Set<string>();
-  #sameDayOptionContractsAvailable: boolean | undefined;
   #optionConnected = false;
   #brokerAvailable = false;
   #positionsReconciled = false;
@@ -172,13 +163,10 @@ export class SpyOptionsTradingRuntime {
   #lastOptionRestFallbackError: string | undefined;
   #lastOptionDiagnosis: OpraQuoteDiagnosis | undefined;
   #providerDelayDiagnosticReconnectAttempted = false;
-  #execution: ConcurrentLiveExecutionSnapshot = {
-    halted: false, lifecycle: "FLAT", safeMode: false,
-    positions: [], pendingOrders: [], exitIntents: [], positionCount: 0, maxPositions: 1,
-  };
+  #execution: LiveExecutionSnapshot = { halted: false, lifecycle: "FLAT", safeMode: false };
   #pendingOptionSelection: PendingOptionSelection | undefined;
   #pendingLateBullishGrindConfirmation: PendingLateBullishGrindConfirmation | undefined;
-  readonly #retainedPositions = new Map<string, number>();
+  #retainedPositionSymbol: string | undefined;
   #lastError: string | undefined;
   #lastClockCheck = -Infinity;
   #marketClockAvailable = false;
@@ -190,7 +178,6 @@ export class SpyOptionsTradingRuntime {
   #restoredStockEvents = 0;
   #restoredFeatureBars = 0;
   #strategyRecoveryError: string | undefined;
-  #ordersInitialized = false;
   #started = false;
   #stopping = false;
   #tickTimer: ReturnType<typeof setInterval> | undefined;
@@ -207,12 +194,13 @@ export class SpyOptionsTradingRuntime {
     this.#killSwitch = options.killSwitch === true;
     this.#now = options.now ?? Date.now;
     this.#monotonicNow = options.monotonicNow ?? performance.now.bind(performance);
-    this.#marketDataClockOffsetMs = options.marketDataClockOffsetMs ?? 0;
-    this.#optionDataProvider = options.optionDataProvider ?? "alpaca";
     this.#optionHealth = new OpraQuoteHealthMonitor({
       executionMaxQuoteAgeMs: options.config.dataQuality.maxOptionQuoteAgeMs,
       transportTimeoutMs: OPTION_QUOTE_STALL_TIMEOUT_MS,
-      clockOffsetMs: this.#marketDataClockOffsetMs,
+    });
+    this.#alpacaOptionFeatures = new AlpacaOptionFeatureEngine({
+      windowMs: options.config.risk.alpacaOptionFeatures.windowMs,
+      maximumQuoteAgeMs: options.config.dataQuality.maxOptionQuoteAgeMs,
     });
     this.#executionTickMs = options.executionTickMs ?? 250;
     this.#onEvent = options.onEvent;
@@ -257,7 +245,7 @@ export class SpyOptionsTradingRuntime {
     for (const engine of this.#shadowSignals.values()) engine.restoreState(restored.signal);
     this.#recorder = options.recorder ?? new MemoryRecorder();
     this.#history = options.history;
-    this.#orders = new ConcurrentLiveOrderManager({
+    this.#orders = new LiveOrderManager({
       config: options.config,
       client: options.client,
       recorder: this.#recorder,
@@ -276,7 +264,6 @@ export class SpyOptionsTradingRuntime {
       knownClientOrderIds: restored.knownClientOrderIds,
       ...(options.portfolioRisk ? { portfolioRisk: options.portfolioRisk } : {}),
     });
-    this.#execution = this.#orders.snapshot();
     this.#stockReceiver = new SpySipReceiver({
       config: options.config,
       stream: options.stockStream,
@@ -313,13 +300,11 @@ export class SpyOptionsTradingRuntime {
         this.#strategyStateMarketDate = marketDate(clock.timestamp, this.#config.timeZone);
       }
       this.#execution = await this.#orders.initialize(clock.timestamp);
-      this.#ordersInitialized = true;
       await this.#auditRuntime(clock.timestamp, "runtime_config_snapshot", {
         config: this.#config,
         executionMode: this.#executionMode,
         executionEnabled: this.#executionEnabled,
         executionTickMs: this.#executionTickMs,
-        optionDataProvider: this.#optionDataProvider,
       });
       await this.#auditRuntime(clock.timestamp, "daily_risk_state_recovery", {
         marketDate: this.#restoredRuntimeState.risk.marketDate,
@@ -381,7 +366,6 @@ export class SpyOptionsTradingRuntime {
         executionEnabled: this.#executionEnabled,
         stockFeed: "sip",
         optionFeed: "opra",
-        optionDataProvider: this.#optionDataProvider,
         subscribedOptionContracts: this.#subscribedSymbols.size,
         marketOpen: this.#marketOpen,
         marketDataIdle: this.#marketDataIdle,
@@ -404,7 +388,6 @@ export class SpyOptionsTradingRuntime {
   async close(): Promise<void> {
     this.#stopping = true;
     this.#started = false;
-    this.#ordersInitialized = false;
     if (this.#tickTimer) clearInterval(this.#tickTimer);
     if (this.#optionReconnectTimer) clearTimeout(this.#optionReconnectTimer);
     this.#tickTimer = undefined;
@@ -663,9 +646,8 @@ export class SpyOptionsTradingRuntime {
   }
 
   #selectOptions(signal: TradeSignal, decisionTimestamp: number): SelectionResult {
-    const occupiedSymbols = new Set(this.#execution.positions.map((position) => position.symbol));
     const subscribedContracts = this.#contracts.filter((contract) =>
-      this.#subscribedSymbols.has(contract.symbol) && !occupiedSymbols.has(contract.symbol));
+      this.#subscribedSymbols.has(contract.symbol));
     return this.#selector.select(signal, subscribedContracts, this.#book, decisionTimestamp);
   }
 
@@ -872,15 +854,12 @@ export class SpyOptionsTradingRuntime {
     const brokerReady = !this.#executionEnabled || (this.#brokerAvailable && this.#positionsReconciled && this.#account?.optionsApproved === true);
     const streamsConnected = stock.websocketConnected && this.#optionConnected;
     const streamsReady = this.#marketDataIdle || streamsConnected;
-    const hasOptionExposure = this.#execution.positions.length > 0 || this.#execution.pendingOrders.length > 0;
-    const noSameDayContractIdle = !hasOptionExposure && this.#sameDayOptionContractsAvailable === false;
+    const hasOptionExposure = this.#execution.position !== undefined || this.#execution.pending !== undefined;
     const optionSubscriptionsRequired = optionUniverseRequired(
       now, this.#marketOpen, hasOptionExposure, this.#config,
-      this.#sameDayOptionContractsAvailable !== false,
     );
     const universeReady = this.#subscribedSymbols.size > 0 || !optionSubscriptionsRequired;
-    const strategyReady = !this.#executionEnabled || !this.#marketOpen ||
-      this.#strategyStateReady || noSameDayContractIdle;
+    const strategyReady = !this.#executionEnabled || !this.#marketOpen || this.#strategyStateReady;
     const optionChainHealth = this.#optionChainHealth(now);
     const optionQuoteSilenceAgeMs = this.#subscribedSymbols.size > 0
       ? optionChainHealth.transportAgeMs : undefined;
@@ -889,11 +868,13 @@ export class SpyOptionsTradingRuntime {
       optionChainHealth.observedSymbolCount > 0;
     const optionQuoteProviderLagged = optionChainHealth.diagnosis === "PROVIDER_DELAYED";
     const optionQuoteStalled = this.#isOptionQuoteStalled(now);
-    const activeHealth = this.#activeExecutionSymbols().map((symbol) =>
-      this.#optionHealth.diagnose(symbol, now, this.#monotonicNow()));
+    const activeSymbol = this.#execution.position?.symbol ?? this.#execution.pending?.order.symbol;
+    const activeHealth = activeSymbol
+      ? this.#optionHealth.diagnose(activeSymbol, now, this.#monotonicNow())
+      : undefined;
     const optionDataReady = !optionSubscriptionsRequired || (
       optionQuotePrimed && optionChainHealth.entryEligible && !optionQuoteStalled &&
-      activeHealth.every((health) => health.entryEligible)
+      (!activeHealth || activeHealth.entryEligible)
     );
     const restCircuit = this.#optionRestCircuit.snapshot(this.#monotonicNow());
     return {
@@ -935,9 +916,6 @@ export class SpyOptionsTradingRuntime {
       optionQuoteStalled,
       optionQuoteStallThresholdMs: OPTION_QUOTE_STALL_TIMEOUT_MS,
       optionSubscriptionsRequired,
-      ...(this.#sameDayOptionContractsAvailable !== undefined
-        ? { optionSameDayContractsAvailable: this.#sameDayOptionContractsAvailable }
-        : {}),
       optionRestFallbackEnabled: this.#client.getLatestOptionQuotes !== undefined,
       optionRestFallbackInFlight: this.#optionRestRecoveryInFlight !== undefined,
       optionRestFallbackRequests: this.#optionRestFallbackRequests,
@@ -965,27 +943,21 @@ export class SpyOptionsTradingRuntime {
       executionEnabled: this.#executionEnabled,
       executionMode: this.#executionMode,
       accountOptionsApproved: this.#account?.optionsApproved === true,
-      positionOpen: this.#execution.positions.length > 0,
-      positionCount: this.#execution.positionCount,
-      maxPositions: this.#execution.maxPositions,
-      pendingOrder: this.#execution.pendingOrders.length > 0,
-      pendingOrderCount: this.#execution.pendingOrders.length,
+      positionOpen: this.#execution.position !== undefined,
+      pendingOrder: this.#execution.pending !== undefined,
       subscribedOptionContracts: this.#subscribedSymbols.size,
-      ...(activeHealth.some((health) => Number.isFinite(health.latestProviderAgeMs))
-        ? { openPositionOptionQuoteAgeMs: Math.max(...activeHealth
-            .map((health) => health.latestProviderAgeMs)
-            .filter((age): age is number => Number.isFinite(age))) } : {}),
+      ...(activeHealth && Number.isFinite(activeHealth.latestProviderAgeMs)
+        ? { openPositionOptionQuoteAgeMs: activeHealth.latestProviderAgeMs } : {}),
       brokerAvailable: this.#brokerAvailable,
       marketClockState: this.#marketOpen ? "market-open" :
         this.#marketDataIdle ? "market-closed-idle" : "market-closed",
       marketClockAvailable: this.#marketClockAvailable,
       ...(this.#lastMarketClockError ? { lastMarketClockError: this.#lastMarketClockError } : {}),
-      openOrderCount: this.#execution.pendingOrders.length,
+      openOrderCount: this.#execution.pending ? 1 : 0,
       positionsReconciled: this.#positionsReconciled,
       recorderHealthy,
-      strategyStateReady: this.#strategyStateReady || noSameDayContractIdle,
-      strategyStateStatus: noSameDayContractIdle
-        ? "NO_SAME_DAY_OPTION_CONTRACTS" : this.#strategyStateStatus,
+      strategyStateReady: this.#strategyStateReady,
+      strategyStateStatus: this.#strategyStateStatus,
       ...(this.#strategyStateMarketDate ? { strategyStateMarketDate: this.#strategyStateMarketDate } : {}),
       strategyOpeningRangeEnd: this.#config.session.openingRangeEnd,
       restoredStockEvents: this.#restoredStockEvents,
@@ -1008,23 +980,15 @@ export class SpyOptionsTradingRuntime {
       reasons.push("ACCOUNT_NOT_READY");
     }
     if (this.#executionEnabled && !this.#recorder.healthy()) reasons.push("AUDIT_RECORDER_UNHEALTHY");
-    if (this.#executionEnabled && !this.#strategyStateReady &&
-        this.#sameDayOptionContractsAvailable !== false) reasons.push("STRATEGY_STATE_NOT_READY");
-    if (this.#executionEnabled && !this.#ordersInitialized) reasons.push("ORDER_MANAGER_NOT_READY");
+    if (this.#executionEnabled && !this.#strategyStateReady) reasons.push("STRATEGY_STATE_NOT_READY");
     if (this.#executionEnabled && !this.#stockReceiver.healthState(this.#killSwitch).websocketConnected) {
       reasons.push("STOCK_FEED_DISCONNECTED");
-    }
-    if (this.#executionEnabled && this.#sameDayOptionContractsAvailable === false) {
-      reasons.push("NO_SAME_DAY_OPTION_CONTRACTS");
     }
     const optionHealth = this.#optionChainHealth(timestamp);
     if (this.#executionEnabled && this.#isOptionQuoteStalled(timestamp)) {
       reasons.push("OPTION_FEED_STALLED");
     } else if (this.#executionEnabled && !this.#optionConnected &&
-        optionUniverseRequired(
-          timestamp, this.#marketOpen, false, this.#config,
-          this.#sameDayOptionContractsAvailable !== false,
-        )) {
+        optionUniverseRequired(timestamp, this.#marketOpen, false, this.#config)) {
       reasons.push("OPTION_FEED_DISCONNECTED");
     } else if (this.#executionEnabled && this.#subscribedSymbols.size > 0 &&
         optionHealth.diagnosis === "NO_DATA") {
@@ -1038,10 +1002,8 @@ export class SpyOptionsTradingRuntime {
         !optionHealth.entryEligible && optionHealth.diagnosis === "CONTRACT_IDLE") {
       reasons.push("OPTION_FEED_CONTRACT_IDLE");
     }
-    if (this.#execution.positionCount >= this.#execution.maxPositions) {
-      reasons.push("MAX_POSITIONS_PER_UNDERLYING");
-    }
-    if (this.#execution.pendingOrders.length > 0) reasons.push("ORDER_ALREADY_PENDING");
+    if (this.#execution.position) reasons.push("POSITION_ALREADY_OPEN");
+    if (this.#execution.pending) reasons.push("ORDER_ALREADY_PENDING");
     return reasons;
   }
 
@@ -1178,8 +1140,8 @@ export class SpyOptionsTradingRuntime {
         if (this.#marketDataIdle || !this.#marketOpen) return;
         this.#recordOptionHistory(quotes);
         const decisionTimestamp = this.#now();
-        const activeSymbols = new Set(this.#activeExecutionSymbols());
-        const latestActiveQuotes = new Map<string, OptionQuote>();
+        const activeSymbol = this.#execution.position?.symbol ?? this.#execution.pending?.order.symbol;
+        let latestActiveQuote: OptionQuote | undefined;
         for (const quote of quotes) {
           if (parseOccSymbol(quote.symbol)?.underlying !== this.#config.symbol) {
             this.#rejectedOptionQuotes += 1;
@@ -1195,13 +1157,15 @@ export class SpyOptionsTradingRuntime {
             this.#rejectedOptionQuotes += 1;
             continue;
           }
-          if (activeSymbols.has(quote.symbol)) latestActiveQuotes.set(quote.symbol, quote);
+          if (activeSymbol === quote.symbol) {
+            latestActiveQuote = quote;
+          }
         }
         if (this.#pendingOptionSelection) {
           await this.#advancePendingOptionSelection(decisionTimestamp);
         }
-        if (latestActiveQuotes.size > 0) {
-          await this.#tickExecution(decisionTimestamp, [...latestActiveQuotes.values()]);
+        if (latestActiveQuote) {
+          await this.#tickExecution(decisionTimestamp, latestActiveQuote);
         }
       });
     } catch (error) {
@@ -1229,11 +1193,6 @@ export class SpyOptionsTradingRuntime {
     if (this.#marketDataIdle || !this.#marketOpen) return;
     const contracts = await this.#client.listOptionContracts(this.#config.symbol);
     if (this.#stopping || this.#marketDataIdle || !this.#marketOpen) return;
-    this.#sameDayOptionContractsAvailable = contracts.some((contract) =>
-      contract.active && contract.tradable &&
-      sameDayOptionContractReasons(
-        contract, timestamp, this.#config.timeZone, this.#config.symbol,
-      ).length === 0);
     const nextSymbols = new Set(this.#universe.plan(contracts, spot, timestamp));
     const snapshots = nextSymbols.size > 0
       ? await this.#client.getOptionSnapshots([...nextSymbols])
@@ -1257,13 +1216,14 @@ export class SpyOptionsTradingRuntime {
     }
     this.#subscribedSymbols = nextSymbols;
     this.#optionHealth.retainSymbols(nextSymbols);
+    this.#alpacaOptionFeatures.retainSymbols(nextSymbols);
     for (const snapshot of snapshots) {
       this.#book.updateSnapshot(snapshot);
+      this.#alpacaOptionFeatures.observeSnapshot(snapshot);
       this.#recordHistory("option_snapshot", snapshot.timestamp ?? timestamp, snapshot.symbol, { ...snapshot });
     }
     this.#emit("option_universe_refreshed", {
       contractCount: contracts.length,
-      sameDayOptionContractsAvailable: this.#sameDayOptionContractsAvailable,
       subscribedOptionContracts: nextSymbols.size,
       added: add.length,
       removed: remove.length,
@@ -1330,7 +1290,6 @@ export class SpyOptionsTradingRuntime {
             freshestProviderTimestamp = Math.max(freshestProviderTimestamp ?? -Infinity, quote.timestamp);
             const assessment = assessRestQuote(
               quote, observedAt, this.#config.dataQuality.maxOptionQuoteAgeMs,
-              this.#marketDataClockOffsetMs,
             );
             if (assessment.fresh) freshQuotes += 1;
             else staleQuotes += 1;
@@ -1400,6 +1359,13 @@ export class SpyOptionsTradingRuntime {
     await this.#optionStream.connect({
       onQuote: (quote) => this.#onOptionQuote(quote),
       onQuotes: (quotes) => this.#onOptionQuotes(quotes),
+      onRawEvents: (events) => {
+        for (const event of events) {
+          if (parseOccSymbol(event.value.symbol)?.underlying !== this.#config.symbol) continue;
+          if (event.type === "quote") this.#alpacaOptionFeatures.observeQuote(event.value);
+          else this.#alpacaOptionFeatures.observeTrade(event.value);
+        }
+      },
       onActivity: (activity) => this.#optionHealth.onAnyFrame(activity.receiveMonotonicTimestamp),
       onQuoteObservations: (observations) => {
         for (const observation of observations) {
@@ -1513,17 +1479,18 @@ export class SpyOptionsTradingRuntime {
     });
   }
 
-  async #tickExecution(timestamp: number, optionQuotes: readonly OptionQuote[] = []): Promise<void> {
-    if (!this.#ordersInitialized || this.#marketDataIdle || !this.#marketOpen ||
-        !this.#executionEnabled || this.#execution.halted) return;
-    const optionSnapshots = this.#activeExecutionSymbols().flatMap((symbol) => {
-      const snapshot = this.#book.get(symbol)?.snapshot;
-      return snapshot ? [snapshot] : [];
-    });
+  async #tickExecution(timestamp: number, optionQuote?: OptionQuote): Promise<void> {
+    if (this.#marketDataIdle || !this.#marketOpen || !this.#executionEnabled || this.#execution.halted) return;
+    const activeSymbol = this.#execution.position?.symbol ?? this.#execution.pending?.order.symbol;
+    const optionSnapshot = activeSymbol ? this.#book.get(activeSymbol)?.snapshot : undefined;
+    const alpacaOptionFeatures = activeSymbol
+      ? this.#alpacaOptionFeatures.snapshot(activeSymbol, timestamp)
+      : undefined;
     this.#execution = await this.#orders.tick({
       timestamp,
-      ...(optionQuotes.length > 0 ? { optionQuotes } : {}),
-      ...(optionSnapshots.length > 0 ? { optionSnapshots } : {}),
+      ...(optionQuote ? { optionQuote } : {}),
+      ...(optionSnapshot ? { optionSnapshot } : {}),
+      ...(alpacaOptionFeatures ? { alpacaOptionFeatures } : {}),
       ...(this.#lastFeature ? { feature: this.#lastFeature } : {}),
       ...(this.#lastRegime ? { regime: this.#lastRegime } : {}),
       killSwitch: this.#killSwitch,
@@ -1558,7 +1525,6 @@ export class SpyOptionsTradingRuntime {
     if (this.#marketDataIdle) return;
     this.#marketOpen = false;
     this.#marketDataIdle = true;
-    this.#sameDayOptionContractsAvailable = undefined;
     this.#optionConnected = false;
     this.#optionQuoteStalled = false;
     this.#providerDelayDiagnosticReconnectAttempted = false;
@@ -1580,10 +1546,8 @@ export class SpyOptionsTradingRuntime {
       reason: "MARKET_CLOSED",
       marketOpen: false,
       controlPlanePollMs: CLOSED_MARKET_CLOCK_POLL_MS,
-      positionOpen: this.#execution.positions.length > 0,
-      positionCount: this.#execution.positionCount,
-      pendingOrder: this.#execution.pendingOrders.length > 0,
-      pendingOrderCount: this.#execution.pendingOrders.length,
+      positionOpen: this.#execution.position !== undefined,
+      pendingOrder: this.#execution.pending !== undefined,
     });
     this.#emit("market_session_idle", {
       reason: "MARKET_CLOSED",
@@ -1595,7 +1559,6 @@ export class SpyOptionsTradingRuntime {
     await this.#marketDataTransition;
     if (this.#stopping || !this.#marketOpen || !this.#marketDataIdle) return;
     this.#marketDataIdle = false;
-    this.#sameDayOptionContractsAvailable = undefined;
     this.#optionQuoteStalled = false;
     this.#lastFeature = undefined;
     this.#lastRegime = undefined;
@@ -1644,48 +1607,35 @@ export class SpyOptionsTradingRuntime {
   }
 
   #synchronizeHistoryPriorities(): void {
-    const symbols = new Set(this.#activeExecutionSymbols());
-    if (this.#pendingLateBullishGrindConfirmation) {
-      symbols.add(this.#pendingLateBullishGrindConfirmation.candidate.symbol);
-    }
-    if (this.#pendingOptionSelection) {
-      const candidate = relevantOptionEvaluations(
-        this.#pendingOptionSelection.signal,
-        this.#pendingOptionSelection.lastSelection,
-        this.#config,
-      )[0];
-      if (candidate) symbols.add(candidate.symbol);
-    }
-    this.#history?.setPrioritySymbols?.(symbols);
+    const symbol = this.#execution.position?.symbol ?? this.#execution.pending?.order.symbol ??
+      this.#pendingLateBullishGrindConfirmation?.candidate.symbol ??
+      (this.#pendingOptionSelection
+        ? relevantOptionEvaluations(
+            this.#pendingOptionSelection.signal,
+            this.#pendingOptionSelection.lastSelection,
+            this.#config,
+          )[0]?.symbol
+        : undefined);
+    this.#history?.setPrioritySymbols?.(symbol ? new Set([symbol]) : new Set());
   }
 
   #synchronizePositionLifecycle(): void {
-    const currentSymbols = new Set(this.#execution.positions.map((position) => position.symbol));
-    for (const position of this.#execution.positions) {
-      if (this.#retainedPositions.get(position.symbol) === position.entryTimestamp) continue;
-      this.#universe.retainOpenPosition(position.symbol, this.#now());
-      this.#retainedPositions.set(position.symbol, position.entryTimestamp);
-      this.#signals.recordEntry(position.direction, position.entryTimestamp);
+    const symbol = this.#execution.position?.symbol;
+    if (symbol && symbol !== this.#retainedPositionSymbol) {
+      this.#universe.retainOpenPosition(symbol, this.#now());
+      this.#retainedPositionSymbol = symbol;
+      this.#signals.recordEntry(this.#execution.position!.direction, this.#execution.position!.entryTimestamp);
       this.#lateEntryBaselineSignals?.recordEntry(
-        position.direction,
-        position.entryTimestamp,
+        this.#execution.position!.direction,
+        this.#execution.position!.entryTimestamp,
       );
       for (const engine of this.#shadowSignals.values()) {
-        engine.recordEntry(position.direction, position.entryTimestamp);
+        engine.recordEntry(this.#execution.position!.direction, this.#execution.position!.entryTimestamp);
       }
+    } else if (!symbol && this.#retainedPositionSymbol) {
+      this.#universe.releaseClosedPosition(this.#retainedPositionSymbol);
+      this.#retainedPositionSymbol = undefined;
     }
-    for (const symbol of this.#retainedPositions.keys()) {
-      if (currentSymbols.has(symbol)) continue;
-      this.#universe.releaseClosedPosition(symbol);
-      this.#retainedPositions.delete(symbol);
-    }
-  }
-
-  #activeExecutionSymbols(): string[] {
-    return [...new Set([
-      ...this.#execution.positions.map((position) => position.symbol),
-      ...this.#execution.pendingOrders.map((pending) => pending.order.symbol),
-    ])];
   }
 
   #recordError(error: unknown): void {
@@ -1910,7 +1860,7 @@ function auditEventBelongsToUnderlying(event: AuditEvent, underlying: Underlying
   for (const symbol of candidates) {
     const parsed = symbol ? parseOccSymbol(symbol) : undefined;
     if (parsed) return parsed.underlying === underlying;
-    if (isUnderlyingSymbol(symbol)) return symbol === underlying;
+    if (symbol === "SPY" || symbol === "QQQ") return symbol === underlying;
   }
   // Untagged historical audit events predate multi-underlying support and are SPY-only.
   return underlying === "SPY";

@@ -79,8 +79,6 @@ test("dashboard exposes liveness and feed tabs before any entries, orders, or hi
   assert.match(html, /Actionable stages only/);
   assert.match(html, /scheduleDisplayRollover/);
   assert.match(html, /window\.location\.reload/);
-  assert.match(html, /Provider latency subtracts the configured local-minus-provider clock offset/);
-  assert.match(html, /feedLatency/);
   assert.match(html, /resets at 10:00 PM Pacific/);
   assert.match(html, /h\.receivedOptionQuotes/);
   assert.match(html, /h\.lastOptionQuoteAgeMs/);
@@ -100,9 +98,6 @@ test("dashboard exposes liveness and feed tabs before any entries, orders, or hi
   assert.match(html, /REST diagnostic/);
   assert.match(html, /h\.optionQuoteStalled/);
   assert.match(html, /h\.optionSubscriptionsRequired/);
-  assert.match(html, /h\.optionSameDayContractsAvailable/);
-  assert.match(html, /GOOGL only/);
-  assert.match(html, /NO SAME-DAY OPTION CONTRACTS/);
   assert.match(html, /opraSubscriptionIdle/);
   assert.match(html, /ENTRY CUTOFF · NO ACTIVE EXPOSURE/);
   assert.match(html, /session WS quotes/);
@@ -115,26 +110,6 @@ test("dashboard exposes liveness and feed tabs before any entries, orders, or hi
   const script = html.match(/<script>([\s\S]*)<\/script>/)?.[1];
   assert.ok(script);
   assert.doesNotThrow(() => new Function(script));
-});
-
-test("dashboard reports corrected provider latency while retaining the raw timestamp delta", () => {
-  const clockOffsetMs = 75;
-  const dashboard = new TradingDashboardStore(timestamp, true, 0, 7, dashboardNow, clockOffsetMs);
-  dashboard.recordMarketEvent({
-    type: "option_quote",
-    providerTimestamp: timestamp,
-    receivedTimestamp: timestamp + 2_575,
-    marketDate: "2026-07-22",
-    symbol,
-    data: { symbol, timestamp, bidPrice: 2, askPrice: 2.01, bidSize: 10, askSize: 12 },
-  });
-
-  const live = dashboard.snapshot().liveData;
-  assert.equal(live.marketDataClockOffsetMs, 75);
-  assert.equal(live.recentEvents[0]?.rawLatencyMs, 2_575);
-  assert.equal(live.recentEvents[0]?.latencyMs, 2_500);
-  assert.equal(live.recentEvents[0]?.providerTimestamp, timestamp);
-  assert.equal(live.recentEvents[0]?.receivedTimestamp, timestamp + 2_575);
 });
 
 test("dashboard decision timeline keeps each late-grind confirmation monitoring time", () => {

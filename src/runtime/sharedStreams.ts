@@ -1,7 +1,9 @@
 import type {
   StockStream, StockStreamEvent, StockStreamHandlers,
 } from "../alpaca/stockStream.js";
-import type { OptionStream, OptionStreamHandlers } from "../alpaca/optionStream.js";
+import type {
+  OptionStream, OptionStreamActivity, OptionStreamEvent, OptionStreamHandlers,
+} from "../alpaca/optionStream.js";
 import type { OptionQuote, UnderlyingSymbol } from "../types.js";
 
 interface StockChannelState {
@@ -175,6 +177,7 @@ export class SharedOptionStreamHub {
     this.#connection ??= this.#physical.connect({
       onQuote: (quote) => this.#dispatch([quote]),
       onQuotes: (quotes) => this.#dispatch(quotes),
+      onRawEvents: (events, activity) => this.#dispatchRawEvents(events, activity),
       onActivity: (activity) => {
         for (const channel of this.#channels.values()) {
           if (!channel.active || !channel.handlers?.onActivity) continue;
@@ -253,5 +256,15 @@ export class SharedOptionStreamHub {
         channel.handlers.onError?.(error);
       }
     }));
+  }
+
+  #dispatchRawEvents(events: readonly OptionStreamEvent[], activity: OptionStreamActivity): void {
+    for (const channel of this.#channels.values()) {
+      if (!channel.active || !channel.handlers?.onRawEvents) continue;
+      const scoped = events.filter((event) => channel.desired.has(event.value.symbol));
+      if (scoped.length === 0) continue;
+      try { channel.handlers.onRawEvents(scoped, activity); }
+      catch (error) { channel.handlers.onError?.(error); }
+    }
   }
 }

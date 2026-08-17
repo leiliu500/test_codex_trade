@@ -1,7 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { adaptAlpacaStockQuote, adaptAlpacaStockTrade } from "../src/alpaca/stockStream.js";
-import { adaptAlpacaOptionQuote, AlpacaOptionWebSocket } from "../src/alpaca/optionStream.js";
+import {
+  adaptAlpacaOptionQuote, adaptAlpacaOptionTrade, AlpacaOptionWebSocket,
+} from "../src/alpaca/optionStream.js";
 import { AlpacaTradingRestClient } from "../src/alpaca/restClient.js";
 import { OptionBook } from "../src/options/optionBook.js";
 import { decode, encode } from "@msgpack/msgpack";
@@ -25,6 +27,13 @@ test("Alpaca market-data boundary maps official compact schemas", () => {
   assert.ok(Number.isFinite(option.timestamp));
   assert.equal(option.bidExchange, "C");
   assert.deepEqual(option.conditions, ["B"]);
+  const optionTrade = adaptAlpacaOptionTrade({
+    T: "t", S: "SPY260724C00500000", t: time, p: 1.02, s: 15, x: "C", c: ["I"],
+  });
+  assert.equal(optionTrade.price, 1.02);
+  assert.equal(optionTrade.size, 15);
+  assert.equal(optionTrade.exchange, "C");
+  assert.deepEqual(optionTrade.conditions, ["I"]);
   const msgpackOption = adaptAlpacaOptionQuote({
     T: "q", S: "SPY260724C00500000", t: new Date(time), bp: 1, ap: 1.02, bs: 20, as: 30,
   });
@@ -43,7 +52,7 @@ test("OPRA subscription updates wait for each full-state acknowledgement", async
   });
 
   const subscriptions = new Set<string>();
-  const actions: Array<{ action: string; quotes: string[] }> = [];
+  const actions: Array<{ action: string; quotes: string[]; trades: string[] }> = [];
   let dynamicAcknowledgementPending = false;
   let overlappingUpdates = false;
   server.on("connection", (socket) => {
@@ -57,7 +66,11 @@ test("OPRA subscription updates wait for each full-state acknowledgement", async
       const quotes = Array.isArray(message.quotes)
         ? message.quotes.filter((symbol): symbol is string => typeof symbol === "string")
         : [];
-      actions.push({ action, quotes });
+      const trades = Array.isArray(message.trades)
+        ? message.trades.filter((symbol): symbol is string => typeof symbol === "string")
+        : [];
+      actions.push({ action, quotes, trades });
+      assert.deepEqual(trades, quotes);
       for (const symbol of quotes) {
         if (action === "subscribe") subscriptions.add(symbol);
         else if (action === "unsubscribe") subscriptions.delete(symbol);
@@ -65,7 +78,7 @@ test("OPRA subscription updates wait for each full-state acknowledgement", async
       const snapshot = [...subscriptions].sort();
       const acknowledge = (): void => {
         dynamicAcknowledgementPending = false;
-        socket.send(encode([{ T: "subscription", quotes: snapshot }]));
+        socket.send(encode([{ T: "subscription", quotes: snapshot, trades: snapshot }]));
       };
       if (actions.length === 1) acknowledge();
       else {
@@ -101,6 +114,8 @@ test("OPRA subscription updates wait for each full-state acknowledgement", async
   assert.deepEqual(actions.map(({ action }) => action), ["subscribe", "unsubscribe", "subscribe"]);
   assert.deepEqual(actions[1]?.quotes, ["SPY260727C00640000"]);
   assert.deepEqual(actions[2]?.quotes, ["SPY260727C00641000"]);
+  assert.deepEqual(actions[1]?.trades, ["SPY260727C00640000"]);
+  assert.deepEqual(actions[2]?.trades, ["SPY260727C00641000"]);
   assert.deepEqual([...subscriptions].sort(), ["SPY260727C00641000", "SPY260727P00640000"]);
   assert.deepEqual(snapshots.at(-1), ["SPY260727C00641000", "SPY260727P00640000"]);
   assert.deepEqual(errors, []);
@@ -125,7 +140,7 @@ test("OPRA backpressure keeps only the newest pending quote per contract", async
       if (message.action === "auth") {
         socket.send(encode([{ T: "success", msg: "authenticated" }]));
       } else if (message.action === "subscribe") {
-        socket.send(encode([{ T: "subscription", quotes: symbols }]));
+        socket.send(encode([{ T: "subscription", quotes: symbols, trades: symbols }]));
       }
     });
   });
@@ -135,6 +150,7 @@ test("OPRA backpressure keeps only the newest pending quote per contract", async
   const rawObservationReceiveTimes: number[] = [];
   const rawObservationConnectionIds: number[] = [];
   const rawObservationSubscriptionSizes: number[] = [];
+  const rawEventTypes: string[] = [];
   let releaseFirst!: () => void;
   let markFirstStarted!: () => void;
   let markSecondFinished!: () => void;
@@ -157,6 +173,7 @@ test("OPRA backpressure keeps only the newest pending quote per contract", async
       rawObservationSubscriptionSizes.push(...observations.map((observation) =>
         observation.subscriptionSymbols?.length ?? 0));
     },
+    onRawEvents: (events) => rawEventTypes.push(...events.map((event) => event.type)),
     onQuotes: async (quotes) => {
       batches.push(quotes.map((quote) => ({ ...quote })));
       if (batches.length === 1) {
@@ -177,6 +194,7 @@ test("OPRA backpressure keeps only the newest pending quote per contract", async
   socket.send(encode([
     { T: "q", S: symbols[0], t: "2026-07-22T14:29:59.900Z", bp: 0.99, ap: 1.01, bs: 10, as: 12 },
     { T: "q", S: symbols[0], t: "2026-07-22T14:30:00.000Z", bp: 1, ap: 1.02, bs: 10, as: 12 },
+    { T: "t", S: symbols[0], t: "2026-07-22T14:30:00.000Z", p: 1.02, s: 20, x: "C" },
   ]));
   await firstStarted;
   send(symbols[0]!, "2026-07-22T14:30:00.100Z", 1.01);
@@ -200,6 +218,7 @@ test("OPRA backpressure keeps only the newest pending quote per contract", async
   assert.ok(rawObservationReceiveTimes.every(Number.isFinite));
   assert.deepEqual(new Set(rawObservationConnectionIds), new Set([1]));
   assert.ok(rawObservationSubscriptionSizes.every((size) => size === 2));
+  assert.deepEqual(rawEventTypes, ["quote", "quote", "trade", "quote", "quote", "quote"]);
   await stream.close();
 });
 
@@ -221,8 +240,23 @@ test("concrete Alpaca REST adapter uses paper-safe v2 option/order/account mappi
       strike_price: "500", type: "call", tradable: true, status: "active", open_interest: "1000",
     }] });
     if (url.includes("/v1beta1/options/snapshots?")) return json({ snapshots: {
-      SPY260722C00500000: { latestQuote: { t: "2026-07-22T14:30:00Z" }, impliedVolatility: 0.2,
-        greeks: { delta: 0.52, gamma: 0.03, theta: -0.1, vega: 0.02 }, dailyBar: { v: 500 } },
+      SPY260722C00500000: {
+        latestQuote: {
+          t: "2026-07-22T14:30:00Z", bp: 1, ap: 1.02, bs: 10, as: 12, bx: "C", ax: "H",
+        },
+        latestTrade: { t: "2026-07-22T14:29:59.900Z", p: 1.02, s: 15, x: "C" },
+        impliedVolatility: 0.2,
+        greeks: { delta: 0.52, gamma: 0.03, theta: -0.1, vega: 0.02 },
+        minuteBar: {
+          t: "2026-07-22T14:29:00Z", o: 0.98, h: 1.03, l: 0.97, c: 1.01, v: 100, n: 20, vw: 1,
+        },
+        dailyBar: {
+          t: "2026-07-22T13:30:00Z", o: 0.8, h: 1.1, l: 0.7, c: 1.01, v: 500, n: 80, vw: 0.95,
+        },
+        prevDailyBar: {
+          t: "2026-07-21T13:30:00Z", o: 0.7, h: 0.9, l: 0.6, c: 0.8, v: 400, n: 60, vw: 0.75,
+        },
+      },
     } });
     if (url.includes("/v1beta1/options/quotes/latest?")) return json({ quotes: {
       SPY260722C00500000: {
@@ -264,6 +298,11 @@ test("concrete Alpaca REST adapter uses paper-safe v2 option/order/account mappi
   assert.equal(contracts[0]!.openInterest, 1000);
   const snapshots = await client.getOptionSnapshots([contracts[0]!.symbol]);
   assert.equal(snapshots[0]!.greeks?.delta, 0.52);
+  assert.equal(snapshots[0]!.latestQuote?.askPrice, 1.02);
+  assert.equal(snapshots[0]!.latestTrade?.size, 15);
+  assert.equal(snapshots[0]!.minuteBar?.tradeCount, 20);
+  assert.equal(snapshots[0]!.dailyBar?.vwap, 0.95);
+  assert.equal(snapshots[0]!.previousDailyBar?.close, 0.8);
   assert.deepEqual(await client.getLatestOptionQuotes([contracts[0]!.symbol]), [{
     symbol: contracts[0]!.symbol,
     timestamp: Date.parse("2026-07-22T14:30:00Z"),

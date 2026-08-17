@@ -1,13 +1,7 @@
 export type Direction = "BULLISH" | "BEARISH";
 export type SignalKind = "IMPULSE" | "GRIND";
 export type OptionType = "call" | "put";
-export const UNDERLYING_SYMBOLS = ["SPY", "QQQ", "GOOGL"] as const;
-export type UnderlyingSymbol = typeof UNDERLYING_SYMBOLS[number];
-
-export function isUnderlyingSymbol(value: unknown): value is UnderlyingSymbol {
-  return typeof value === "string" &&
-    (UNDERLYING_SYMBOLS as readonly string[]).includes(value);
-}
+export type UnderlyingSymbol = "SPY" | "QQQ";
 
 export interface StockQuote {
   symbol: UnderlyingSymbol;
@@ -43,6 +37,27 @@ export interface OptionQuote {
   conditions?: string[];
 }
 
+export interface OptionTrade {
+  symbol: string;
+  /** Provider event time. Never replace this with local receive time. */
+  timestamp: number;
+  price: number;
+  size: number;
+  exchange?: string;
+  conditions?: string[];
+}
+
+export interface OptionBar {
+  timestamp: number;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume: number;
+  tradeCount?: number;
+  vwap?: number;
+}
+
 export interface OptionSnapshot {
   symbol: string;
   timestamp?: number;
@@ -55,6 +70,11 @@ export interface OptionSnapshot {
   };
   dailyVolume?: number;
   openInterest?: number;
+  latestQuote?: OptionQuote;
+  latestTrade?: OptionTrade;
+  minuteBar?: OptionBar;
+  dailyBar?: OptionBar;
+  previousDailyBar?: OptionBar;
 }
 
 export interface OptionContract {
@@ -313,6 +333,9 @@ export interface PositionState {
     holdingCostDollars: number;
     uncertaintyDollars: number;
     expectedChangeDollars: number;
+    alpacaFlowAdjustmentDollars?: number;
+    alpacaFlowScore?: number;
+    alpacaFlowEvidenceUsed?: boolean;
     lcbDollars: number;
     ivCrushDetected: boolean;
     /** Modeled estimates remain diagnostic until fresh provider Greeks are present. */

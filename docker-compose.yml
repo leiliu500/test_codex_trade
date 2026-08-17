@@ -7,7 +7,6 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-spy_options_local}
     volumes:
       - spy-options-postgres:/var/lib/postgresql/data
-    shm_size: 256mb
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U spy_options -d spy_options"]
       interval: 5s
@@ -32,9 +31,7 @@ services:
       MARKET_DATA_ENABLED: ${MARKET_DATA_ENABLED:-true}
       STOCK_DATA_FEED: sip
       OPTION_DATA_FEED: opra
-      OPTION_DATA_PROVIDER: ${OPTION_DATA_PROVIDER:-massive}
-      MARKET_DATA_CLOCK_OFFSET_MS: ${MARKET_DATA_CLOCK_OFFSET_MS:-0}
-      TRADING_SYMBOLS: ${TRADING_SYMBOLS:-SPY,QQQ,GOOGL}
+      TRADING_SYMBOLS: ${TRADING_SYMBOLS:-SPY,QQQ}
       HISTORY_DATABASE_ENABLED: "true"
       MARKET_HISTORY_QUOTE_SAMPLE_MS: ${MARKET_HISTORY_QUOTE_SAMPLE_MS:-250}
       MARKET_HISTORY_RETENTION_DAYS: ${MARKET_HISTORY_RETENTION_DAYS:-7}
@@ -55,7 +52,7 @@ services:
         - "fetch('http://127.0.0.1:3001/ready').then((response) => process.exit(response.ok ? 0 : 1)).catch(() => process.exit(1))"
       interval: 10s
       timeout: 3s
-      start_period: 120s
+      start_period: 10s
       retries: 3
     init: true
     restart: unless-stopped

@@ -1,4 +1,4 @@
-import type { OptionQuote } from "../types.js";
+import type { OptionQuote, OptionTrade } from "../types.js";
 import { performance } from "node:perf_hooks";
 import WebSocket, { type RawData } from "ws";
 import { decode, encode } from "@msgpack/msgpack";
@@ -11,11 +11,17 @@ export interface OptionStreamActivity {
   receiveMonotonicTimestamp: number;
 }
 
+export type OptionStreamEvent =
+  | { type: "quote"; value: OptionQuote }
+  | { type: "trade"; value: OptionTrade };
+
 export interface OptionStreamHandlers {
   onQuote(quote: OptionQuote): void | Promise<void>;
   onQuotes?(quotes: readonly OptionQuote[]): void | Promise<void>;
   /** Synchronous raw-arrival observation, before coalescing or asynchronous consumers. */
   onQuoteObservations?(observations: readonly OpraQuoteObservation[]): void;
+  /** Synchronous Alpaca provider events before quote coalescing. Keep this handler non-blocking. */
+  onRawEvents?(events: readonly OptionStreamEvent[], activity: OptionStreamActivity): void;
   /** Any OPRA frame, including control frames and frames for other subscribed symbols. */
   onActivity?(activity: OptionStreamActivity): void;
   onState?(connected: boolean): void;
@@ -123,13 +129,14 @@ export class AlpacaOptionWebSocket implements OptionStream {
           const binary = data instanceof ArrayBuffer ? new Uint8Array(data) : new Uint8Array(data as Buffer);
           const decoded = decode(binary) as Array<Record<string, unknown>>;
           const quotes: OptionQuote[] = [];
+          const trades: OptionTrade[] = [];
           for (const message of decoded) {
             if (message.T === "success" && message.msg === "authenticated") {
               this.#authenticated = true;
               if (this.#symbols.size > 0) {
                 const initialSubscription = this.#waitForSubscriptions(new Set(this.#symbols));
                 this.#subscriptionTail = initialSubscription.catch(() => undefined);
-                this.#send({ action: "subscribe", quotes: [...this.#symbols] });
+                this.#send({ action: "subscribe", quotes: [...this.#symbols], trades: [...this.#symbols] });
                 void initialSubscription.then(resolveOnce, rejectOnce);
               }
               else resolveOnce();
@@ -137,10 +144,21 @@ export class AlpacaOptionWebSocket implements OptionStream {
               const quotes = Array.isArray(message.quotes)
                 ? message.quotes.filter((symbol): symbol is string => typeof symbol === "string")
                 : [];
+              const trades = Array.isArray(message.trades)
+                ? message.trades.filter((symbol): symbol is string => typeof symbol === "string")
+                : [];
               handlers.onSubscriptions?.(quotes);
-              this.#acceptSubscriptionSnapshot(new Set(quotes));
+              this.#acceptSubscriptionSnapshot(new Set(quotes), new Set(trades));
             } else if (message.T === "q") quotes.push(adaptAlpacaOptionQuote(message));
+            else if (message.T === "t") trades.push(adaptAlpacaOptionTrade(message));
             else if (message.T === "error") throw new Error(`Alpaca option stream error ${String(message.code)}: ${String(message.msg)}`);
+          }
+          const rawEvents: OptionStreamEvent[] = [
+            ...quotes.map((quote) => ({ type: "quote" as const, value: quote })),
+            ...trades.map((trade) => ({ type: "trade" as const, value: trade })),
+          ].sort((left, right) => left.value.timestamp - right.value.timestamp);
+          if (rawEvents.length > 0) {
+            handlers.onRawEvents?.(rawEvents, { receiveWallTimestamp, receiveMonotonicTimestamp });
           }
           if (quotes.length > 0) {
             handlers.onQuoteObservations?.(quotes.map((quote) => ({
@@ -201,7 +219,7 @@ export class AlpacaOptionWebSocket implements OptionStream {
       if (!this.#authenticated) return;
       const acknowledgement = this.#waitForSubscriptions(new Set(this.#symbols));
       try {
-        this.#send({ action, quotes: unique });
+        this.#send({ action, quotes: unique, trades: unique });
       } catch (error) {
         this.#failSubscriptionWaiter(error);
       }
@@ -226,15 +244,19 @@ export class AlpacaOptionWebSocket implements OptionStream {
     });
   }
 
-  #acceptSubscriptionSnapshot(acknowledged: Set<string>): void {
+  #acceptSubscriptionSnapshot(acknowledgedQuotes: Set<string>, acknowledgedTrades: Set<string>): void {
     const waiter = this.#subscriptionWaiter;
     const target = waiter?.target ?? this.#symbols;
-    const missing = [...target].filter((symbol) => !acknowledged.has(symbol));
-    const unexpected = [...acknowledged].filter((symbol) => !target.has(symbol));
-    if (missing.length > 0 || unexpected.length > 0) {
+    const missingQuotes = [...target].filter((symbol) => !acknowledgedQuotes.has(symbol));
+    const unexpectedQuotes = [...acknowledgedQuotes].filter((symbol) => !target.has(symbol));
+    const missingTrades = [...target].filter((symbol) => !acknowledgedTrades.has(symbol));
+    const unexpectedTrades = [...acknowledgedTrades].filter((symbol) => !target.has(symbol));
+    if (missingQuotes.length > 0 || unexpectedQuotes.length > 0 ||
+        missingTrades.length > 0 || unexpectedTrades.length > 0) {
       const error = new Error(
         `${this.#config.feed.toUpperCase()} option subscription acknowledgement differs from requested state: ` +
-        `${missing.length} missing, ${unexpected.length} unexpected`,
+        `${missingQuotes.length} quote/${missingTrades.length} trade missing, ` +
+        `${unexpectedQuotes.length} quote/${unexpectedTrades.length} trade unexpected`,
       );
       this.#failSubscriptionWaiter(error);
       this.#failSocket(error);
@@ -327,4 +349,23 @@ export function adaptAlpacaOptionQuote(raw: Record<string, unknown>): OptionQuot
     throw new Error("Invalid Alpaca option quote payload");
   }
   return quote as OptionQuote;
+}
+
+export function adaptAlpacaOptionTrade(raw: Record<string, unknown>): OptionTrade {
+  const trade = {
+    symbol: raw.S,
+    timestamp: raw.t instanceof Date ? raw.t.getTime() :
+      typeof raw.t === "string" ? parseRfc3339ToMs(raw.t) : raw.t,
+    price: raw.p,
+    size: raw.s,
+    ...(typeof raw.x === "string" ? { exchange: raw.x } : {}),
+    ...(Array.isArray(raw.c)
+      ? { conditions: raw.c.filter((condition): condition is string => typeof condition === "string") }
+      : typeof raw.c === "string" ? { conditions: [raw.c] } : {}),
+  };
+  if (typeof trade.symbol !== "string" ||
+      ![trade.timestamp, trade.price, trade.size].every(Number.isFinite)) {
+    throw new Error("Invalid Alpaca option trade payload");
+  }
+  return trade as OptionTrade;
 }

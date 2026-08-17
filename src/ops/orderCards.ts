@@ -25,6 +25,9 @@ export interface DashboardOptionContinuation {
   holdingCostDollars?: number;
   uncertaintyDollars?: number;
   expectedChangeDollars?: number;
+  alpacaFlowAdjustmentDollars?: number;
+  alpacaFlowScore?: number;
+  alpacaFlowEvidenceUsed?: boolean;
   lcbDollars?: number;
   ivCrushDetected?: boolean;
   /** False when the estimate is modeled-only and cannot arm the Greeks exit. */
@@ -460,6 +463,9 @@ function sameOptionContinuation(
     sameDisplayedNumber(left.holdingCostDollars, right.holdingCostDollars, 100) &&
     sameDisplayedNumber(left.uncertaintyDollars, right.uncertaintyDollars, 100) &&
     sameDisplayedNumber(left.expectedChangeDollars, right.expectedChangeDollars, 100) &&
+    sameDisplayedNumber(left.alpacaFlowAdjustmentDollars, right.alpacaFlowAdjustmentDollars, 100) &&
+    sameDisplayedNumber(left.alpacaFlowScore, right.alpacaFlowScore, 1_000) &&
+    left.alpacaFlowEvidenceUsed === right.alpacaFlowEvidenceUsed &&
     sameDisplayedNumber(left.lcbDollars, right.lcbDollars, 100) &&
     left.ivCrushDetected === right.ivCrushDetected &&
     left.providerGreeksAvailable === right.providerGreeksAvailable;

@@ -1,6 +1,5 @@
 import defaultConfigJson from "../config/default.json" with { type: "json" };
 import qqqConfigJson from "../config/qqq.json" with { type: "json" };
-import googlConfigJson from "../config/googl.json" with { type: "json" };
 import { parseClock } from "./utils/time.js";
 import type { UnderlyingSymbol } from "./types.js";
 
@@ -177,7 +176,6 @@ export interface EngineConfig {
     orderPollMs: number;
     optionTickSize: number;
     entrySignalTtlMs: number;
-    maxEntryQuoteAgeMs: number;
     optionSelectionRetryMs: number;
     adverseFillSpreadFraction: number;
     exitTtlMinMs: number;
@@ -190,7 +188,6 @@ export interface EngineConfig {
     maxRiskDollarsPerTrade: number;
     maxPremiumDollarsPerTrade: number;
     maxContracts: number;
-    maxPositionsPerUnderlying: number;
     maxTradesPerDay: number;
     maxDailyLossDollars: number;
     hardOptionStopPct: number;
@@ -233,6 +230,12 @@ export interface EngineConfig {
     continuationConfidenceZ: number;
     continuationSpreadCostFraction: number;
     ivCrushThreshold: number;
+    alpacaOptionFeatures: {
+      windowMs: number;
+      minimumQuoteEvents: number;
+      minimumTradeEvents: number;
+      flowAdjustmentSpreadFraction: number;
+    };
   };
 }
 
@@ -261,9 +264,6 @@ export function mergeConfig(overrides: Partial<EngineConfig> = {}): EngineConfig
 /** QQQ starts from the unchanged SPY baseline but has an independent versioned override surface. */
 export const qqqConfig = deepFreeze(mergeConfig(qqqConfigJson as Partial<EngineConfig>));
 
-/** GOOGL starts from the SPY baseline and remains isolated behind its own versioned override surface. */
-export const googlConfig = deepFreeze(mergeConfig(googlConfigJson as Partial<EngineConfig>));
-
 export function validateConfig(config: EngineConfig): void {
   const fractions = [
     config.regression.halfLifeFraction,
@@ -279,9 +279,18 @@ export function validateConfig(config: EngineConfig): void {
     config.risk.recoveredRetentionBonus,
     config.risk.timeRetentionBonus,
     config.risk.continuationSpreadCostFraction,
+    config.risk.alpacaOptionFeatures.flowAdjustmentSpreadFraction,
   ];
   if (fractions.some((x) => !Number.isFinite(x) || x < 0 || x > 1)) {
     throw new Error("Configuration contains a fraction outside [0, 1]");
+  }
+  if (!(Number.isFinite(config.risk.alpacaOptionFeatures.windowMs) &&
+        config.risk.alpacaOptionFeatures.windowMs >= 1_000 &&
+        Number.isInteger(config.risk.alpacaOptionFeatures.minimumQuoteEvents) &&
+        config.risk.alpacaOptionFeatures.minimumQuoteEvents >= 2 &&
+        Number.isInteger(config.risk.alpacaOptionFeatures.minimumTradeEvents) &&
+        config.risk.alpacaOptionFeatures.minimumTradeEvents >= 0)) {
+    throw new Error("Alpaca option exit feature thresholds are invalid");
   }
   if (!(config.regression.fastWindowSec < config.regression.mediumWindowSec &&
         config.regression.mediumWindowSec < config.regression.slowWindowSec)) {
@@ -443,15 +452,7 @@ export function validateConfig(config: EngineConfig): void {
   if (config.risk.maxContracts !== 1) {
     throw new Error("Entry order sizing is hard-limited to exactly one option contract");
   }
-  if (!(Number.isInteger(config.risk.maxPositionsPerUnderlying) &&
-        config.risk.maxPositionsPerUnderlying > 0 &&
-        config.risk.maxPositionsPerUnderlying <= 10)) {
-    throw new Error("Maximum positions per underlying must be an integer in [1, 10]");
-  }
   if (!(config.execution.entrySignalTtlMs > 0 &&
-        Number.isFinite(config.execution.maxEntryQuoteAgeMs) &&
-        config.execution.maxEntryQuoteAgeMs > 0 &&
-        config.execution.maxEntryQuoteAgeMs <= config.dataQuality.maxOptionQuoteAgeMs &&
         Number.isFinite(config.execution.optionSelectionRetryMs) &&
         config.execution.optionSelectionRetryMs >= 0 &&
         config.execution.optionSelectionRetryMs <= config.execution.entrySignalTtlMs &&

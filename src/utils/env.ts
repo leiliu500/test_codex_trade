@@ -1,4 +1,4 @@
-import { isUnderlyingSymbol, UNDERLYING_SYMBOLS, type UnderlyingSymbol } from "../types.js";
+import type { UnderlyingSymbol } from "../types.js";
 
 export interface RuntimeEnvironment {
   tradingMode: "paper" | "live";
@@ -6,19 +6,16 @@ export interface RuntimeEnvironment {
   marketDataEnabled: boolean;
   stockDataFeed: "sip";
   optionDataFeed: "opra";
-  optionDataProvider: "massive" | "alpaca";
   tradingSymbols: readonly UnderlyingSymbol[];
   historyDatabaseEnabled: boolean;
   historyQuoteSampleMs: number;
   historyRetentionDays: number;
-  marketDataClockOffsetMs: number;
   databaseUrl?: string;
   killSwitch: boolean;
   healthHost: string;
   healthPort: number;
   alpacaApiKey?: string;
   alpacaApiSecret?: string;
-  massiveApiKey?: string;
 }
 
 export function readEnvironment(env: NodeJS.ProcessEnv = process.env): RuntimeEnvironment {
@@ -27,12 +24,10 @@ export function readEnvironment(env: NodeJS.ProcessEnv = process.env): RuntimeEn
   const marketDataEnabled = env.MARKET_DATA_ENABLED === "true";
   const stockDataFeed = env.STOCK_DATA_FEED ?? "sip";
   const optionDataFeed = env.OPTION_DATA_FEED ?? "opra";
-  const optionDataProvider = env.OPTION_DATA_PROVIDER ?? "massive";
   const tradingSymbols = parseTradingSymbols(env.TRADING_SYMBOLS ?? "SPY");
   const historyDatabaseEnabled = env.HISTORY_DATABASE_ENABLED === "true";
   const historyQuoteSampleMs = Number(env.MARKET_HISTORY_QUOTE_SAMPLE_MS ?? "250");
   const historyRetentionDays = Number(env.MARKET_HISTORY_RETENTION_DAYS ?? "7");
-  const marketDataClockOffsetMs = Number(env.MARKET_DATA_CLOCK_OFFSET_MS ?? "0");
   const healthPort = Number(env.HEALTH_PORT ?? "3001");
   const healthHost = env.HEALTH_HOST?.trim() || "127.0.0.1";
   if (!Number.isInteger(healthPort) || healthPort < 1 || healthPort > 65_535) {
@@ -44,14 +39,8 @@ export function readEnvironment(env: NodeJS.ProcessEnv = process.env): RuntimeEn
   if (!Number.isInteger(historyRetentionDays) || historyRetentionDays < 0 || historyRetentionDays > 3_650) {
     throw new Error("MARKET_HISTORY_RETENTION_DAYS must be an integer between 0 and 3650");
   }
-  if (!Number.isFinite(marketDataClockOffsetMs) || Math.abs(marketDataClockOffsetMs) > 10_000) {
-    throw new Error("MARKET_DATA_CLOCK_OFFSET_MS must be a finite local-minus-provider offset between -10000 and 10000");
-  }
   if (stockDataFeed !== "sip") throw new Error("This runtime is hard-limited to the SIP stock-data feed");
   if (optionDataFeed !== "opra") throw new Error("Executable option trading requires the real-time OPRA option-data feed");
-  if (optionDataProvider !== "massive" && optionDataProvider !== "alpaca") {
-    throw new Error("OPTION_DATA_PROVIDER must be massive or alpaca");
-  }
   if (liveOrdersEnabled && !marketDataEnabled) {
     throw new Error("Broker order execution requires MARKET_DATA_ENABLED=true");
   }
@@ -65,10 +54,7 @@ export function readEnvironment(env: NodeJS.ProcessEnv = process.env): RuntimeEn
     throw new Error("Live mode requires broker credentials");
   }
   if (marketDataEnabled && (!env.ALPACA_API_KEY || !env.ALPACA_API_SECRET)) {
-    throw new Error("Underlying SIP market data requires ALPACA_API_KEY and ALPACA_API_SECRET");
-  }
-  if (liveOrdersEnabled && optionDataProvider === "massive" && !env.MASSIVE_API_KEY) {
-    throw new Error("Massive OPRA market data requires MASSIVE_API_KEY");
+    throw new Error("SPY/QQQ SIP market data requires ALPACA_API_KEY and ALPACA_API_SECRET");
   }
   return {
     tradingMode,
@@ -76,26 +62,23 @@ export function readEnvironment(env: NodeJS.ProcessEnv = process.env): RuntimeEn
     marketDataEnabled,
     stockDataFeed,
     optionDataFeed,
-    optionDataProvider,
     tradingSymbols,
     historyDatabaseEnabled,
     historyQuoteSampleMs,
     historyRetentionDays,
-    marketDataClockOffsetMs,
     killSwitch: env.KILL_SWITCH === "true",
     healthHost,
     healthPort,
     ...(env.ALPACA_API_KEY ? { alpacaApiKey: env.ALPACA_API_KEY } : {}),
     ...(env.ALPACA_API_SECRET ? { alpacaApiSecret: env.ALPACA_API_SECRET } : {}),
-    ...(env.MASSIVE_API_KEY ? { massiveApiKey: env.MASSIVE_API_KEY } : {}),
     ...(env.DATABASE_URL ? { databaseUrl: env.DATABASE_URL } : {}),
   };
 }
 
 function parseTradingSymbols(value: string): UnderlyingSymbol[] {
   const symbols = [...new Set(value.split(",").map((symbol) => symbol.trim().toUpperCase()).filter(Boolean))];
-  if (symbols.length === 0 || symbols.some((symbol) => !isUnderlyingSymbol(symbol))) {
-    throw new Error(`TRADING_SYMBOLS must be a comma-separated subset of ${UNDERLYING_SYMBOLS.join(",")}`);
+  if (symbols.length === 0 || symbols.some((symbol) => symbol !== "SPY" && symbol !== "QQQ")) {
+    throw new Error("TRADING_SYMBOLS must be a comma-separated subset of SPY,QQQ");
   }
   return symbols as UnderlyingSymbol[];
 }
