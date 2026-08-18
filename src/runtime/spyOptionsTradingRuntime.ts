@@ -139,6 +139,7 @@ export class SpyOptionsTradingRuntime {
   readonly #rawObservedQuotes = new WeakMap<OptionQuote, OpraQuoteObservation>();
   readonly #lastOptionRestFingerprints = new Map<string, string>();
   #contracts: OptionContract[] = [];
+  #optionUniverseInitialized = false;
   #subscribedSymbols = new Set<string>();
   #optionConnected = false;
   #brokerAvailable = false;
@@ -856,7 +857,9 @@ export class SpyOptionsTradingRuntime {
     const streamsConnected = stock.websocketConnected && this.#optionConnected;
     const streamsReady = this.#marketDataIdle || streamsConnected;
     const hasOptionExposure = this.#execution.position !== undefined || this.#execution.pending !== undefined;
-    const optionSubscriptionsRequired = optionUniverseRequired(
+    const noSameDayOptionContracts = this.#optionUniverseInitialized && this.#contracts.length === 0 &&
+      !hasOptionExposure;
+    const optionSubscriptionsRequired = !noSameDayOptionContracts && optionUniverseRequired(
       now, this.#marketOpen, hasOptionExposure, this.#config,
     );
     const universeReady = this.#subscribedSymbols.size > 0 || !optionSubscriptionsRequired;
@@ -917,6 +920,8 @@ export class SpyOptionsTradingRuntime {
       optionQuoteStalled,
       optionQuoteStallThresholdMs: OPTION_QUOTE_STALL_TIMEOUT_MS,
       optionSubscriptionsRequired,
+      sameDayOptionContractCount: this.#contracts.length,
+      noSameDayOptionContracts,
       optionRestFallbackEnabled: this.#client.getLatestOptionQuotes !== undefined,
       optionRestFallbackInFlight: this.#optionRestRecoveryInFlight !== undefined,
       optionRestFallbackRequests: this.#optionRestFallbackRequests,
@@ -982,6 +987,11 @@ export class SpyOptionsTradingRuntime {
     }
     if (this.#executionEnabled && !this.#recorder.healthy()) reasons.push("AUDIT_RECORDER_UNHEALTHY");
     if (this.#executionEnabled && !this.#strategyStateReady) reasons.push("STRATEGY_STATE_NOT_READY");
+    if (this.#executionEnabled && this.#optionUniverseInitialized && this.#contracts.length === 0 &&
+        !this.#execution.position && !this.#execution.pending &&
+        optionUniverseRequired(timestamp, this.#marketOpen, false, this.#config)) {
+      reasons.push("NO_SAME_DAY_OPTION_CONTRACTS");
+    }
     if (this.#executionEnabled && !this.#stockReceiver.healthState(this.#killSwitch).websocketConnected) {
       reasons.push("STOCK_FEED_DISCONNECTED");
     }
@@ -1207,6 +1217,7 @@ export class SpyOptionsTradingRuntime {
     if (add.length > 0) subscriptionUpdates.push(this.#optionStream.subscribe(add));
 
     this.#contracts = contracts;
+    this.#optionUniverseInitialized = true;
     for (const contract of contracts) {
       this.#book.upsertContract(contract);
       this.#recordHistory("option_contract", timestamp, contract.symbol, { ...contract });
@@ -1561,6 +1572,8 @@ export class SpyOptionsTradingRuntime {
     if (this.#stopping || !this.#marketOpen || !this.#marketDataIdle) return;
     this.#marketDataIdle = false;
     this.#optionQuoteStalled = false;
+    this.#optionUniverseInitialized = false;
+    this.#contracts = [];
     this.#lastFeature = undefined;
     this.#lastRegime = undefined;
     this.#strategyStateMarketDate = marketDate(timestamp, this.#config.timeZone);

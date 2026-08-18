@@ -12,6 +12,8 @@ The option-only/day-only constraints are enforced at the contract-universe, sele
 
 SPY, QQQ, and GOOG use separate feature engines, opening ranges, VWAPs, signals, cooldowns, option books, positions, and restoration state. They share one SIP connection, one OPRA connection, and one broker account boundary. A portfolio coordinator atomically reserves aggregate option risk, premium, and buying power before any runtime can submit. QQQ and GOOG have independent override files at [`config/qqq.json`](config/qqq.json) and [`config/goog.json`](config/goog.json). Both currently inherit the unchanged SPY parameter baseline and therefore remain paper-validation configurations—not a claim that SPY calibration transfers to either symbol.
 
+GOOG trades only on sessions where the broker returns active same-day GOOG option contracts. A successful empty 0DTE universe is reported as `NO SAME-DAY OPTION CONTRACTS` and kept safely idle rather than treated as an OPRA failure; it cannot submit an order on such a session.
+
 Opposite-regime exits require persistence across at least three distinct feature observations for two seconds. This filters one-second classifier flicker without delaying hard-risk, stale-data, forced-session, or protected-profit exits.
 
 After a profitable `PROFIT_FLOOR_EXIT` or confirmed `OPPOSITE_REGIME` exit, one same-direction re-entry may bypass the remaining 600-second cooldown. The exception waits 10 seconds, expires after 120 seconds, requires the matching `STRONG_UP` or `STRONG_DOWN` regime, and is consumed by the next fill.

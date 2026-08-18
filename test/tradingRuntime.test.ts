@@ -39,6 +39,38 @@ test("option universe readiness follows the 0DTE cutoff while protecting open ex
   assert.equal(optionUniverseRequired(beforeCutoff, false, true, defaultConfig), false);
 });
 
+test("a successful empty same-day option universe is healthy safe-idle, not a feed failure", async () => {
+  const client = new FakeRuntimeClient();
+  client.contractList = [];
+  const recorder = new MemoryRecorder();
+  const runtime = new SpyOptionsTradingRuntime({
+    config: defaultConfig,
+    client,
+    stockStream: new FakeStockStream(),
+    optionStream: new FakeOptionStream(),
+    executionEnabled: true,
+    executionMode: "paper",
+    now: () => now,
+    executionTickMs: 60_000,
+    recorder,
+  });
+
+  await runtime.start();
+  const health = runtime.healthState();
+  assert.equal(health.ready, true);
+  assert.equal(health.sameDayOptionContractCount, 0);
+  assert.equal(health.noSameDayOptionContracts, true);
+  assert.equal(health.optionSubscriptionsRequired, false);
+  assert.equal(health.subscribedOptionContracts, 0);
+
+  await runtime.ingestFeature(bullishFeature());
+  const evaluation = recorder.events.filter((event) => event.type === "live_entry_evaluation").at(-1);
+  assert.equal(evaluation?.data.decision, "SKIPPED");
+  assert.ok((evaluation?.data.reasons as string[]).includes("NO_SAME_DAY_OPTION_CONTRACTS"));
+  assert.equal(client.requests.length, 0);
+  await runtime.close();
+});
+
 class FakeStockStream implements StockStream {
   handlers: StockStreamHandlers | undefined;
   connectCalls = 0;
