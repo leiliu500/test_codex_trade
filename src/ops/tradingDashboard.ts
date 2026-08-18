@@ -1320,11 +1320,12 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
     if (!clientOrderId) return;
     const existing = this.#orders.get(clientOrderId);
     if (!existing) return;
+    const brokerFillTimestamp = numberValue(broker.filledTimestamp);
     existing.updatedAt = event.timestamp;
     existing.status = stringValue(broker.status) ?? stringValue(local.status) ?? existing.status;
     const filledQuantity = numberValue(broker.filledQuantity) ?? numberValue(local.filledQuantity) ?? existing.filledQuantity;
     if (existing.filledQuantity === 0 && filledQuantity > 0 && existing.firstFillTimestamp === undefined) {
-      existing.firstFillTimestamp = event.timestamp;
+      existing.firstFillTimestamp = brokerFillTimestamp ?? event.timestamp;
     }
     existing.filledQuantity = filledQuantity;
     existing.limitPrice = numberValue(local.limitPrice) ?? existing.limitPrice;
@@ -1333,7 +1334,9 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
     if (brokerOrderId) existing.brokerOrderId = brokerOrderId;
     const averageFillPrice = positiveNumber(broker.averageFillPrice) ?? positiveNumber(local.averageFillPrice);
     if (averageFillPrice !== undefined) existing.averageFillPrice = averageFillPrice;
-    if (!isWorkingOrder(existing) && existing.completedTimestamp === undefined) existing.completedTimestamp = event.timestamp;
+    if (!isWorkingOrder(existing) && existing.completedTimestamp === undefined) {
+      existing.completedTimestamp = brokerFillTimestamp ?? event.timestamp;
+    }
   }
 
   #recordOrderReplacement(event: AuditEvent): void {
@@ -1438,7 +1441,7 @@ export class TradingDashboardStore implements AuditRecorder, MarketHistorySink {
     trade.exitNotional += quantity * price;
     trade.realizedPnl += numberValue(event.data.realizedPnl) ?? 0;
     if (trade.exitedQuantity > 0) trade.averageExitPrice = trade.exitNotional / trade.exitedQuantity;
-    trade.exitTimestamp = event.timestamp;
+    trade.exitTimestamp = numberValue(event.data.brokerFillTimestamp) ?? event.timestamp;
     trade.exitReason = stringValue(event.data.reason) ?? "UNKNOWN";
     const cost = trade.averageEntryPrice * 100 * trade.exitedQuantity;
     if (cost > 0) trade.returnPct = 100 * trade.realizedPnl / cost;
@@ -2244,7 +2247,7 @@ if(managementDetails.length)management.append(node('div','management-detail',man
 const fields=node('div','live-fields');
 fields.append(field('Position',x.remainingQuantity+' / '+x.quantity+' contracts'),field('Entry',x.entryPrice===undefined?'—':money(x.entryPrice)),field(x.active?'Bid / Ask':'Exit',x.active?(x.currentBid===undefined?'—':money(x.currentBid)+' / '+money(x.currentAsk)):(x.exitPrice===undefined?'—':money(x.exitPrice))),field('Hard stop',x.stopPrice===undefined?'—':money(x.stopPrice)),field('Protected floor',x.protectedFloorPnl===undefined?'—':money(x.protectedFloorPnl)),field('Elapsed',duration(x.elapsedMs)),field('Realized',money(x.realizedPnl)),field(x.active?'Quote age':'Exit reason',x.active?(x.quoteAgeMs===undefined?'Waiting for quote':duration(x.quoteAgeMs)):(x.exitReason||x.managementReason||x.status)),field('Direction',x.direction||'Pending entry'));
 fields.append(field('Entry time (ET)',orderFullTime(x.entryTimestamp)),field('Last monitored (ET)',orderFullTime(latestMonitoredAt)));
-if(!x.active)fields.append(field('Exit time (ET)',orderFullTime(x.exitTimestamp)));
+if(!x.active)fields.append(field('Pre-exit peak',x.bestObservedPnl===undefined?'—':money(x.bestObservedPnl)),field('Pending-exit peak',x.bestPendingExitObservedPnl===undefined?'—':money(x.bestPendingExitObservedPnl)),field('Exit time (ET)',orderFullTime(x.exitTimestamp)));
 card.append(head,quality,management,fields);
 if(x.workingOrder){const order=x.workingOrder,strip=node('div','order-strip'),row=node('div','order-strip-row'),left=node('span','',order.purpose+' '+order.status+' · '+order.filledQuantity+'/'+order.requestedQuantity+' filled'),right=node('span','',money(order.limitPrice)+' limit · '+order.replacements+' replaces'),details=[],triggerText=(order.triggers||x.exitTriggers||[]).map(value=>value.replaceAll('_',' ')).join(' · ');row.append(left,right);if(order.urgency!==undefined)details.push('urgency '+percent(100*order.urgency,0));if(order.actionTtlMs!==undefined)details.push('TTL '+order.actionTtlMs+' ms');if(order.priceCollar!==undefined)details.push('collar '+money(order.priceCollar));if(order.attempt!==undefined)details.push('attempt '+order.attempt);if(order.exitIntentId)details.push('intent '+order.exitIntentId);strip.append(row);if(details.length)strip.append(node('div','order-strip-detail',details.join(' · ')));if(triggerText)strip.append(node('div','order-strip-detail','Exit triggers · '+triggerText));card.append(strip)}
 const explicitControllerEvaluations=updates.filter(update=>update.source==='CONTROLLER').length,legacyControllerEvaluations=explicitControllerEvaluations?0:new Set(updates.filter(update=>update.source==='STATUS'&&update.managementDecision&&update.lifecycle!=='CLOSED'&&update.optionContinuation).map(update=>update.timestamp)).size,controllerEvaluations=explicitControllerEvaluations||legacyControllerEvaluations,pnlObservations=updates.reduce((maximum,update)=>Number.isFinite(update.pnlObservationCount)?Math.max(maximum,update.pnlObservationCount):maximum,0),managerPhases=updates.reduce((summary,update)=>{if(!update.managementDecision)return summary;const key=JSON.stringify([update.tradeState,update.managementDecision,update.managementReason,update.exitTriggers||[]]);if(key!==summary.key){summary.count+=1;summary.key=key}return summary},{count:0,key:''}).count,summaryParts=[updates.length+' durable updates'];if(controllerEvaluations)summaryParts.push(controllerEvaluations+' controller evaluations');if(pnlObservations)summaryParts.push(pnlObservations+' changed-P&L observations');if(managerPhases)summaryParts.push(managerPhases+' manager decision phases');const dynamics=node('div','dynamics'),title=node('div','dynamics-title','Timestamped durable timeline · '+summaryParts.join(' · ')),columns=node('div','dynamics-columns'),list=node('div','dynamics-list');

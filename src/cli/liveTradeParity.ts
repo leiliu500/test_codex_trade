@@ -117,6 +117,7 @@ async function main(): Promise<void> {
       const observedExit = aggregateObservedExit(exitRequest, exitFills);
       const events = await loadMarketEvents(
         client,
+        resolution.config.symbol,
         position.symbol,
         position.entryTimestamp - PRE_ENTRY_CONTEXT_MS,
         observedExit.fillTimestamp + POST_FILL_CONTEXT_MS,
@@ -129,7 +130,10 @@ async function main(): Promise<void> {
         observedExit,
         timerIntervalMs: resolution.timerIntervalMs,
         dailyRealizedPnlBeforeEntry: audits
-          .filter((event) => event.type === "exit_fill" && Number(event.timestamp) < position.entryTimestamp)
+          .filter((event) =>
+            event.type === "exit_fill" &&
+            Number(event.timestamp) < position.entryTimestamp &&
+            stringValue(event.data.underlying) === resolution.config.symbol)
           .reduce((sum, event) => sum + (numberValue(event.data.realizedPnl) ?? 0), 0),
       });
       reports.push({
@@ -194,6 +198,7 @@ async function loadAudits(client: Client, marketDate: string): Promise<AuditRow[
 
 async function loadMarketEvents(
   client: Client,
+  underlying: EngineConfig["symbol"],
   optionSymbol: string,
   startTimestamp: number,
   endTimestamp: number,
@@ -209,11 +214,11 @@ async function loadMarketEvents(
     FROM market_events
     WHERE received_timestamp BETWEEN $1 AND $2
       AND (
-        (event_type = 'feature_snapshot' AND symbol = 'SPY') OR
-        (event_type IN ('option_quote', 'option_snapshot') AND symbol = $3)
+        (event_type = 'feature_snapshot' AND symbol = $3) OR
+        (event_type IN ('option_quote', 'option_snapshot') AND symbol = $4)
       )
-    ORDER BY id
-  `, [startTimestamp, endTimestamp, optionSymbol]);
+    ORDER BY received_timestamp, id
+  `, [startTimestamp, endTimestamp, underlying, optionSymbol]);
   return result.rows.map((row) => {
     const common = {
       sequence: Number(row.id),
@@ -259,7 +264,8 @@ function aggregateObservedExit(
   }
   if (!(quantity > 0)) throw new Error("Exit audit has no positive broker-filled quantity");
   const decisionTimestamp = Number(request.timestamp);
-  const fillTimestamp = Number(ordered.at(-1)!.timestamp);
+  const fillTimestamp = numberValue(ordered.at(-1)!.data.brokerFillTimestamp) ??
+    Number(ordered.at(-1)!.timestamp);
   return {
     decisionTimestamp,
     fillTimestamp,

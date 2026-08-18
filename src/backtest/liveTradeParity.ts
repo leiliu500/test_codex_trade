@@ -286,7 +286,11 @@ function prepareEvents(
   symbol: string,
   config: EngineConfig,
 ): PreparedEvents {
-  const events = [...source].sort((left, right) => left.sequence - right.sequence);
+  // Batched PostgreSQL inserts can assign ids in flush order across independent
+  // feature and OPRA writers. Receiver wall time is the causal boundary; ids
+  // only break ties within the same receive timestamp.
+  const events = [...source].sort((left, right) =>
+    left.receivedTimestamp - right.receivedTimestamp || left.sequence - right.sequence);
   const steps: ReplayStep[] = [];
   const quoteBatches: Array<{ timestamp: number; quote: OptionQuote }> = [];
   const acceptedQuotes = new OptionBook();

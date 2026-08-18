@@ -10,7 +10,7 @@ import { SpyOptionsTradingRuntime } from "./runtime/spyOptionsTradingRuntime.js"
 import { SharedOptionStreamHub, SharedStockStreamHub } from "./runtime/sharedStreams.js";
 import { PortfolioRiskCoordinator } from "./risk/portfolioRiskCoordinator.js";
 import { CompositeRecorder, JsonLineRecorder, type AuditEvent } from "./ops/recorder.js";
-import { TradingDashboardStore } from "./ops/tradingDashboard.js";
+import { dashboardDisplayDate, TradingDashboardStore } from "./ops/tradingDashboard.js";
 import { PostgresHistoryStore } from "./history/postgresHistory.js";
 import { CompositeMarketHistorySink, SharedPriorityMarketHistoryHub } from "./history/types.js";
 import { JsonLogger } from "./utils/logger.js";
@@ -59,7 +59,7 @@ const restoredFeatureCheckpoints = new Map<UnderlyingSymbol, FeatureSnapshot>();
 if (history) {
   await history.initialize();
   [restoredEvents, restoredOrderCards] = await Promise.all([
-    history.loadAuditEvents(),
+    history.loadAuditEvents(50_000, dashboardDisplayDate(Date.now())),
     history.loadOrderCards(),
   ]);
   const checkpoints = await Promise.all(configs.map((config) =>

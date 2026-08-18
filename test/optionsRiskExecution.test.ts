@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { defaultConfig, validateConfig } from "../src/config.js";
+import { defaultConfig, qqqConfig, validateConfig } from "../src/config.js";
 import { blackScholes, impliedVolatility, noArbitrageBounds } from "../src/options/blackScholes.js";
 import { evaluateOptionCost, gammaAwareProjectedOptionMove } from "../src/options/costGate.js";
 import { formatOccSymbol, parseOccSymbol } from "../src/options/occSymbol.js";
@@ -617,6 +617,67 @@ test("winner protection never lowers an established executable profit floor", ()
   const newHigh = manager.evaluate(exitContext(position, timestamp + 3_000, 3.20));
   assert.equal(newHigh.exit, false);
   assert.ok(newHigh.updatedPosition.protectedFloorPnl! >= position.protectedFloorPnl!);
+});
+
+test("QQQ full-winner tuning protects the August 18 recovered winner one bid step earlier", () => {
+  const timestamp = zonedDateTimeToEpoch("2026-08-18", "11:09:07");
+  const baselineConfig = structuredClone(qqqConfig);
+  baselineConfig.risk.profitRetentionPeakScaleDollars = 100;
+  const position = new RiskManager(qqqConfig).createFilledPosition(
+    "QQQ260818P00717000", "BEARISH", 3, 1.74, timestamp, 717,
+  );
+  position.lowWaterPnl = -7.5;
+  // The retained live path reached this peak through many small observations;
+  // avoid manufacturing a one-sample volatility spike in the focused fixture.
+  position.lastPnlTimestamp = timestamp + 6_000;
+
+  const peakQuote = {
+    symbol: position.symbol,
+    timestamp: timestamp + 6_000,
+    bidPrice: 1.82,
+    askPrice: 1.83,
+    bidSize: 55,
+    askSize: 146,
+  };
+  const tunedPeak = new ExitManager(qqqConfig).evaluate({
+    timestamp: peakQuote.timestamp,
+    position,
+    optionQuote: peakQuote,
+    killSwitch: false,
+  });
+  const baselinePeak = new ExitManager(baselineConfig).evaluate({
+    timestamp: peakQuote.timestamp,
+    position,
+    optionQuote: peakQuote,
+    killSwitch: false,
+  });
+
+  assert.equal(tunedPeak.updatedPosition.tradeState, "PROTECTED_RECOVERED");
+  assert.ok(
+    tunedPeak.updatedPosition.protectedFloorPnl! >
+      baselinePeak.updatedPosition.protectedFloorPnl!,
+  );
+  const pullbackQuote = {
+    ...peakQuote,
+    timestamp: timestamp + 6_900,
+    bidPrice: 1.80,
+    askPrice: 1.83,
+  };
+  const tunedPullback = new ExitManager(qqqConfig).evaluate({
+    timestamp: pullbackQuote.timestamp,
+    position: tunedPeak.updatedPosition,
+    optionQuote: pullbackQuote,
+    killSwitch: false,
+  });
+  const baselinePullback = new ExitManager(baselineConfig).evaluate({
+    timestamp: pullbackQuote.timestamp,
+    position: baselinePeak.updatedPosition,
+    optionQuote: pullbackQuote,
+    killSwitch: false,
+  });
+
+  assert.equal(tunedPullback.reason, "PROFIT_FLOOR_EXIT");
+  assert.equal(baselinePullback.exit, false);
 });
 
 test("soft protection resets quote flicker and exits only a persistent buffered-floor breach", () => {
