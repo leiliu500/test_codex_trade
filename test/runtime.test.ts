@@ -91,6 +91,64 @@ test("market-closed idle is healthy without connected market-data sockets", () =
   assert.equal(healthReadiness(state).status, "ok");
 });
 
+test("dashboard database cleanup requires exact confirmation and a safe idle system", async (context) => {
+  const state: HealthState = {
+    ready: true,
+    marketDataIdle: true,
+    subscribedOptionContracts: 0,
+    websocketConnected: false,
+    brokerAvailable: true,
+    marketClockState: "market-closed-idle",
+    openOrderCount: 0,
+    positionsReconciled: true,
+    recorderHealthy: true,
+    killSwitch: false,
+  };
+  let cleanups = 0;
+  const dashboard = new TradingDashboardStore();
+  const server = startHealthServer(
+    () => state,
+    0,
+    "127.0.0.1",
+    () => dashboard.snapshot(),
+    async () => { cleanups += 1; },
+  );
+  context.after(() => new Promise<void>((resolve, reject) => {
+    server.close((error) => error ? reject(error) : resolve());
+  }));
+  await new Promise<void>((resolve) => server.once("listening", resolve));
+  const address = server.address() as AddressInfo;
+  const endpoint = `http://127.0.0.1:${address.port}/api/database/cleanup`;
+
+  const rejected = await fetch(endpoint, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ confirmation: "yes" }),
+  });
+  assert.equal(rejected.status, 400);
+  assert.equal(cleanups, 0);
+
+  const cleared = await fetch(endpoint, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ confirmation: "DELETE ALL DATABASE DATA" }),
+  });
+  assert.equal(cleared.status, 200);
+  assert.equal((await cleared.json() as { status: string }).status, "cleared");
+  assert.equal(cleanups, 1);
+
+  state.marketDataIdle = false;
+  state.marketClockState = "market-open";
+  const blocked = await fetch(endpoint, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ confirmation: "DELETE ALL DATABASE DATA" }),
+  });
+  assert.equal(blocked.status, 409);
+  assert.match((await blocked.json() as { error: string }).error, /market is open/i);
+  assert.equal(cleanups, 1);
+});
+
 test("combined health exposes the worst per-symbol OPRA provider lag", () => {
   const base: HealthState = {
     ready: true,

@@ -204,6 +204,14 @@ const server = startHealthServer(
   environment.healthPort,
   environment.healthHost,
   () => dashboard.snapshot(),
+  history ? async () => {
+    await history.clearAllData();
+    dashboard.clearHistory();
+    logger.log("warn", "postgres_history_cleared", {
+      source: "dashboard",
+      clearedAt: Date.now(),
+    });
+  } : undefined,
 );
 
 server.on("listening", () => {

@@ -100,6 +100,7 @@ export interface HistoryStore extends MarketHistorySink, OrderCardPersistence {
   loadLatestRecoveredFeature(
     marketDate: string, underlying?: UnderlyingSymbol,
   ): Promise<FeatureSnapshot | undefined>;
+  clearAllData(): Promise<void>;
   flush(): Promise<void>;
   close(): Promise<void>;
 }

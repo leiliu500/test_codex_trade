@@ -274,6 +274,54 @@ test("PostgreSQL history applies bounded age cleanup only when retention is enab
   await disabled.close();
 });
 
+test("PostgreSQL history cleanup drains queued writes and truncates every application table", async () => {
+  const client = new FakeDatabaseClient();
+  const store = new PostgresHistoryStore({
+    connectionString: "postgresql://unused",
+    client,
+    batchSize: 10,
+    flushIntervalMs: 60_000,
+    retentionDays: 0,
+  });
+  await store.initialize();
+  store.recordMarketEvent({
+    type: "stock_trade",
+    providerTimestamp: 1_000,
+    receivedTimestamp: 1_001,
+    marketDate: "2026-07-22",
+    symbol: "SPY",
+    data: { price: 500, size: 10 },
+  });
+
+  await store.clearAllData();
+
+  const insertIndex = client.queries.findIndex((query) => query.text.includes("INSERT INTO market_events"));
+  const truncateIndex = client.queries.findIndex((query) => query.text.includes("TRUNCATE TABLE"));
+  assert.ok(insertIndex >= 0 && truncateIndex > insertIndex);
+  const truncate = client.queries[truncateIndex]?.text ?? "";
+  assert.match(truncate, /order_card_updates/);
+  assert.match(truncate, /order_cards/);
+  assert.match(truncate, /order_lifecycle_events/);
+  assert.match(truncate, /order_lifecycle/);
+  assert.match(truncate, /audit_events/);
+  assert.match(truncate, /market_events/);
+  assert.match(truncate, /RESTART IDENTITY/);
+  assert.equal(store.healthy(), true);
+
+  store.recordMarketEvent({
+    type: "stock_trade",
+    providerTimestamp: 2_000,
+    receivedTimestamp: 2_001,
+    marketDate: "2026-07-22",
+    symbol: "SPY",
+    data: { price: 501, size: 5 },
+  });
+  await store.flush();
+  assert.ok(client.queries.findIndex((query, index) =>
+    index > truncateIndex && query.text.includes("INSERT INTO market_events")) > truncateIndex);
+  await store.close();
+});
+
 test("PostgreSQL history streams current-session SIP events in bounded pages", async () => {
   let page = 0;
   const rows = Array.from({ length: 101 }, (_unused, index) => ({
