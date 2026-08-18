@@ -1,5 +1,9 @@
-import { createServer, type Server } from "node:http";
-import { tradingDashboardHtml, type TradingDashboardSnapshot } from "./tradingDashboard.js";
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import {
+  DATABASE_CLEANUP_CONFIRMATION,
+  tradingDashboardHtml,
+  type TradingDashboardSnapshot,
+} from "./tradingDashboard.js";
 import type { CircuitState, OpraQuoteDiagnosis } from "../marketData/opraQuoteHealth.js";
 
 export interface HealthState {
@@ -227,12 +231,53 @@ export function clockDriftMs(providerTimestamp: number, localTimestamp = Date.no
   return Math.abs(localTimestamp - providerTimestamp);
 }
 
+export function databaseCleanupBlockReason(state: HealthState): string | undefined {
+  if (!state.positionsReconciled) return "Broker positions have not been reconciled";
+  if (state.positionOpen) return "An option position is open";
+  if (state.pendingOrder) return "An order is pending";
+  if (state.openOrderCount > 0) return `${state.openOrderCount} broker order(s) are still open`;
+  if (state.marketClockState === "market-open" || state.marketClockState === "mixed") {
+    return "The market is open";
+  }
+  const closedOrIdle = state.marketDataIdle === true || /(?:closed|idle)/i.test(state.marketClockState);
+  if (!closedOrIdle) return "The system is not confirmed market-closed and idle";
+  return undefined;
+}
+
+async function readCleanupConfirmation(request: IncomingMessage): Promise<string | undefined> {
+  const contentType = request.headers["content-type"] ?? "";
+  if (!contentType.toLowerCase().startsWith("application/json")) {
+    throw new Error("Content-Type must be application/json");
+  }
+  let body = "";
+  for await (const chunk of request) {
+    body += chunk.toString();
+    if (Buffer.byteLength(body) > 4_096) throw new Error("Request body is too large");
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body);
+  } catch {
+    throw new Error("Request body must contain valid JSON");
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+  const confirmation = (parsed as Record<string, unknown>).confirmation;
+  return typeof confirmation === "string" ? confirmation : undefined;
+}
+
+function sendJson(response: ServerResponse, status: number, body: Record<string, unknown>): void {
+  response.writeHead(status, { "content-type": "application/json" });
+  response.end(JSON.stringify(body));
+}
+
 export function startHealthServer(
   getState: () => HealthState,
   port = 3001,
   host = "127.0.0.1",
   getDashboard?: () => TradingDashboardSnapshot,
+  cleanupDatabase?: () => Promise<void>,
 ): Server {
+  let cleanupInProgress = false;
   const server = createServer((request, response) => {
     const health = healthReadiness(getState());
     response.setHeader("x-content-type-options", "nosniff");
@@ -245,6 +290,51 @@ export function startHealthServer(
     if (request.url === "/api/dashboard" && getDashboard) {
       response.writeHead(200, { "content-type": "application/json" });
       response.end(JSON.stringify({ ...getDashboard(), readiness: health.status, health: health.checks }));
+      return;
+    }
+    if (request.url === "/api/database/cleanup") {
+      if (request.method !== "POST") {
+        response.setHeader("allow", "POST");
+        sendJson(response, 405, { error: "method not allowed" });
+        return;
+      }
+      if (!cleanupDatabase) {
+        sendJson(response, 503, { error: "Database persistence is not enabled" });
+        return;
+      }
+      if (cleanupInProgress) {
+        sendJson(response, 409, { error: "A database cleanup is already in progress" });
+        return;
+      }
+      void (async () => {
+        let cleanupStarted = false;
+        try {
+          const confirmation = await readCleanupConfirmation(request);
+          if (confirmation !== DATABASE_CLEANUP_CONFIRMATION) {
+            sendJson(response, 400, { error: `Type ${DATABASE_CLEANUP_CONFIRMATION} exactly to confirm` });
+            return;
+          }
+          if (cleanupInProgress) {
+            sendJson(response, 409, { error: "A database cleanup is already in progress" });
+            return;
+          }
+          const blockedBy = databaseCleanupBlockReason(getState());
+          if (blockedBy) {
+            sendJson(response, 409, { error: `Database cleanup blocked: ${blockedBy}` });
+            return;
+          }
+          cleanupInProgress = true;
+          cleanupStarted = true;
+          await cleanupDatabase();
+          sendJson(response, 200, { status: "cleared", clearedAt: Date.now() });
+        } catch (error) {
+          sendJson(response, cleanupStarted ? 500 : 400, {
+            error: error instanceof Error ? error.message : "Database cleanup failed",
+          });
+        } finally {
+          if (cleanupStarted) cleanupInProgress = false;
+        }
+      })();
       return;
     }
     if (request.url === "/dashboard" && getDashboard) {

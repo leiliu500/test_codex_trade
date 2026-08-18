@@ -213,6 +213,7 @@ export class PostgresHistoryStore implements HistoryStore, AuditRecorder {
   #marketHealthy = false;
   #auditHealthy = false;
   #closed = false;
+  #clearing = false;
 
   constructor(options: PostgresHistoryStoreOptions) {
     this.#client = options.client ?? new Pool({ connectionString: options.connectionString, max: 8 });
@@ -230,15 +231,8 @@ export class PostgresHistoryStore implements HistoryStore, AuditRecorder {
     await this.#client.query(SCHEMA_SQL);
     this.#marketHealthy = true;
     this.#auditHealthy = true;
-    this.#flushTimer = setInterval(() => {
-      void this.flush().catch((error: unknown) => this.#recordError(error, "market"));
-    }, this.#flushIntervalMs);
-    if (this.#retentionDays > 0) {
-      await this.#runRetentionCleanup();
-      this.#retentionTimer = setInterval(() => {
-        void this.#runRetentionCleanup().catch((error: unknown) => this.#recordError(error, "market"));
-      }, this.#retentionCleanupIntervalMs);
-    }
+    if (this.#retentionDays > 0) await this.#runRetentionCleanup();
+    this.#startMaintenanceTimers();
   }
 
   recordMarketEvent(event: HistoricalMarketEvent): void {
@@ -644,6 +638,42 @@ export class PostgresHistoryStore implements HistoryStore, AuditRecorder {
     return result.rows[0]?.data;
   }
 
+  /** Permanently removes all application history while retaining its schema and indexes. */
+  async clearAllData(): Promise<void> {
+    if (this.#closed) throw new Error("Cannot clear history after the database store is closed");
+    if (this.#clearing) throw new Error("A database cleanup is already in progress");
+    this.#clearing = true;
+    if (this.#flushTimer) clearInterval(this.#flushTimer);
+    if (this.#retentionTimer) clearInterval(this.#retentionTimer);
+    this.#flushTimer = undefined;
+    this.#retentionTimer = undefined;
+    try {
+      await this.#retentionTail;
+      while (this.#queue.length > 0) await this.flush();
+      await this.#flushTail;
+      await this.#client.query(
+        `TRUNCATE TABLE
+           order_card_updates,
+           order_cards,
+           order_lifecycle_events,
+           order_lifecycle,
+           audit_events,
+           market_events
+         RESTART IDENTITY`,
+      );
+      this.#lastPersistedQuoteTimestamp.clear();
+      this.#marketHealthy = true;
+      this.#auditHealthy = true;
+    } catch (error) {
+      this.#recordError(error, "market");
+      this.#recordError(error, "audit");
+      throw error;
+    } finally {
+      this.#clearing = false;
+      if (!this.#closed) this.#startMaintenanceTimers();
+    }
+  }
+
   async close(): Promise<void> {
     if (this.#closed) return;
     if (this.#flushTimer) clearInterval(this.#flushTimer);
@@ -728,6 +758,19 @@ export class PostgresHistoryStore implements HistoryStore, AuditRecorder {
       .catch(() => undefined)
       .finally(() => { this.#retentionRunning = false; });
     return cleanup;
+  }
+
+  #startMaintenanceTimers(): void {
+    if (!this.#flushTimer) {
+      this.#flushTimer = setInterval(() => {
+        void this.flush().catch((error: unknown) => this.#recordError(error, "market"));
+      }, this.#flushIntervalMs);
+    }
+    if (this.#retentionDays > 0 && !this.#retentionTimer) {
+      this.#retentionTimer = setInterval(() => {
+        void this.#runRetentionCleanup().catch((error: unknown) => this.#recordError(error, "market"));
+      }, this.#retentionCleanupIntervalMs);
+    }
   }
 
   #recordError(error: unknown, channel: "market" | "audit"): void {

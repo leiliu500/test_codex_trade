@@ -449,8 +449,9 @@ export function validateConfig(config: EngineConfig): void {
   if (!(Number.isInteger(config.risk.maxTradesPerDay) && config.risk.maxTradesPerDay > 0)) {
     throw new Error("The daily safety entry limit must be a positive integer");
   }
-  if (config.risk.maxContracts !== 1) {
-    throw new Error("Entry order sizing is hard-limited to exactly one option contract");
+  if (!(Number.isInteger(config.risk.maxContracts) &&
+        config.risk.maxContracts >= 1 && config.risk.maxContracts <= 3)) {
+    throw new Error("Maximum contracts per entry must be an integer in [1, 3]");
   }
   if (!(config.execution.entrySignalTtlMs > 0 &&
         Number.isFinite(config.execution.optionSelectionRetryMs) &&

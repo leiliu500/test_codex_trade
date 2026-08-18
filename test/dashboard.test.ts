@@ -107,9 +107,48 @@ test("dashboard exposes liveness and feed tabs before any entries, orders, or hi
   assert.match(html, /h\.completedBars/);
   assert.match(html, /bars restored at startup/);
   assert.match(html, /live bars/);
+  assert.match(html, /Clean up database/);
+  assert.match(html, /DELETE ALL DATABASE DATA/);
+  assert.match(html, /\/api\/database\/cleanup/);
+  assert.match(html, /permanently deletes all stored trading data/i);
   const script = html.match(/<script>([\s\S]*)<\/script>/)?.[1];
   assert.ok(script);
   assert.doesNotThrow(() => new Function(script));
+});
+
+test("dashboard cleanup resets its complete in-memory history view", () => {
+  const dashboard = historicalDashboard();
+  dashboard.recordMarketEvent({
+    type: "stock_trade",
+    providerTimestamp: timestamp,
+    receivedTimestamp: timestamp,
+    marketDate: "2026-07-22",
+    symbol: "SPY",
+    data: { symbol: "SPY", price: 500, size: 10 },
+  });
+  dashboard.record(event("live_signal_selection", {
+    signalId: "cleanup-signal",
+    direction: "BULLISH",
+    kind: "IMPULSE",
+    regime: "STRONG_UP",
+    candidate: symbol,
+    selectionStatus: "SELECTED",
+    selectionReasons: [],
+  }));
+  assert.equal(dashboard.snapshot().liveData.totalEvents, 1);
+  assert.equal(dashboard.snapshot().signals.length, 1);
+
+  dashboard.clearHistory();
+
+  const snapshot = dashboard.snapshot();
+  assert.equal(snapshot.liveData.totalEvents, 0);
+  assert.deepEqual(snapshot.liveData.recentEvents, []);
+  assert.deepEqual(snapshot.signals, []);
+  assert.deepEqual(snapshot.orders, []);
+  assert.deepEqual(snapshot.trades, []);
+  assert.deepEqual(snapshot.orderCards, []);
+  assert.deepEqual(snapshot.decisions, []);
+  assert.equal(snapshot.lastMarketDate, undefined);
 });
 
 test("dashboard decision timeline keeps each late-grind confirmation monitoring time", () => {
