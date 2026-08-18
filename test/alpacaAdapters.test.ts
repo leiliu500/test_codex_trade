@@ -19,6 +19,12 @@ test("Alpaca market-data boundary maps official compact schemas", () => {
   assert.deepEqual(quote.conditions, ["R"]);
   const trade = adaptAlpacaStockTrade({ T: "t", S: "SPY", t: time, p: 500.01, s: 25, x: "D", c: ["@"] });
   assert.equal(trade.exchange, "D");
+  assert.equal(adaptAlpacaStockQuote({ T: "q", S: "GOOG", t: time, bp: 180, ap: 180.01, bs: 10, as: 12 }).symbol, "GOOG");
+  assert.equal(adaptAlpacaStockTrade({ T: "t", S: "GOOG", t: time, p: 180.01, s: 25 }).symbol, "GOOG");
+  assert.throws(
+    () => adaptAlpacaStockQuote({ T: "q", S: "GOOGL", t: time, bp: 180, ap: 180.01, bs: 10, as: 12 }),
+    /Invalid Alpaca stock quote payload/,
+  );
   const option = adaptAlpacaOptionQuote({
     T: "q", S: "SPY260724C00500000", t: time, bp: 1, ap: 1.02, bs: 20, as: 30,
     bx: "C", ax: "H", c: "B",

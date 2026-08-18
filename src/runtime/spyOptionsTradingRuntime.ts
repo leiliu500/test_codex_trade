@@ -4,9 +4,10 @@ import { AlpacaOptionFeatureEngine } from "../alpaca/optionFeatures.js";
 import type { StockStream } from "../alpaca/stockStream.js";
 import type { StockStreamEvent } from "../alpaca/stockStream.js";
 import type { TradingRestClient } from "../alpaca/restClient.js";
-import type {
-  AccountState, FeatureSnapshot, OptionCandidateEvaluation, OptionContract, OptionQuote, RegimeDecision,
-  StockQuote, TradeSignal, UnderlyingSymbol,
+import {
+  isUnderlyingSymbol, type AccountState, type FeatureSnapshot, type OptionCandidateEvaluation,
+  type OptionContract, type OptionQuote, type RegimeDecision, type StockQuote, type TradeSignal,
+  type UnderlyingSymbol,
 } from "../types.js";
 import type { HealthState } from "../ops/healthServer.js";
 import type { AuditEvent, AuditRecorder } from "../ops/recorder.js";
@@ -1860,7 +1861,7 @@ function auditEventBelongsToUnderlying(event: AuditEvent, underlying: Underlying
   for (const symbol of candidates) {
     const parsed = symbol ? parseOccSymbol(symbol) : undefined;
     if (parsed) return parsed.underlying === underlying;
-    if (symbol === "SPY" || symbol === "QQQ") return symbol === underlying;
+    if (isUnderlyingSymbol(symbol)) return symbol === underlying;
   }
   // Untagged historical audit events predate multi-underlying support and are SPY-only.
   return underlying === "SPY";

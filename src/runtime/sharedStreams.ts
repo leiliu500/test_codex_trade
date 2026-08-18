@@ -17,6 +17,7 @@ export class SharedStockStreamHub {
   readonly #channels = new Map<UnderlyingSymbol, StockChannelState>();
   #connected = false;
   #connection: Promise<void> | undefined;
+  #closeOperation: Promise<void> | undefined;
 
   constructor(physical: StockStream, underlyings: readonly UnderlyingSymbol[]) {
     this.#physical = physical;
@@ -32,6 +33,7 @@ export class SharedStockStreamHub {
   }
 
   async #connectChannel(underlying: UnderlyingSymbol, handlers: StockStreamHandlers): Promise<void> {
+    await this.#closeOperation;
     const state = this.#channels.get(underlying)!;
     if (state.active) throw new Error(`${underlying} SIP channel is already connected`);
     state.active = true;
@@ -50,10 +52,17 @@ export class SharedStockStreamHub {
     state.handlers?.onState?.(false);
     state.handlers = undefined;
     if ([...this.#channels.values()].some((channel) => channel.active)) return;
-    await this.#connection?.catch(() => undefined);
-    await this.#physical.close();
-    this.#connected = false;
-    this.#connection = undefined;
+    await this.#closePhysical();
+  }
+
+  #closePhysical(): Promise<void> {
+    this.#closeOperation ??= (async () => {
+      await this.#connection?.catch(() => undefined);
+      await this.#physical.close();
+      this.#connected = false;
+      this.#connection = undefined;
+    })().finally(() => { this.#closeOperation = undefined; });
+    return this.#closeOperation;
   }
 
   async #ensureConnected(): Promise<void> {
@@ -117,6 +126,7 @@ export class SharedOptionStreamHub {
   readonly #applied = new Set<string>();
   #connected = false;
   #connection: Promise<void> | undefined;
+  #closeOperation: Promise<void> | undefined;
   #reconcileTail: Promise<void> = Promise.resolve();
 
   constructor(physical: OptionStream, underlyings: readonly UnderlyingSymbol[]) {
@@ -137,6 +147,7 @@ export class SharedOptionStreamHub {
   }
 
   async #connectChannel(underlying: UnderlyingSymbol, handlers: OptionStreamHandlers): Promise<void> {
+    await this.#closeOperation;
     const state = this.#channels.get(underlying)!;
     if (state.active) throw new Error(`${underlying} OPRA channel is already connected`);
     state.active = true;
@@ -154,11 +165,18 @@ export class SharedOptionStreamHub {
     state.handlers = undefined;
     await this.#queueReconcile();
     if ([...this.#channels.values()].some((channel) => channel.active)) return;
-    await this.#connection?.catch(() => undefined);
-    await this.#physical.close();
-    this.#connected = false;
-    this.#connection = undefined;
-    this.#applied.clear();
+    await this.#closePhysical();
+  }
+
+  #closePhysical(): Promise<void> {
+    this.#closeOperation ??= (async () => {
+      await this.#connection?.catch(() => undefined);
+      await this.#physical.close();
+      this.#connected = false;
+      this.#connection = undefined;
+      this.#applied.clear();
+    })().finally(() => { this.#closeOperation = undefined; });
+    return this.#closeOperation;
   }
 
   async #updateDesired(

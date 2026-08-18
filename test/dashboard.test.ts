@@ -50,6 +50,7 @@ test("dashboard exposes liveness and feed tabs before any entries, orders, or hi
   assert.match(html, /Dashboard scope/);
   assert.match(html, /SPY only/);
   assert.match(html, /QQQ only/);
+  assert.match(html, /GOOG only/);
   assert.match(html, /underlyingViews/);
   assert.match(html, /Showing isolated/);
   assert.match(html, /Order manager/);
