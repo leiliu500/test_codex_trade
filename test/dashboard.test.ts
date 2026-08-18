@@ -51,9 +51,11 @@ test("dashboard exposes liveness and feed tabs before any entries, orders, or hi
   assert.match(html, /SPY only/);
   assert.match(html, /QQQ only/);
   assert.match(html, /GOOGL only/);
+  assert.match(html, /IWM only/);
   assert.match(html, /NO SAME-DAY OPTION CONTRACTS/);
   assert.match(html, /underlyingViews/);
   assert.match(html, /Showing isolated/);
+  assert.ok(snapshot.underlyingViews.IWM);
   assert.match(html, /Order manager/);
   assert.match(html, /Executable P&L/);
   assert.match(html, /Profit floor/);

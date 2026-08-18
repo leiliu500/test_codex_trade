@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { defaultConfig, googlConfig, qqqConfig } from "../src/config.js";
+import { defaultConfig, googlConfig, iwmConfig, qqqConfig } from "../src/config.js";
 import type {
   AccountState, FeatureSnapshot, OptionContract, OptionQuote, OptionSnapshot, OptionTrade, StockQuote, StockTrade,
   TradeSignal, UnderlyingSymbol, WindowMetrics,
@@ -28,17 +28,21 @@ const timestamp = zonedDateTimeToEpoch(date, "10:20:00");
 const spyOption = "SPY260722C00500000";
 const qqqOption = "QQQ260722C00600000";
 const googlOption = "GOOGL260722C00180000";
+const iwmOption = "IWM260722C00230000";
 
-test("QQQ and GOOGL have independent configurations and reject cross-underlying contracts", () => {
+test("QQQ, GOOGL, and IWM have independent configurations and reject cross-underlying contracts", () => {
   assert.equal(defaultConfig.symbol, "SPY");
   assert.equal(qqqConfig.symbol, "QQQ");
   assert.equal(googlConfig.symbol, "GOOGL");
+  assert.equal(iwmConfig.symbol, "IWM");
   assert.notEqual(qqqConfig.version, defaultConfig.version);
   assert.notEqual(googlConfig.version, defaultConfig.version);
+  assert.notEqual(iwmConfig.version, defaultConfig.version);
   assert.notEqual(googlConfig.version, qqqConfig.version);
   assert.equal(defaultConfig.risk.maxContracts, 3);
   assert.equal(qqqConfig.risk.maxContracts, 3);
   assert.equal(googlConfig.risk.maxContracts, 3);
+  assert.equal(iwmConfig.risk.maxContracts, 3);
   assert.equal(qqqConfig.risk.onePositionAtATime, true);
   const qqq: OptionContract = {
     symbol: qqqOption, underlying: "QQQ", expirationDate: date, strike: 600,
@@ -52,11 +56,17 @@ test("QQQ and GOOGL have independent configurations and reject cross-underlying 
     symbol: googlOption, underlying: "GOOGL", expirationDate: date, strike: 180,
     type: "call", active: true, tradable: true,
   };
+  const iwm: OptionContract = {
+    symbol: iwmOption, underlying: "IWM", expirationDate: date, strike: 230,
+    type: "call", active: true, tradable: true,
+  };
   assert.deepEqual(sameDayOptionContractReasons(qqq, timestamp, qqqConfig.timeZone, "QQQ"), []);
   assert.deepEqual(sameDayOptionContractReasons(spy, timestamp, qqqConfig.timeZone, "QQQ"), ["WRONG_UNDERLYING"]);
   assert.deepEqual(sameDayOptionContractReasons(spy, timestamp, defaultConfig.timeZone, "SPY"), []);
   assert.deepEqual(sameDayOptionContractReasons(googl, timestamp, googlConfig.timeZone, "GOOGL"), []);
   assert.deepEqual(sameDayOptionContractReasons(qqq, timestamp, googlConfig.timeZone, "GOOGL"), ["WRONG_UNDERLYING"]);
+  assert.deepEqual(sameDayOptionContractReasons(iwm, timestamp, iwmConfig.timeZone, "IWM"), []);
+  assert.deepEqual(sameDayOptionContractReasons(spy, timestamp, iwmConfig.timeZone, "IWM"), ["WRONG_UNDERLYING"]);
 });
 
 test("feature engines stamp their own underlying and restoration state remains isolated", () => {
@@ -242,11 +252,12 @@ test("portfolio coordinator atomically permits one reservation for each of SPY, 
   assert.deepEqual((await coordinator.snapshot(timestamp)).activeUnderlyings.sort(), ["GOOGL", "SPY"]);
 });
 
-test("synthetic SPY, QQQ, and GOOGL replays select and fill only their own option contracts", async () => {
-  const [spy, qqq, googl] = await Promise.all([
+test("synthetic SPY, QQQ, GOOGL, and IWM replays select and fill only their own option contracts", async () => {
+  const [spy, qqq, googl, iwm] = await Promise.all([
     replayOne(defaultConfig, "SPY", spyOption, 500),
     replayOne(qqqConfig, "QQQ", qqqOption, 600),
     replayOne(googlConfig, "GOOGL", googlOption, 180),
+    replayOne(iwmConfig, "IWM", iwmOption, 230),
   ]);
   assert.equal(spy.funnel.ordersSubmitted, 1);
   assert.equal(spy.funnel.fills, 1);
@@ -254,15 +265,20 @@ test("synthetic SPY, QQQ, and GOOGL replays select and fill only their own optio
   assert.equal(qqq.funnel.fills, 1);
   assert.equal(googl.funnel.ordersSubmitted, 1);
   assert.equal(googl.funnel.fills, 1);
+  assert.equal(iwm.funnel.ordersSubmitted, 1);
+  assert.equal(iwm.funnel.fills, 1);
   assert.equal(spy.openPosition?.symbol, spyOption);
   assert.equal(qqq.openPosition?.symbol, qqqOption);
   assert.equal(googl.openPosition?.symbol, googlOption);
+  assert.equal(iwm.openPosition?.symbol, iwmOption);
   assert.equal(spy.metadata.underlying, "SPY");
   assert.equal(qqq.metadata.underlying, "QQQ");
   assert.equal(googl.metadata.underlying, "GOOGL");
+  assert.equal(iwm.metadata.underlying, "IWM");
   assert.equal(spy.metadata.configVersion, defaultConfig.version);
   assert.equal(qqq.metadata.configVersion, qqqConfig.version);
   assert.equal(googl.metadata.configVersion, googlConfig.version);
+  assert.equal(iwm.metadata.configVersion, iwmConfig.version);
 });
 
 test("live order managers share the portfolio reservation before broker submission", async () => {
@@ -615,7 +631,7 @@ async function replayOne(
   config.signals.entryConfirmationMode = "SHADOW";
   config.signals.followThroughMinSec = 0;
   config.signals.followThroughMaxSec = 0;
-  const optionBid = underlying === "GOOGL" ? 0.7 : 2;
+  const optionBid = underlying === "GOOGL" || underlying === "IWM" ? 0.7 : 2;
   const engine = new ReplayEngine({ config });
   await engine.ingest({
     type: "option_contract", timestamp: timestamp - 30,
