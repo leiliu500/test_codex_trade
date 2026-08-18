@@ -11,7 +11,7 @@
       "import": "./dist/src/index.js"
     }
   },
-  "description": "Causal isolated SPY, QQQ, and GOOG intraday options research, replay, execution, and portfolio-risk engine",
+  "description": "Causal isolated SPY, QQQ, and GOOGL intraday options research, replay, execution, and portfolio-risk engine",
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "build:prod": "tsc -p tsconfig.build.json",

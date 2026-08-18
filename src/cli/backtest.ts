@@ -1,6 +1,6 @@
 import { createReadStream, readFileSync } from "node:fs";
 import { createInterface } from "node:readline";
-import { defaultConfig, googConfig, qqqConfig } from "../config.js";
+import { defaultConfig, googlConfig, qqqConfig } from "../config.js";
 import { isUnderlyingSymbol, type CalibrationProfile } from "../types.js";
 import { ReplayEngine, type FillModel } from "../backtest/replay.js";
 import { parseReplayLine } from "../backtest/replay.js";
@@ -15,14 +15,14 @@ async function main(): Promise<void> {
   const positional = args.filter((argument) => !argument.startsWith("--symbol="));
   const path = positional[0];
   if (!path) {
-    throw new Error("Usage: npm run backtest -- <events.jsonl> [conservative|midpoint-touch|queue] [calibration.json] [--symbol=SPY|QQQ|GOOG]");
+    throw new Error("Usage: npm run backtest -- <events.jsonl> [conservative|midpoint-touch|queue] [calibration.json] [--symbol=SPY|QQQ|GOOGL]");
   }
   const fillModel = (positional[1] ?? "conservative") as FillModel;
   if (!new Set(["conservative", "midpoint-touch", "queue"]).has(fillModel)) throw new Error(`Unknown fill model: ${fillModel}`);
   const calibrationPath = positional[2];
   const calibration = calibrationPath
     ? JSON.parse(readFileSync(calibrationPath, "utf8")) as CalibrationProfile : undefined;
-  const config = symbol === "QQQ" ? qqqConfig : symbol === "GOOG" ? googConfig : defaultConfig;
+  const config = symbol === "QQQ" ? qqqConfig : symbol === "GOOGL" ? googlConfig : defaultConfig;
   const engine = new ReplayEngine({ config, fillModel, ...(calibration ? { calibration } : {}) });
   const lines = createInterface({ input: createReadStream(path), crlfDelay: Infinity });
   let lineNumber = 0;

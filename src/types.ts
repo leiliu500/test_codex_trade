@@ -1,7 +1,7 @@
 export type Direction = "BULLISH" | "BEARISH";
 export type SignalKind = "IMPULSE" | "GRIND";
 export type OptionType = "call" | "put";
-export const UNDERLYING_SYMBOLS = ["SPY", "QQQ", "GOOG"] as const;
+export const UNDERLYING_SYMBOLS = ["SPY", "QQQ", "GOOGL"] as const;
 export type UnderlyingSymbol = typeof UNDERLYING_SYMBOLS[number];
 
 export function isUnderlyingSymbol(value: unknown): value is UnderlyingSymbol {

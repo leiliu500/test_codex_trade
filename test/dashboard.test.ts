@@ -50,7 +50,7 @@ test("dashboard exposes liveness and feed tabs before any entries, orders, or hi
   assert.match(html, /Dashboard scope/);
   assert.match(html, /SPY only/);
   assert.match(html, /QQQ only/);
-  assert.match(html, /GOOG only/);
+  assert.match(html, /GOOGL only/);
   assert.match(html, /NO SAME-DAY OPTION CONTRACTS/);
   assert.match(html, /underlyingViews/);
   assert.match(html, /Showing isolated/);
@@ -116,6 +116,34 @@ test("dashboard exposes liveness and feed tabs before any entries, orders, or hi
   const script = html.match(/<script>([\s\S]*)<\/script>/)?.[1];
   assert.ok(script);
   assert.doesNotThrow(() => new Function(script));
+});
+
+test("dashboard ignores persisted events from a removed underlying instead of assigning them to SPY", () => {
+  const dashboard = historicalDashboard();
+  dashboard.record(event("live_signal_selection", {
+    underlying: "GOOG",
+    signalId: "legacy-goog-signal",
+    timestamp,
+    candidate: "GOOG260722C00340000",
+    direction: "BULLISH",
+    kind: "IMPULSE",
+    regime: "STRONG_UP",
+    selectionStatus: "SELECTED",
+  }));
+  dashboard.recordMarketEvent({
+    type: "stock_quote",
+    marketDate: "2026-07-22",
+    symbol: "GOOG",
+    providerTimestamp: timestamp,
+    receivedTimestamp: timestamp,
+    data: { symbol: "GOOG" },
+  });
+
+  const snapshot = dashboard.snapshot();
+  assert.equal(snapshot.signals.length, 0);
+  assert.equal(snapshot.underlyingViews.SPY.signals.length, 0);
+  assert.equal(snapshot.liveData.totalEvents, 0);
+  assert.equal(snapshot.underlyingViews.SPY.liveData.totalEvents, 0);
 });
 
 test("dashboard cleanup resets its complete in-memory history view", () => {

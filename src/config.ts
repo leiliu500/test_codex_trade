@@ -1,6 +1,6 @@
 import defaultConfigJson from "../config/default.json" with { type: "json" };
 import qqqConfigJson from "../config/qqq.json" with { type: "json" };
-import googConfigJson from "../config/goog.json" with { type: "json" };
+import googlConfigJson from "../config/googl.json" with { type: "json" };
 import { parseClock } from "./utils/time.js";
 import type { UnderlyingSymbol } from "./types.js";
 
@@ -265,8 +265,8 @@ export function mergeConfig(overrides: Partial<EngineConfig> = {}): EngineConfig
 /** QQQ starts from the unchanged SPY baseline but has an independent versioned override surface. */
 export const qqqConfig = deepFreeze(mergeConfig(qqqConfigJson as Partial<EngineConfig>));
 
-/** GOOG starts from the unchanged SPY baseline but has an independent versioned override surface. */
-export const googConfig = deepFreeze(mergeConfig(googConfigJson as Partial<EngineConfig>));
+/** GOOGL starts from the unchanged SPY baseline but has an independent versioned override surface. */
+export const googlConfig = deepFreeze(mergeConfig(googlConfigJson as Partial<EngineConfig>));
 
 export function validateConfig(config: EngineConfig): void {
   const fractions = [
