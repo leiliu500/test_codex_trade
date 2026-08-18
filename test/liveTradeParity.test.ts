@@ -56,6 +56,25 @@ test("live trade parity collapses an OPRA callback to its last accepted active q
   assert.ok(Math.abs((result.pnl.quoteBidAtObservedFill ?? Infinity) - 2) < 1e-9);
 });
 
+test("live trade parity orders asynchronously flushed rows by receiver time", () => {
+  const earlier = entryTimestamp + 1_000;
+  const later = entryTimestamp + 2_000;
+  const events: LiveManagementEvent[] = [
+    quoteEvent(1, later, quote(later - 1, 2.20, 2.22)),
+    quoteEvent(2, earlier, quote(earlier - 1, 2.02, 2.04)),
+  ];
+
+  const result = replayLiveTradeManagement({
+    config: defaultConfig,
+    position: protectedWinner(),
+    events,
+    timerIntervalMs: 0,
+  });
+
+  assert.equal(result.modeledExit?.timestamp, earlier);
+  assert.equal(result.modeledExit?.quote.bidPrice, 2.02);
+});
+
 function protectedWinner(): PositionState {
   return {
     symbol,

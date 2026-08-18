@@ -279,6 +279,10 @@ test("synthetic SPY, QQQ, GOOGL, and IWM replays select and fill only their own 
   assert.equal(qqq.metadata.configVersion, qqqConfig.version);
   assert.equal(googl.metadata.configVersion, googlConfig.version);
   assert.equal(iwm.metadata.configVersion, iwmConfig.version);
+  assert.equal(defaultConfig.risk.profitRetentionPeakScaleDollars, 100);
+  assert.equal(qqqConfig.risk.profitRetentionPeakScaleDollars, 50);
+  assert.equal(googlConfig.risk.profitRetentionPeakScaleDollars, 100);
+  assert.equal(iwmConfig.risk.profitRetentionPeakScaleDollars, 100);
 });
 
 test("live order managers share the portfolio reservation before broker submission", async () => {

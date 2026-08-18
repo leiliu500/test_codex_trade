@@ -703,6 +703,65 @@ test("order cards classify entry quality from the best observed and final P&L", 
   assert.equal(classified([], 0), "NOT_RATED");
 });
 
+test("order-card peaks separate pre-exit opportunity from pending-exit quote movement", () => {
+  const result = classifyOrderCardEntryQuality({
+    id: "fill-latency-quality",
+    symbol,
+    active: false,
+    stage: "CLOSED",
+    status: "filled",
+    quantity: 3,
+    remainingQuantity: 0,
+    realizedPnl: 9,
+    totalPnl: 9,
+    updates: [{
+      timestamp,
+      stage: "POSITION_OPEN",
+      status: "filled",
+      remainingQuantity: 3,
+      realizedPnl: 0,
+      totalPnl: 12,
+    }, {
+      timestamp: timestamp + 100,
+      stage: "EXIT_WORKING",
+      status: "pending_new",
+      remainingQuantity: 3,
+      realizedPnl: 0,
+      totalPnl: 15,
+    }, {
+      timestamp: timestamp + 200,
+      stage: "CLOSED",
+      status: "filled",
+      remainingQuantity: 0,
+      realizedPnl: 9,
+      totalPnl: 9,
+    }],
+  });
+
+  assert.equal(result.bestObservedPnl, 12);
+  assert.equal(result.bestPendingExitObservedPnl, 15);
+  assert.match(result.entryQualityReason, /pre-exit \+\$12\.00/);
+});
+
+test("dashboard prefers broker fill time over later local fill observation", () => {
+  const dashboard = historicalDashboard();
+  dashboard.record(event("entry_fill", {
+    position: {
+      symbol, direction: "BULLISH", quantity: 1, averageEntryPrice: 2,
+      entryTimestamp: timestamp, tradeState: "OPEN_UNPROTECTED",
+      executablePnl: 0, highWaterPnl: 0, lowWaterPnl: 0,
+    },
+  }));
+  dashboard.record(event("exit_fill", {
+    reason: "TREND_INVALIDATION", symbol, direction: "BULLISH", entryTimestamp: timestamp,
+    averageEntryPrice: 2, incrementalQuantity: 1, incrementalPrice: 2.1,
+    realizedPnl: 10, remainingQuantity: 0,
+    brokerFillTimestamp: timestamp + 900,
+  }, 1_200));
+
+  assert.equal(dashboard.snapshot().trades[0]?.exitTimestamp, timestamp + 900);
+});
+
 test("completed cards keep the exit order from their own trade window when symbols repeat", () => {
   const dashboard = historicalDashboard();
   dashboard.record(event("entry_fill", {

@@ -1,4 +1,7 @@
 {
-  "version": "qqq-0dte-isolated-baseline-3-three-contract-cap",
-  "symbol": "QQQ"
+  "version": "qqq-0dte-isolated-baseline-4-tighter-profit-retention",
+  "symbol": "QQQ",
+  "risk": {
+    "profitRetentionPeakScaleDollars": 50
+  }
 }

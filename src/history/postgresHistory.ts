@@ -64,6 +64,21 @@ interface OrderCardQuoteRow extends QueryResultRow {
   ask_price: string | number;
 }
 
+const PRESERVED_DASHBOARD_AUDIT_EVENT_TYPES = [
+  "live_signal_selection",
+  "late_bullish_grind_confirmation",
+  "risk_decision",
+  "entry_blocked",
+  "paper_order_submission_result",
+  "broker_order_request",
+  "broker_order_state",
+  "broker_order_replaced",
+  "entry_fill",
+  "order_management_state",
+  "exit_fill",
+  "execution_halted",
+] as const;
+
 const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS market_events (
   id BIGSERIAL PRIMARY KEY,
@@ -354,16 +369,37 @@ export class PostgresHistoryStore implements HistoryStore, AuditRecorder {
     return result;
   }
 
-  async loadAuditEvents(limit = 50_000): Promise<AuditEvent[]> {
+  async loadAuditEvents(limit = 50_000, preserveMarketDate?: string): Promise<AuditEvent[]> {
     const boundedLimit = Math.max(1, Math.min(250_000, Math.floor(limit)));
-    const result = await this.#client.query<AuditRow>(
-      `SELECT event_timestamp, market_date, event_type, config_version, calibration_version, data
-       FROM (
-         SELECT id, event_timestamp, market_date, event_type, config_version, calibration_version, data
-         FROM audit_events ORDER BY id DESC LIMIT $1
-       ) recent ORDER BY id ASC`,
-      [boundedLimit],
-    );
+    const result = preserveMarketDate
+      ? await this.#client.query<AuditRow>(
+        `SELECT event_timestamp, market_date, event_type, config_version, calibration_version, data
+         FROM audit_events
+         WHERE id IN (
+           SELECT id FROM (
+             SELECT id FROM audit_events ORDER BY id DESC LIMIT $1
+           ) recent
+           UNION
+           SELECT id FROM audit_events
+           WHERE market_date = $2::date
+             AND event_type = ANY($3::text[])
+           UNION
+           SELECT id FROM audit_events
+           WHERE market_date = $2::date
+             AND event_type = 'live_entry_evaluation'
+             AND data ->> 'decision' = 'SIGNAL'
+         )
+         ORDER BY id ASC`,
+        [boundedLimit, preserveMarketDate, [...PRESERVED_DASHBOARD_AUDIT_EVENT_TYPES]],
+      )
+      : await this.#client.query<AuditRow>(
+        `SELECT event_timestamp, market_date, event_type, config_version, calibration_version, data
+         FROM (
+           SELECT id, event_timestamp, market_date, event_type, config_version, calibration_version, data
+           FROM audit_events ORDER BY id DESC LIMIT $1
+         ) recent ORDER BY id ASC`,
+        [boundedLimit],
+      );
     return result.rows.map((row) => ({
       timestamp: Number(row.event_timestamp),
       ...(row.market_date ? { marketDate: formatDatabaseDate(row.market_date) } : {}),

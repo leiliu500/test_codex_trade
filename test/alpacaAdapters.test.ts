@@ -280,6 +280,7 @@ test("concrete Alpaca REST adapter uses paper-safe v2 option/order/account mappi
     if (url.endsWith("/v2/orders/broker-id") && !init?.method) return json({
       id: "broker-id", client_order_id: "client-id", symbol: "SPY260722C00500000",
       status: "partially_filled", filled_qty: "1", filled_avg_price: "1.02",
+      filled_at: "2026-07-22T14:30:00.125Z",
     });
     if (url.includes("/v2/orders/broker-id") && init?.method === "PATCH") return json({
       id: "broker-id-2", client_order_id: "client-id", symbol: "SPY260722C00500000",
@@ -325,7 +326,9 @@ test("concrete Alpaca REST adapter uses paper-safe v2 option/order/account mappi
     clientOrderId: "client-id", symbol: contracts[0]!.symbol, side: "buy", quantity: 1, limitPrice: 1.02, timeInForce: "day",
   });
   assert.equal(order.status, "new");
-  assert.equal((await client.getOrder("broker-id")).filledQuantity, 1);
+  const filledOrder = await client.getOrder("broker-id");
+  assert.equal(filledOrder.filledQuantity, 1);
+  assert.equal(filledOrder.filledTimestamp, Date.parse("2026-07-22T14:30:00.125Z"));
   assert.equal((await client.getOrderByClientOrderId("client-id")).id, "broker-id");
   assert.equal((await client.replaceOrder("broker-id", 1.03)).averageFillPrice, 1.02);
   await client.cancelOrder("broker-id");

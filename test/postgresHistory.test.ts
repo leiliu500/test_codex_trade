@@ -69,6 +69,24 @@ test("PostgreSQL history creates schema, batches market data, and durably insert
   await store.close();
 });
 
+test("PostgreSQL audit restore preserves the displayed day's dashboard lifecycle beyond the recent window", async () => {
+  const client = new FakeDatabaseClient();
+  const store = new PostgresHistoryStore({ connectionString: "postgresql://unused", client });
+
+  await store.loadAuditEvents(50_000, "2026-08-18");
+
+  const restore = client.queries.find((query) => query.text.includes("data ->> 'decision' = 'SIGNAL'"));
+  assert.ok(restore);
+  assert.deepEqual(restore.values.slice(0, 2), [50_000, "2026-08-18"]);
+  assert.ok(Array.isArray(restore.values[2]));
+  assert.ok((restore.values[2] as string[]).includes("live_signal_selection"));
+  assert.ok((restore.values[2] as string[]).includes("risk_decision"));
+  assert.ok((restore.values[2] as string[]).includes("broker_order_request"));
+  assert.ok((restore.values[2] as string[]).includes("entry_fill"));
+  assert.ok((restore.values[2] as string[]).includes("exit_fill"));
+  assert.match(restore.text, /ORDER BY id ASC/);
+});
+
 test("PostgreSQL history saves completed order cards with their full dynamics list", async () => {
   const client = new FakeDatabaseClient();
   const store = new PostgresHistoryStore({

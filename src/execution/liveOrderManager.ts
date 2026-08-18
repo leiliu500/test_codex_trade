@@ -667,6 +667,9 @@ export class LiveOrderManager {
         this.#lifecycle = this.#position?.tradeState ?? "FLAT";
         await this.#audit(timestamp, "entry_fill", {
           signalId: pending.signalId,
+          ...(broker.filledTimestamp !== undefined
+            ? { brokerFillTimestamp: broker.filledTimestamp }
+            : {}),
           incrementalQuantity, incrementalPrice, cumulativeQuantity: totalFilled, position: this.#position,
         });
       } else if (this.#position) {
@@ -690,6 +693,9 @@ export class LiveOrderManager {
         }
         await this.#audit(timestamp, "exit_fill", {
           reason: pending.exitReason, incrementalQuantity, incrementalPrice, realizedPnl,
+          ...(broker.filledTimestamp !== undefined
+            ? { brokerFillTimestamp: broker.filledTimestamp }
+            : {}),
           exitIntentId: pending.exitIntentId,
           exitTriggers: this.#exitIntent?.triggers ?? [],
           symbol: exitingPosition.symbol, direction: exitingPosition.direction,

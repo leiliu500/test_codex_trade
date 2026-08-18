@@ -85,7 +85,7 @@ export class SharedPriorityMarketHistoryHub {
 export interface HistoryStore extends MarketHistorySink, OrderCardPersistence {
   initialize(): Promise<void>;
   record(event: AuditEvent): void | Promise<void>;
-  loadAuditEvents(limit?: number): Promise<AuditEvent[]>;
+  loadAuditEvents(limit?: number, preserveMarketDate?: string): Promise<AuditEvent[]>;
   loadOrderCards(limit?: number): Promise<DashboardOrderCard[]>;
   loadOrderCardQuotes(cards: readonly DashboardOrderCard[]): Promise<Map<string, DashboardOrderQuote[]>>;
   loadReplayEvents(marketDate: string, underlying?: UnderlyingSymbol): Promise<Array<{

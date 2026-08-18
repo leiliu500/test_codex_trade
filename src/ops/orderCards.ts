@@ -108,7 +108,10 @@ export interface DashboardOrderCard extends DashboardOrderManagement {
   exitReason?: string;
   entryQuality?: DashboardOrderEntryQuality;
   entryQualityReason?: string;
+  /** Best bid-mark P&L before an exit order was working. */
   bestObservedPnl?: number;
+  /** Diagnostic peak while an exit order was already working. */
+  bestPendingExitObservedPnl?: number;
   workingOrder?: {
     clientOrderId: string;
     brokerOrderId?: string;
@@ -138,14 +141,31 @@ export function classifyOrderCardEntryQuality(card: DashboardOrderCard): {
   entryQuality: DashboardOrderEntryQuality;
   entryQualityReason: string;
   bestObservedPnl?: number;
+  bestPendingExitObservedPnl?: number;
 } {
-  const observedPnl = card.updates
+  const preExitObservedPnl = card.updates
+    .filter((update) => update.stage !== "EXIT_WORKING" && update.stage !== "CLOSED")
     .map((update) => update.totalPnl ?? update.unrealizedPnl)
     .filter((value): value is number => value !== undefined && Number.isFinite(value));
+  const allObservedPnl = card.updates
+    .map((update) => update.totalPnl ?? update.unrealizedPnl)
+    .filter((value): value is number => value !== undefined && Number.isFinite(value));
+  const observedPnl = preExitObservedPnl.length > 0 ? preExitObservedPnl : allObservedPnl;
+  const pendingExitObservedPnl = card.updates
+    .filter((update) => update.stage === "EXIT_WORKING")
+    .map((update) => update.totalPnl ?? update.unrealizedPnl)
+    .filter((value): value is number => value !== undefined && Number.isFinite(value));
+  const pendingExitPeak = pendingExitObservedPnl.length > 0
+    ? Math.max(...pendingExitObservedPnl)
+    : undefined;
+  const pendingExitFields = pendingExitPeak === undefined
+    ? {}
+    : { bestPendingExitObservedPnl: pendingExitPeak };
   if (observedPnl.length === 0) {
     return {
       entryQuality: "NOT_RATED",
       entryQualityReason: "No post-fill P&L observations are available yet.",
+      ...pendingExitFields,
     };
   }
 
@@ -162,15 +182,17 @@ export function classifyOrderCardEntryQuality(card: DashboardOrderCard): {
       return {
         entryQuality: "GOOD",
         entryQualityReason:
-          `Reached meaningful entry protection with best observed P&L ${formatSignedPnl(bestObservedPnl)}.`,
+          `Reached meaningful entry protection with best pre-exit P&L ${formatSignedPnl(bestObservedPnl)}.`,
         bestObservedPnl,
+        ...pendingExitFields,
       };
     }
     return {
       entryQuality: "EVALUATING",
       entryQualityReason:
-        `Position is active; best observed P&L is ${formatSignedPnl(bestObservedPnl)} and entry protection requires ${formatSignedPnl(meaningfulProfit)}.`,
+        `Position is active; best pre-exit P&L is ${formatSignedPnl(bestObservedPnl)} and entry protection requires ${formatSignedPnl(meaningfulProfit)}.`,
       bestObservedPnl,
+      ...pendingExitFields,
     };
   }
   if (meaningfulProfitReached) {
@@ -178,30 +200,34 @@ export function classifyOrderCardEntryQuality(card: DashboardOrderCard): {
       return {
         entryQuality: "GOOD",
         entryQualityReason:
-          `Reached meaningful entry protection at ${formatSignedPnl(bestObservedPnl)} and closed ${formatSignedPnl(finalPnl)}.`,
+          `Reached meaningful entry protection at a pre-exit ${formatSignedPnl(bestObservedPnl)} and closed ${formatSignedPnl(finalPnl)}.`,
         bestObservedPnl,
+        ...pendingExitFields,
       };
     }
     return {
       entryQuality: "GOOD_ENTRY_POOR_EXIT",
       entryQualityReason:
-        `Reached meaningful entry protection at ${formatSignedPnl(bestObservedPnl)}, but closed ${formatSignedPnl(finalPnl)}.`,
+        `Reached meaningful entry protection at a pre-exit ${formatSignedPnl(bestObservedPnl)}, but closed ${formatSignedPnl(finalPnl)}.`,
       bestObservedPnl,
+      ...pendingExitFields,
     };
   }
   if (bestObservedPnl >= -epsilon) {
     return {
       entryQuality: "MARGINAL",
       entryQualityReason:
-        `Reached only ${formatSignedPnl(bestObservedPnl)}, below the ${formatSignedPnl(meaningfulProfit)} entry-quality threshold, and closed ${formatSignedPnl(finalPnl)}.`,
+        `Reached only a pre-exit ${formatSignedPnl(bestObservedPnl)}, below the ${formatSignedPnl(meaningfulProfit)} entry-quality threshold, and closed ${formatSignedPnl(finalPnl)}.`,
       bestObservedPnl,
+      ...pendingExitFields,
     };
   }
   return {
     entryQuality: "POOR",
     entryQualityReason:
-      `Never recovered the opening spread; best observed P&L was ${formatSignedPnl(bestObservedPnl)} and never approached ${formatSignedPnl(meaningfulProfit)} protection.`,
+      `Never recovered the opening spread; best pre-exit P&L was ${formatSignedPnl(bestObservedPnl)} and never approached ${formatSignedPnl(meaningfulProfit)} protection.`,
     bestObservedPnl,
+    ...pendingExitFields,
   };
 }
 

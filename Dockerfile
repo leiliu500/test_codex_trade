@@ -28,6 +28,7 @@ WORKDIR /app
 COPY --chown=node:node package.json package-lock.json ./
 COPY --chown=node:node --from=production-dependencies /app/node_modules ./node_modules
 COPY --chown=node:node --from=build /app/dist ./dist
+COPY --chown=node:node --from=build /app/config ./config
 
 USER node
 EXPOSE 3001

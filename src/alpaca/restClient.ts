@@ -29,6 +29,8 @@ export interface BrokerOrder {
   status: string;
   filledQuantity: number;
   averageFillPrice?: number;
+  /** Broker-reported execution time; local observation time remains the audit-event timestamp. */
+  filledTimestamp?: number;
 }
 
 export interface BrokerPosition {
@@ -78,6 +80,7 @@ interface RawOrder {
   status: string;
   filled_qty: string;
   filled_avg_price?: string | null;
+  filled_at?: string | null;
 }
 
 export class AlpacaTradingRestClient implements MultiUnderlyingTradingRestClient {
@@ -497,6 +500,7 @@ function mapOrder(raw: RawOrder): BrokerOrder {
     id: raw.id, clientOrderId: raw.client_order_id, symbol: raw.symbol, status: raw.status,
     filledQuantity: Number(raw.filled_qty),
     ...(raw.filled_avg_price != null ? { averageFillPrice: Number(raw.filled_avg_price) } : {}),
+    ...(raw.filled_at != null ? { filledTimestamp: parseRfc3339ToMs(raw.filled_at) } : {}),
   };
 }
 
