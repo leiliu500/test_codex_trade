@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { defaultConfig, qqqConfig } from "../src/config.js";
+import { defaultConfig, googlConfig, qqqConfig } from "../src/config.js";
 import type {
   AccountState, FeatureSnapshot, OptionContract, OptionQuote, OptionSnapshot, OptionTrade, StockQuote, StockTrade,
   TradeSignal, UnderlyingSymbol, WindowMetrics,
@@ -27,13 +27,18 @@ const date = "2026-07-22";
 const timestamp = zonedDateTimeToEpoch(date, "10:20:00");
 const spyOption = "SPY260722C00500000";
 const qqqOption = "QQQ260722C00600000";
+const googlOption = "GOOGL260722C00180000";
 
-test("QQQ has an independent configuration and rejects SPY contracts without mutating SPY", () => {
+test("QQQ and GOOGL have independent configurations and reject cross-underlying contracts", () => {
   assert.equal(defaultConfig.symbol, "SPY");
   assert.equal(qqqConfig.symbol, "QQQ");
+  assert.equal(googlConfig.symbol, "GOOGL");
   assert.notEqual(qqqConfig.version, defaultConfig.version);
+  assert.notEqual(googlConfig.version, defaultConfig.version);
+  assert.notEqual(googlConfig.version, qqqConfig.version);
   assert.equal(defaultConfig.risk.maxContracts, 3);
   assert.equal(qqqConfig.risk.maxContracts, 3);
+  assert.equal(googlConfig.risk.maxContracts, 3);
   assert.equal(qqqConfig.risk.onePositionAtATime, true);
   const qqq: OptionContract = {
     symbol: qqqOption, underlying: "QQQ", expirationDate: date, strike: 600,
@@ -43,9 +48,15 @@ test("QQQ has an independent configuration and rejects SPY contracts without mut
     symbol: spyOption, underlying: "SPY", expirationDate: date, strike: 500,
     type: "call", active: true, tradable: true,
   };
+  const googl: OptionContract = {
+    symbol: googlOption, underlying: "GOOGL", expirationDate: date, strike: 180,
+    type: "call", active: true, tradable: true,
+  };
   assert.deepEqual(sameDayOptionContractReasons(qqq, timestamp, qqqConfig.timeZone, "QQQ"), []);
   assert.deepEqual(sameDayOptionContractReasons(spy, timestamp, qqqConfig.timeZone, "QQQ"), ["WRONG_UNDERLYING"]);
   assert.deepEqual(sameDayOptionContractReasons(spy, timestamp, defaultConfig.timeZone, "SPY"), []);
+  assert.deepEqual(sameDayOptionContractReasons(googl, timestamp, googlConfig.timeZone, "GOOGL"), []);
+  assert.deepEqual(sameDayOptionContractReasons(qqq, timestamp, googlConfig.timeZone, "GOOGL"), ["WRONG_UNDERLYING"]);
 });
 
 test("feature engines stamp their own underlying and restoration state remains isolated", () => {
@@ -62,6 +73,8 @@ test("feature engines stamp their own underlying and restoration state remains i
     audit("exit_fill", "SPY", { realizedPnl: 5, direction: "BULLISH", reason: "TRAILING_PROFIT" }),
     audit("entry_fill", "QQQ", { position: { symbol: qqqOption, direction: "BULLISH", entryTimestamp: timestamp + 1 } }),
     audit("exit_fill", "QQQ", { realizedPnl: -3, direction: "BULLISH", reason: "HARD_STOP" }),
+    audit("entry_fill", "GOOGL", { position: { symbol: googlOption, direction: "BULLISH", entryTimestamp: timestamp + 2 } }),
+    audit("exit_fill", "GOOGL", { realizedPnl: 7, direction: "BULLISH", reason: "TRAILING_PROFIT" }),
   ];
   assert.deepEqual(restoreRuntimeState(events, timestamp, defaultConfig.timeZone, "SPY").risk, {
     marketDate: date, entries: 1, realizedPnl: 5,
@@ -69,33 +82,42 @@ test("feature engines stamp their own underlying and restoration state remains i
   assert.deepEqual(restoreRuntimeState(events, timestamp, defaultConfig.timeZone, "QQQ").risk, {
     marketDate: date, entries: 1, realizedPnl: -3,
   });
+  assert.deepEqual(restoreRuntimeState(events, timestamp, defaultConfig.timeZone, "GOOGL").risk, {
+    marketDate: date, entries: 1, realizedPnl: 7,
+  });
 });
 
 test("shared SIP and OPRA hubs route events and union subscriptions without cross-symbol leakage", async () => {
   const stock = new FakeStockStream();
-  const stockHub = new SharedStockStreamHub(stock, ["SPY", "QQQ"]);
+  const stockHub = new SharedStockStreamHub(stock, ["SPY", "QQQ", "GOOGL"]);
   const spyStocks: string[] = [];
   const qqqStocks: string[] = [];
+  const googlStocks: string[] = [];
   const spyChannel = stockHub.channel("SPY");
   const qqqChannel = stockHub.channel("QQQ");
+  const googlChannel = stockHub.channel("GOOGL");
   await Promise.all([
     spyChannel.connect(stockCollector(spyStocks)),
     qqqChannel.connect(stockCollector(qqqStocks)),
+    googlChannel.connect(stockCollector(googlStocks)),
   ]);
   await stock.emit([
     { type: "quote", value: stockQuote("SPY", 500) },
     { type: "trade", value: stockTrade("QQQ", 600) },
+    { type: "quote", value: stockQuote("GOOGL", 180) },
   ]);
   assert.deepEqual(spyStocks, ["SPY"]);
   assert.deepEqual(qqqStocks, ["QQQ"]);
+  assert.deepEqual(googlStocks, ["GOOGL"]);
   assert.equal(stock.connectCalls, 1);
   await spyChannel.close();
   assert.equal(stock.closeCalls, 0);
 
   const option = new FakeOptionStream();
-  const optionHub = new SharedOptionStreamHub(option, ["SPY", "QQQ"]);
+  const optionHub = new SharedOptionStreamHub(option, ["SPY", "QQQ", "GOOGL"]);
   const spyOptions: string[] = [];
   const qqqOptions: string[] = [];
+  const googlOptions: string[] = [];
   const spyObservations: string[] = [];
   const qqqObservations: string[] = [];
   const spyRawEvents: string[] = [];
@@ -104,8 +126,10 @@ test("shared SIP and OPRA hubs route events and union subscriptions without cros
   let qqqActivities = 0;
   const spyOptionChannel = optionHub.channel("SPY");
   const qqqOptionChannel = optionHub.channel("QQQ");
+  const googlOptionChannel = optionHub.channel("GOOGL");
   await spyOptionChannel.subscribe([spyOption]);
   await qqqOptionChannel.subscribe([qqqOption]);
+  await googlOptionChannel.subscribe([googlOption]);
   await Promise.all([
     spyOptionChannel.connect({
       ...optionCollector(spyOptions),
@@ -119,12 +143,14 @@ test("shared SIP and OPRA hubs route events and union subscriptions without cros
       onRawEvents: (events) => qqqRawEvents.push(...events.map((event) => `${event.type}:${event.value.symbol}`)),
       onActivity: () => { qqqActivities += 1; },
     }),
+    googlOptionChannel.connect(optionCollector(googlOptions)),
   ]);
-  assert.deepEqual([...option.subscribed].sort(), [qqqOption, spyOption]);
+  assert.deepEqual([...option.subscribed].sort(), [googlOption, qqqOption, spyOption]);
   assert.equal(option.connectCalls, 1);
-  await option.emit([optionQuote(spyOption), optionQuote(qqqOption)]);
+  await option.emit([optionQuote(spyOption), optionQuote(qqqOption), optionQuote(googlOption)]);
   assert.deepEqual(spyOptions, [spyOption]);
   assert.deepEqual(qqqOptions, [qqqOption]);
+  assert.deepEqual(googlOptions, [googlOption]);
   assert.deepEqual(spyObservations, [spyOption]);
   assert.deepEqual(qqqObservations, [qqqOption]);
   await option.emitTrades([
@@ -136,9 +162,9 @@ test("shared SIP and OPRA hubs route events and union subscriptions without cros
   assert.equal(spyActivities, 1);
   assert.equal(qqqActivities, 1);
   await spyOptionChannel.close();
-  assert.deepEqual([...option.subscribed], [qqqOption]);
+  assert.deepEqual([...option.subscribed].sort(), [googlOption, qqqOption]);
   assert.equal(option.closeCalls, 0);
-  await Promise.all([qqqChannel.close(), qqqOptionChannel.close()]);
+  await Promise.all([qqqChannel.close(), googlChannel.close(), qqqOptionChannel.close(), googlOptionChannel.close()]);
   assert.equal(stock.closeCalls, 1);
   assert.equal(option.closeCalls, 1);
 });
@@ -168,24 +194,28 @@ test("broker views are scoped by underlying while account state remains shared",
   const base = new FakeMultiBroker();
   const spy = new UnderlyingTradingRestClient(base, "SPY");
   const qqq = new UnderlyingTradingRestClient(base, "QQQ");
+  const googl = new UnderlyingTradingRestClient(base, "GOOGL");
   assert.deepEqual((await spy.listPositions()).map((position) => position.symbol), [spyOption]);
   assert.deepEqual((await qqq.listPositions()).map((position) => position.symbol), [qqqOption]);
+  assert.deepEqual((await googl.listPositions()).map((position) => position.symbol), [googlOption]);
   assert.deepEqual((await spy.listOpenOrders()).map((order) => order.symbol), [spyOption]);
   assert.deepEqual((await qqq.listOpenOrders()).map((order) => order.symbol), [qqqOption]);
+  assert.deepEqual((await googl.listOpenOrders()).map((order) => order.symbol), [googlOption]);
   assert.equal((await spy.getAccount()).equity, (await qqq.getAccount()).equity);
   await assert.rejects(() => spy.submitOrder(orderRequest(qqqOption)), /cross-underlying/);
   assert.equal((await qqq.listOptionContracts())[0]?.underlying, "QQQ");
+  assert.equal((await googl.listOptionContracts())[0]?.underlying, "GOOGL");
 });
 
-test("portfolio coordinator atomically permits one SPY and one QQQ risk reservation", async () => {
+test("portfolio coordinator atomically permits one reservation for each of SPY, QQQ, and GOOGL", async () => {
   const coordinator = new PortfolioRiskCoordinator({
     timeZone: defaultConfig.timeZone,
-    maxConcurrentUnderlyings: 2,
-    maxAggregateRiskDollars: 1_000,
-    maxAggregatePremiumDollars: 3_000,
+    maxConcurrentUnderlyings: 3,
+    maxAggregateRiskDollars: 1_500,
+    maxAggregatePremiumDollars: 4_500,
     maxDailyLossDollars: 1_000,
   }, timestamp);
-  const [spy, qqq] = await Promise.all([
+  const [spy, qqq, googl] = await Promise.all([
     coordinator.reserveEntry({
       underlying: "SPY", timestamp, riskDollars: 500, premiumDollars: 1_500,
       optionBuyingPowerDollars: 25_000,
@@ -194,34 +224,45 @@ test("portfolio coordinator atomically permits one SPY and one QQQ risk reservat
       underlying: "QQQ", timestamp, riskDollars: 500, premiumDollars: 1_500,
       optionBuyingPowerDollars: 25_000,
     }),
+    coordinator.reserveEntry({
+      underlying: "GOOGL", timestamp, riskDollars: 500, premiumDollars: 1_500,
+      optionBuyingPowerDollars: 25_000,
+    }),
   ]);
   assert.equal(spy.allowed, true);
   assert.equal(qqq.allowed, true);
-  assert.deepEqual((await coordinator.snapshot(timestamp)).activeUnderlyings.sort(), ["QQQ", "SPY"]);
+  assert.equal(googl.allowed, true);
+  assert.deepEqual((await coordinator.snapshot(timestamp)).activeUnderlyings.sort(), ["GOOGL", "QQQ", "SPY"]);
   const duplicate = await coordinator.reserveEntry({
     underlying: "QQQ", timestamp, riskDollars: 1, premiumDollars: 1, optionBuyingPowerDollars: 25_000,
   });
   assert.equal(duplicate.allowed, false);
   assert.ok(duplicate.reasons.includes("PORTFOLIO_UNDERLYING_EXPOSURE_EXISTS"));
   await coordinator.recordCompletedExit("QQQ", timestamp, -25);
-  assert.deepEqual((await coordinator.snapshot(timestamp)).activeUnderlyings, ["SPY"]);
+  assert.deepEqual((await coordinator.snapshot(timestamp)).activeUnderlyings.sort(), ["GOOGL", "SPY"]);
 });
 
-test("synthetic SPY and QQQ replays select and fill only their own option contracts", async () => {
-  const [spy, qqq] = await Promise.all([
+test("synthetic SPY, QQQ, and GOOGL replays select and fill only their own option contracts", async () => {
+  const [spy, qqq, googl] = await Promise.all([
     replayOne(defaultConfig, "SPY", spyOption, 500),
     replayOne(qqqConfig, "QQQ", qqqOption, 600),
+    replayOne(googlConfig, "GOOGL", googlOption, 180),
   ]);
   assert.equal(spy.funnel.ordersSubmitted, 1);
   assert.equal(spy.funnel.fills, 1);
   assert.equal(qqq.funnel.ordersSubmitted, 1);
   assert.equal(qqq.funnel.fills, 1);
+  assert.equal(googl.funnel.ordersSubmitted, 1);
+  assert.equal(googl.funnel.fills, 1);
   assert.equal(spy.openPosition?.symbol, spyOption);
   assert.equal(qqq.openPosition?.symbol, qqqOption);
+  assert.equal(googl.openPosition?.symbol, googlOption);
   assert.equal(spy.metadata.underlying, "SPY");
   assert.equal(qqq.metadata.underlying, "QQQ");
+  assert.equal(googl.metadata.underlying, "GOOGL");
   assert.equal(spy.metadata.configVersion, defaultConfig.version);
   assert.equal(qqq.metadata.configVersion, qqqConfig.version);
+  assert.equal(googl.metadata.configVersion, googlConfig.version);
 });
 
 test("live order managers share the portfolio reservation before broker submission", async () => {
@@ -283,7 +324,7 @@ test("dashboard forward-move diagnostics never compare QQQ evaluations with SPY 
   assert.equal(misses[0]?.forwardPrice, 601);
 });
 
-test("dashboard exposes complete independent SPY and QQQ views", () => {
+test("dashboard exposes complete independent SPY, QQQ, and GOOGL views", () => {
   const store = new TradingDashboardStore(timestamp, false, 0, 0, () => timestamp + 5_000);
   store.record(audit("live_signal_selection", "SPY", {
     signalId: "spy-dashboard-signal", timestamp, direction: "BULLISH", kind: "IMPULSE",
@@ -292,6 +333,10 @@ test("dashboard exposes complete independent SPY and QQQ views", () => {
   store.record(audit("live_signal_selection", "QQQ", {
     signalId: "qqq-dashboard-signal", timestamp, direction: "BEARISH", kind: "IMPULSE",
     regime: "STRONG_DOWN", candidate: qqqOption, selectionStatus: "SELECTED", reasons: [],
+  }));
+  store.record(audit("live_signal_selection", "GOOGL", {
+    signalId: "googl-dashboard-signal", timestamp, direction: "BULLISH", kind: "GRIND",
+    regime: "GRIND_UP", candidate: googlOption, selectionStatus: "SELECTED", reasons: [],
   }));
   store.record(audit("entry_fill", "SPY", {
     incrementalQuantity: 1, incrementalPrice: 2, cumulativeQuantity: 1,
@@ -317,11 +362,28 @@ test("dashboard exposes complete independent SPY and QQQ views", () => {
     entryTimestamp: timestamp, averageEntryPrice: 2, incrementalQuantity: 1,
     incrementalPrice: 1.95, realizedPnl: -5, remainingQuantity: 0,
   }));
+  store.record(audit("entry_fill", "GOOGL", {
+    incrementalQuantity: 1, incrementalPrice: 2, cumulativeQuantity: 1,
+    position: {
+      symbol: googlOption, direction: "BULLISH", quantity: 1, averageEntryPrice: 2,
+      entryTimestamp: timestamp, stopPrice: 1.5,
+    },
+  }));
+  store.record(audit("exit_fill", "GOOGL", {
+    reason: "PROFIT_FLOOR_EXIT", symbol: googlOption, direction: "BULLISH",
+    entryTimestamp: timestamp, averageEntryPrice: 2, incrementalQuantity: 1,
+    incrementalPrice: 2.1, realizedPnl: 10, remainingQuantity: 0,
+  }));
   store.record(entryEvaluation("SPY", timestamp, 500, "NO_SIGNAL"));
   store.record(entryEvaluation("QQQ", timestamp, 600, "NO_SIGNAL"));
+  store.record(entryEvaluation("GOOGL", timestamp, 180, "NO_SIGNAL"));
   store.recordMarketEvent({
     type: "stock_quote", providerTimestamp: timestamp, receivedTimestamp: timestamp,
     marketDate: date, symbol: "SPY", data: stockQuote("SPY", 500) as unknown as Record<string, unknown>,
+  });
+  store.recordMarketEvent({
+    type: "stock_quote", providerTimestamp: timestamp, receivedTimestamp: timestamp,
+    marketDate: date, symbol: "GOOGL", data: stockQuote("GOOGL", 180) as unknown as Record<string, unknown>,
   });
   store.recordMarketEvent({
     type: "stock_quote", providerTimestamp: timestamp, receivedTimestamp: timestamp,
@@ -329,29 +391,37 @@ test("dashboard exposes complete independent SPY and QQQ views", () => {
   });
 
   const snapshot = store.snapshot();
-  assert.equal(snapshot.performance.signalsFired, 2);
+  assert.equal(snapshot.performance.signalsFired, 3);
   assert.equal(snapshot.underlyingViews.SPY.performance.signalsFired, 1);
   assert.equal(snapshot.underlyingViews.QQQ.performance.signalsFired, 1);
-  assert.equal(snapshot.performance.realizedPnl, 15);
+  assert.equal(snapshot.underlyingViews.GOOGL.performance.signalsFired, 1);
+  assert.equal(snapshot.performance.realizedPnl, 25);
   assert.equal(snapshot.underlyingViews.SPY.performance.realizedPnl, 20);
   assert.equal(snapshot.underlyingViews.QQQ.performance.realizedPnl, -5);
+  assert.equal(snapshot.underlyingViews.GOOGL.performance.realizedPnl, 10);
   assert.equal(snapshot.underlyingViews.SPY.performance.wins, 1);
   assert.equal(snapshot.underlyingViews.QQQ.performance.losses, 1);
   assert.deepEqual(snapshot.underlyingViews.SPY.trades.map((trade) => trade.symbol), [spyOption]);
   assert.deepEqual(snapshot.underlyingViews.QQQ.trades.map((trade) => trade.symbol), [qqqOption]);
+  assert.deepEqual(snapshot.underlyingViews.GOOGL.trades.map((trade) => trade.symbol), [googlOption]);
   assert.deepEqual(snapshot.underlyingViews.SPY.signals.map((signal) => signal.underlying), ["SPY"]);
   assert.deepEqual(snapshot.underlyingViews.QQQ.signals.map((signal) => signal.underlying), ["QQQ"]);
+  assert.deepEqual(snapshot.underlyingViews.GOOGL.signals.map((signal) => signal.underlying), ["GOOGL"]);
   assert.ok(snapshot.underlyingViews.SPY.decisions.every((decision) => decision.underlying === "SPY"));
   assert.ok(snapshot.underlyingViews.QQQ.decisions.every((decision) => decision.underlying === "QQQ"));
+  assert.ok(snapshot.underlyingViews.GOOGL.decisions.every((decision) => decision.underlying === "GOOGL"));
   assert.deepEqual(snapshot.underlyingViews.SPY.tuning.entries.map((entry) => entry.underlying), ["SPY"]);
   assert.deepEqual(snapshot.underlyingViews.QQQ.tuning.entries.map((entry) => entry.underlying), ["QQQ"]);
+  assert.deepEqual(snapshot.underlyingViews.GOOGL.tuning.entries.map((entry) => entry.underlying), ["GOOGL"]);
   assert.equal(snapshot.underlyingViews.SPY.liveData.eventCounts.stock_quote, 1);
   assert.equal(snapshot.underlyingViews.QQQ.liveData.eventCounts.stock_quote, 1);
+  assert.equal(snapshot.underlyingViews.GOOGL.liveData.eventCounts.stock_quote, 1);
   assert.deepEqual(snapshot.underlyingViews.SPY.liveData.recentEvents.map((event) => event.symbol), ["SPY"]);
   assert.deepEqual(snapshot.underlyingViews.QQQ.liveData.recentEvents.map((event) => event.symbol), ["QQQ"]);
+  assert.deepEqual(snapshot.underlyingViews.GOOGL.liveData.recentEvents.map((event) => event.symbol), ["GOOGL"]);
 });
 
-function audit(type: string, underlying: "SPY" | "QQQ", data: Record<string, unknown>): AuditEvent {
+function audit(type: string, underlying: UnderlyingSymbol, data: Record<string, unknown>): AuditEvent {
   return {
     timestamp, marketDate: date, type, configVersion: "test",
     data: { underlying, ...data },
@@ -370,11 +440,11 @@ function entryEvaluation(
   };
 }
 
-function stockQuote(symbol: "SPY" | "QQQ", price: number): StockQuote {
+function stockQuote(symbol: UnderlyingSymbol, price: number): StockQuote {
   return { symbol, timestamp, bidPrice: price - 0.01, askPrice: price + 0.01, bidSize: 10, askSize: 10 };
 }
 
-function stockTrade(symbol: "SPY" | "QQQ", price: number): StockTrade {
+function stockTrade(symbol: UnderlyingSymbol, price: number): StockTrade {
   return { symbol, timestamp, price, size: 10 };
 }
 
@@ -446,13 +516,13 @@ class FakeMultiBroker implements MultiUnderlyingTradingRestClient {
   };
   async getAccount(): Promise<AccountState> { return { ...this.account }; }
   async getMarketClock(): Promise<{ timestamp: number; isOpen: boolean }> { return { timestamp, isOpen: true }; }
-  async getLatestUnderlyingSipQuote(underlying: "SPY" | "QQQ"): Promise<StockQuote> {
-    return stockQuote(underlying, underlying === "SPY" ? 500 : 600);
+  async getLatestUnderlyingSipQuote(underlying: UnderlyingSymbol): Promise<StockQuote> {
+    return stockQuote(underlying, underlying === "SPY" ? 500 : underlying === "QQQ" ? 600 : 180);
   }
-  async listOptionContracts(underlying = "SPY" as const): Promise<OptionContract[]> {
+  async listOptionContracts(underlying: UnderlyingSymbol = "SPY"): Promise<OptionContract[]> {
     return [{
-      symbol: underlying === "SPY" ? spyOption : qqqOption,
-      underlying, expirationDate: date, strike: underlying === "SPY" ? 500 : 600,
+      symbol: underlying === "SPY" ? spyOption : underlying === "QQQ" ? qqqOption : googlOption,
+      underlying, expirationDate: date, strike: underlying === "SPY" ? 500 : underlying === "QQQ" ? 600 : 180,
       type: "call", active: true, tradable: true,
     }];
   }
@@ -472,12 +542,14 @@ class FakeMultiBroker implements MultiUnderlyingTradingRestClient {
     return [
       { id: "s", clientOrderId: "s", symbol: spyOption, status: "new", filledQuantity: 0 },
       { id: "q", clientOrderId: "q", symbol: qqqOption, status: "new", filledQuantity: 0 },
+      { id: "g", clientOrderId: "g", symbol: googlOption, status: "new", filledQuantity: 0 },
     ];
   }
   async listPositions(): Promise<BrokerPosition[]> {
     return [
       { symbol: spyOption, direction: "BULLISH", quantity: 1, averageEntryPrice: 1 },
       { symbol: qqqOption, direction: "BULLISH", quantity: 1, averageEntryPrice: 1 },
+      { symbol: googlOption, direction: "BULLISH", quantity: 1, averageEntryPrice: 1 },
     ];
   }
 }
@@ -543,6 +615,7 @@ async function replayOne(
   config.signals.entryConfirmationMode = "SHADOW";
   config.signals.followThroughMinSec = 0;
   config.signals.followThroughMaxSec = 0;
+  const optionBid = underlying === "GOOGL" ? 0.7 : 2;
   const engine = new ReplayEngine({ config });
   await engine.ingest({
     type: "option_contract", timestamp: timestamp - 30,
@@ -560,12 +633,12 @@ async function replayOne(
   });
   await engine.ingest({
     type: "option_quote", timestamp: timestamp - 10,
-    data: optionQuoteAt(optionSymbol, timestamp - 10, 2, 2.016),
+    data: optionQuoteAt(optionSymbol, timestamp - 10, optionBid, optionBid * 1.008),
   });
   await engine.ingestRecordedFeature(replayFeature(underlying, spot));
   await engine.ingest({
     type: "option_quote", timestamp: timestamp + 100,
-    data: optionQuoteAt(optionSymbol, timestamp + 100, 2.01, 2.02),
+    data: optionQuoteAt(optionSymbol, timestamp + 100, optionBid + 0.01, optionBid + 0.014),
   });
   return engine.finish();
 }

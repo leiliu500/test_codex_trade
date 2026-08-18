@@ -1,4 +1,4 @@
-import type { StockQuote, StockTrade, UnderlyingSymbol } from "../types.js";
+import { isUnderlyingSymbol, type StockQuote, type StockTrade, type UnderlyingSymbol } from "../types.js";
 import WebSocket, { type RawData } from "ws";
 
 export interface StockStreamHandlers {
@@ -208,8 +208,4 @@ export function adaptAlpacaStockTrade(raw: Record<string, unknown>): StockTrade 
     throw new Error("Invalid Alpaca stock trade payload");
   }
   return trade as StockTrade;
-}
-
-function isUnderlyingSymbol(value: unknown): value is UnderlyingSymbol {
-  return value === "SPY" || value === "QQQ";
 }

@@ -1,4 +1,4 @@
-import type { UnderlyingSymbol } from "../types.js";
+import { UNDERLYING_SYMBOLS, isUnderlyingSymbol, type UnderlyingSymbol } from "../types.js";
 
 export interface RuntimeEnvironment {
   tradingMode: "paper" | "live";
@@ -54,7 +54,7 @@ export function readEnvironment(env: NodeJS.ProcessEnv = process.env): RuntimeEn
     throw new Error("Live mode requires broker credentials");
   }
   if (marketDataEnabled && (!env.ALPACA_API_KEY || !env.ALPACA_API_SECRET)) {
-    throw new Error("SPY/QQQ SIP market data requires ALPACA_API_KEY and ALPACA_API_SECRET");
+    throw new Error("SIP market data requires ALPACA_API_KEY and ALPACA_API_SECRET");
   }
   return {
     tradingMode,
@@ -77,10 +77,10 @@ export function readEnvironment(env: NodeJS.ProcessEnv = process.env): RuntimeEn
 
 function parseTradingSymbols(value: string): UnderlyingSymbol[] {
   const symbols = [...new Set(value.split(",").map((symbol) => symbol.trim().toUpperCase()).filter(Boolean))];
-  if (symbols.length === 0 || symbols.some((symbol) => symbol !== "SPY" && symbol !== "QQQ")) {
-    throw new Error("TRADING_SYMBOLS must be a comma-separated subset of SPY,QQQ");
+  if (symbols.length === 0 || !symbols.every(isUnderlyingSymbol)) {
+    throw new Error(`TRADING_SYMBOLS must be a comma-separated subset of ${UNDERLYING_SYMBOLS.join(",")}`);
   }
-  return symbols as UnderlyingSymbol[];
+  return symbols;
 }
 
 export function redactSecrets(value: unknown, secrets: readonly string[]): unknown {
