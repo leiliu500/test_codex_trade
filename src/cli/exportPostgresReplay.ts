@@ -14,7 +14,7 @@ const positional = args.filter((argument) => !argument.startsWith("--symbol="));
 const marketDate = positional[0];
 const outputPath = positional[1];
 if (!marketDate || !/^\d{4}-\d{2}-\d{2}$/.test(marketDate)) {
-  throw new Error("Usage: npm run export:history -- YYYY-MM-DD [output.jsonl] [--symbol=SPY|QQQ|GOOGL|IWM]");
+  throw new Error("Usage: npm run export:history -- YYYY-MM-DD [output.jsonl] [--symbol=<supported ticker>]");
 }
 if (!isUnderlyingSymbol(symbolValue)) throw new Error(`Unknown export symbol: ${symbolValue}`);
 const underlying = symbolValue;

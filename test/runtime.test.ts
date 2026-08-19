@@ -40,10 +40,10 @@ test("runtime environment is paper-safe and validates the health listener", () =
     MARKET_DATA_ENABLED: "true", ALPACA_API_KEY: "key", ALPACA_API_SECRET: "secret",
   }).marketDataEnabled, true);
   assert.deepEqual(
-    readEnvironment({ TRADING_SYMBOLS: "spy,iwm,googl,qqq,iwm" }).tradingSymbols,
-    ["SPY", "IWM", "GOOGL", "QQQ"],
+    readEnvironment({ TRADING_SYMBOLS: "spy,gld,xlf,xle,tsla,nvda,sndk,spcx,dia,xlk,gld" }).tradingSymbols,
+    ["SPY", "GLD", "XLF", "XLE", "TSLA", "NVDA", "SNDK", "SPCX", "DIA", "XLK"],
   );
-  assert.throws(() => readEnvironment({ TRADING_SYMBOLS: "GOOG" }), /SPY,QQQ,GOOGL,IWM/);
+  assert.throws(() => readEnvironment({ TRADING_SYMBOLS: "GOOG" }), /GLD,XLF,XLE,TSLA,NVDA,SNDK,SPCX,DIA,XLK/);
 });
 
 test("health server exposes liveness while paper-idle readiness is degraded", async (context) => {

@@ -2,6 +2,15 @@ import defaultConfigJson from "../config/default.json" with { type: "json" };
 import qqqConfigJson from "../config/qqq.json" with { type: "json" };
 import googlConfigJson from "../config/googl.json" with { type: "json" };
 import iwmConfigJson from "../config/iwm.json" with { type: "json" };
+import gldConfigJson from "../config/gld.json" with { type: "json" };
+import xlfConfigJson from "../config/xlf.json" with { type: "json" };
+import xleConfigJson from "../config/xle.json" with { type: "json" };
+import tslaConfigJson from "../config/tsla.json" with { type: "json" };
+import nvdaConfigJson from "../config/nvda.json" with { type: "json" };
+import sndkConfigJson from "../config/sndk.json" with { type: "json" };
+import spcxConfigJson from "../config/spcx.json" with { type: "json" };
+import diaConfigJson from "../config/dia.json" with { type: "json" };
+import xlkConfigJson from "../config/xlk.json" with { type: "json" };
 import { parseClock } from "./utils/time.js";
 import type { UnderlyingSymbol } from "./types.js";
 
@@ -271,6 +280,33 @@ export const googlConfig = deepFreeze(mergeConfig(googlConfigJson as Partial<Eng
 
 /** IWM starts from the unchanged SPY baseline but has an independent versioned override surface. */
 export const iwmConfig = deepFreeze(mergeConfig(iwmConfigJson as Partial<EngineConfig>));
+
+/** Newly enabled symbols inherit the SPY baseline until independently calibrated. */
+export const gldConfig = deepFreeze(mergeConfig(gldConfigJson as Partial<EngineConfig>));
+export const xlfConfig = deepFreeze(mergeConfig(xlfConfigJson as Partial<EngineConfig>));
+export const xleConfig = deepFreeze(mergeConfig(xleConfigJson as Partial<EngineConfig>));
+export const tslaConfig = deepFreeze(mergeConfig(tslaConfigJson as Partial<EngineConfig>));
+export const nvdaConfig = deepFreeze(mergeConfig(nvdaConfigJson as Partial<EngineConfig>));
+export const sndkConfig = deepFreeze(mergeConfig(sndkConfigJson as Partial<EngineConfig>));
+export const spcxConfig = deepFreeze(mergeConfig(spcxConfigJson as Partial<EngineConfig>));
+export const diaConfig = deepFreeze(mergeConfig(diaConfigJson as Partial<EngineConfig>));
+export const xlkConfig = deepFreeze(mergeConfig(xlkConfigJson as Partial<EngineConfig>));
+
+export const configCatalog: Readonly<Record<UnderlyingSymbol, EngineConfig>> = deepFreeze({
+  SPY: defaultConfig,
+  QQQ: qqqConfig,
+  GOOGL: googlConfig,
+  IWM: iwmConfig,
+  GLD: gldConfig,
+  XLF: xlfConfig,
+  XLE: xleConfig,
+  TSLA: tslaConfig,
+  NVDA: nvdaConfig,
+  SNDK: sndkConfig,
+  SPCX: spcxConfig,
+  DIA: diaConfig,
+  XLK: xlkConfig,
+});
 
 export function validateConfig(config: EngineConfig): void {
   const fractions = [

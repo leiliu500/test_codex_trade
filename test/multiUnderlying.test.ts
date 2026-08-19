@@ -1,10 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { defaultConfig, googlConfig, iwmConfig, qqqConfig } from "../src/config.js";
+import { configCatalog, defaultConfig, googlConfig, iwmConfig, qqqConfig, validateConfig } from "../src/config.js";
 import type {
   AccountState, FeatureSnapshot, OptionContract, OptionQuote, OptionSnapshot, OptionTrade, StockQuote, StockTrade,
   TradeSignal, UnderlyingSymbol, WindowMetrics,
 } from "../src/types.js";
+import { UNDERLYING_SYMBOLS } from "../src/types.js";
 import type {
   BrokerOrder, BrokerOrderRequest, BrokerPosition, MultiUnderlyingTradingRestClient,
   TradingRestClient,
@@ -67,6 +68,18 @@ test("QQQ, GOOGL, and IWM have independent configurations and reject cross-under
   assert.deepEqual(sameDayOptionContractReasons(qqq, timestamp, googlConfig.timeZone, "GOOGL"), ["WRONG_UNDERLYING"]);
   assert.deepEqual(sameDayOptionContractReasons(iwm, timestamp, iwmConfig.timeZone, "IWM"), []);
   assert.deepEqual(sameDayOptionContractReasons(spy, timestamp, iwmConfig.timeZone, "IWM"), ["WRONG_UNDERLYING"]);
+});
+
+test("every supported underlying has an isolated valid configuration", () => {
+  assert.deepEqual(Object.keys(configCatalog), [...UNDERLYING_SYMBOLS]);
+  for (const symbol of UNDERLYING_SYMBOLS) {
+    const config = configCatalog[symbol];
+    assert.equal(config.symbol, symbol);
+    if (symbol !== "SPY") assert.notEqual(config.version, defaultConfig.version, `${symbol} must have a versioned override`);
+    assert.equal(config.risk.maxContracts, 3);
+    assert.equal(config.risk.onePositionAtATime, true);
+    assert.doesNotThrow(() => validateConfig(config));
+  }
 });
 
 test("feature engines stamp their own underlying and restoration state remains isolated", () => {
