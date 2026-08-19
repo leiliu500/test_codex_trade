@@ -1,6 +1,6 @@
 import { loadDotEnv } from "./utils/loadDotEnv.js";
 import { readEnvironment } from "./utils/env.js";
-import { defaultConfig, googlConfig, iwmConfig, qqqConfig, validateConfig, type EngineConfig } from "./config.js";
+import { configCatalog, defaultConfig, validateConfig } from "./config.js";
 import { combineHealthStates, startHealthServer, type HealthState } from "./ops/healthServer.js";
 import { AlpacaStockWebSocket } from "./alpaca/stockStream.js";
 import { AlpacaOptionWebSocket } from "./alpaca/optionStream.js";
@@ -23,12 +23,6 @@ import {
 
 loadDotEnv();
 const environment = readEnvironment();
-const configCatalog: Readonly<Record<UnderlyingSymbol, EngineConfig>> = {
-  SPY: defaultConfig,
-  QQQ: qqqConfig,
-  GOOGL: googlConfig,
-  IWM: iwmConfig,
-};
 const configs = environment.tradingSymbols.map((symbol) => configCatalog[symbol]);
 for (const config of configs) validateConfig(config);
 
