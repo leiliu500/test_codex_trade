@@ -622,14 +622,14 @@ test("winner protection never lowers an established executable profit floor", ()
   assert.ok(newHigh.updatedPosition.protectedFloorPnl! >= position.protectedFloorPnl!);
 });
 
-test("QQQ full-winner tuning protects the August 18 recovered winner one bid step earlier", () => {
+test("QQQ one-contract tuning protects the August 18 recovered winner one bid step earlier", () => {
   const timestamp = zonedDateTimeToEpoch("2026-08-18", "11:09:07");
   const baselineConfig = structuredClone(qqqConfig);
-  baselineConfig.risk.profitRetentionPeakScaleDollars = 100;
+  baselineConfig.risk.profitRetentionPeakScaleDollars = 33;
   const position = new RiskManager(qqqConfig).createFilledPosition(
-    "QQQ260818P00717000", "BEARISH", 3, 1.74, timestamp, 717,
+    "QQQ260818P00717000", "BEARISH", 1, 1.74, timestamp, 717,
   );
-  position.lowWaterPnl = -7.5;
+  position.lowWaterPnl = -2.5;
   // The retained live path reached this peak through many small observations;
   // avoid manufacturing a one-sample volatility spike in the focused fixture.
   position.lastPnlTimestamp = timestamp + 6_000;

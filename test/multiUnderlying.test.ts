@@ -84,18 +84,32 @@ test("every supported underlying has an isolated valid configuration", () => {
   }
 });
 
-test("TSLA applies its replay-tuned exit thresholds without changing the shared baseline", () => {
-  assert.equal(tslaConfig.version, "tsla-0dte-one-contract-cap-3");
-  assert.equal(tslaConfig.risk.softProtectionEmergencyLossDollars, 15);
-  assert.equal(tslaConfig.risk.directWinnerActivationDollars, 25);
-  assert.equal(tslaConfig.risk.recoveredActivationDollars, 30);
+test("TSLA applies its one-contract replay-tuned exit thresholds without changing the shared baseline", () => {
+  assert.equal(tslaConfig.version, "tsla-0dte-one-contract-exits-4");
+  assert.equal(tslaConfig.risk.softProtectionActivationDollars, 1);
+  assert.equal(tslaConfig.risk.softProtectionRecoveryActivationDollars, 1);
+  assert.equal(tslaConfig.risk.softProtectionMaximumFloorDollars, 1);
+  assert.equal(tslaConfig.risk.softProtectionEmergencyLossDollars, 5);
+  assert.equal(tslaConfig.risk.minimumProfitFloorDollars, 2);
+  assert.equal(tslaConfig.risk.directWinnerActivationDollars, 9);
+  assert.equal(tslaConfig.risk.recoveredActivationDollars, 10);
+  assert.equal(tslaConfig.risk.meaningfulAdverseExcursionDollars, 2);
+  assert.equal(tslaConfig.risk.profitRetentionPeakScaleDollars, 33);
   assert.equal(defaultConfig.risk.softProtectionEmergencyLossDollars, 0);
   assert.equal(defaultConfig.risk.directWinnerActivationDollars, 10);
   assert.equal(defaultConfig.risk.recoveredActivationDollars, 15);
 });
 
 test("QQQ applies its August 19 trend-quality tuning without changing the SPY baseline", () => {
-  assert.equal(qqqConfig.version, "qqq-0dte-one-contract-cap-6");
+  assert.equal(qqqConfig.version, "qqq-0dte-one-contract-exits-7");
+  assert.equal(qqqConfig.risk.softProtectionActivationDollars, 1);
+  assert.equal(qqqConfig.risk.softProtectionRecoveryActivationDollars, 1);
+  assert.equal(qqqConfig.risk.softProtectionMaximumFloorDollars, 1);
+  assert.equal(qqqConfig.risk.minimumProfitFloorDollars, 2);
+  assert.equal(qqqConfig.risk.directWinnerActivationDollars, 4);
+  assert.equal(qqqConfig.risk.recoveredActivationDollars, 5);
+  assert.equal(qqqConfig.risk.meaningfulAdverseExcursionDollars, 2);
+  assert.equal(qqqConfig.risk.profitRetentionPeakScaleDollars, 17);
   assert.equal(qqqConfig.risk.trendInvalidationGraceSec, 15);
   assert.equal(defaultConfig.risk.trendInvalidationGraceSec, 8);
   assert.equal(qqqConfig.signals.lateEntryGuard.bullishGrindMinEfficiency60, 0.28);
@@ -313,7 +327,7 @@ test("synthetic SPY, QQQ, GOOGL, and IWM replays select and fill only their own 
   assert.equal(googl.metadata.configVersion, googlConfig.version);
   assert.equal(iwm.metadata.configVersion, iwmConfig.version);
   assert.equal(defaultConfig.risk.profitRetentionPeakScaleDollars, 100);
-  assert.equal(qqqConfig.risk.profitRetentionPeakScaleDollars, 50);
+  assert.equal(qqqConfig.risk.profitRetentionPeakScaleDollars, 17);
   assert.equal(googlConfig.risk.profitRetentionPeakScaleDollars, 100);
   assert.equal(iwmConfig.risk.profitRetentionPeakScaleDollars, 100);
 });
