@@ -148,6 +148,8 @@ export function lateEntryGuardAudit(
       config.signals.lateEntryGuard.bearishUnclassifiedImpulseMinMediumToFastRatio,
     bullishGrindMinMediumNormalizedSlope:
       config.signals.lateEntryGuard.bullishGrindMinMediumNormalizedSlope,
+    bullishGrindMinEfficiency60:
+      config.signals.lateEntryGuard.bullishGrindMinEfficiency60,
     bullishNoisyGrindMinMediumToFastRatio:
       config.signals.lateEntryGuard.bullishNoisyGrindMinMediumToFastRatio,
     bullishTrendContinuation: {

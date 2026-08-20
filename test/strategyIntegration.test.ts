@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { defaultConfig } from "../src/config.js";
+import { defaultConfig, qqqConfig } from "../src/config.js";
 import type { FeatureSnapshot, OptionContract, RegimeDecision, SecondBar, TradeSignal, WindowMetrics } from "../src/types.js";
 import { classifyRegime } from "../src/strategy/regimeClassifier.js";
 import { SignalEngine } from "../src/strategy/signalEngine.js";
@@ -613,6 +613,22 @@ test("clean low-noise late bullish grinds can reenter without weakening ordinary
   assert.ok(reentry.signal?.reasons.includes("late low-noise bullish grind profile passed"));
   assert.equal(reentry.signal?.reasons.some((reason) => reason.includes("follow-through")), false);
   assert.equal(requiresLateBullishGrindOptionConfirmation(defaultConfig, reentry.signal!), true);
+
+  const weakEfficiency = new SignalEngine(qqqConfig).evaluateDetailed({
+    ...cleanGrind,
+    symbol: "QQQ",
+    efficiency60: qqqConfig.signals.lateEntryGuard.bullishGrindMinEfficiency60 - 0.01,
+  }, unclassified);
+  assert.equal(weakEfficiency.signal, undefined);
+  assert.ok(weakEfficiency.directions.find((item) => item.direction === "BULLISH")?.reasons
+    .includes("LATE_ENTRY_BULLISH_GRIND_EFFICIENCY"));
+
+  const thresholdEfficiency = new SignalEngine(qqqConfig).evaluateDetailed({
+    ...cleanGrind,
+    symbol: "QQQ",
+    efficiency60: qqqConfig.signals.lateEntryGuard.bullishGrindMinEfficiency60,
+  }, unclassified);
+  assert.equal(thresholdEfficiency.signal?.direction, "BULLISH");
 
   const pendingOption = evaluateLateBullishGrindOptionConfirmation(
     defaultConfig,

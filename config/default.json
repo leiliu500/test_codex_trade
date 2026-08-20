@@ -97,6 +97,7 @@
       "bearishGrindRequiresFollowThrough": true,
       "bearishUnclassifiedImpulseMinMediumToFastRatio": 0.4,
       "bullishGrindMinMediumNormalizedSlope": 2.5,
+      "bullishGrindMinEfficiency60": 0,
       "bullishNoisyGrindMinMediumToFastRatio": 1.25,
       "bullishLowNoiseGrind": {
         "enabled": true,

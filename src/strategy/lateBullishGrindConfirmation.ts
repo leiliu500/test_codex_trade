@@ -28,6 +28,7 @@ export function requiresLateBullishGrindOptionConfirmation(
   const confirmation = config.signals.lateEntryGuard.bullishGrindOptionConfirmation;
   const feature = signal.featureSnapshot;
   const lowNoiseProfile = profile.enabled &&
+    feature.efficiency60 >= config.signals.lateEntryGuard.bullishGrindMinEfficiency60 &&
     feature.fast.noiseFloorBps <= profile.maxFastNoiseFloorBps &&
     feature.fast.normalizedSlope >= profile.minFastNormalizedSlope &&
     feature.medium.normalizedSlope >= profile.minMediumNormalizedSlope &&

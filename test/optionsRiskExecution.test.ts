@@ -90,6 +90,9 @@ test("configuration cannot enable later-dated or overnight option trading", () =
   const invalidLateBullishPersistence = structuredClone(defaultConfig);
   invalidLateBullishPersistence.signals.lateEntryGuard.bullishGrindMinMediumNormalizedSlope = 0;
   assert.throws(() => validateConfig(invalidLateBullishPersistence), /Late-entry guard thresholds/);
+  const invalidLateBullishEfficiency = structuredClone(defaultConfig);
+  invalidLateBullishEfficiency.signals.lateEntryGuard.bullishGrindMinEfficiency60 = 1.01;
+  assert.throws(() => validateConfig(invalidLateBullishEfficiency), /Late-entry guard thresholds/);
   const invalidLateSpread = structuredClone(defaultConfig);
   invalidLateSpread.signals.lateEntryGuard.maxOptionSpreadPct =
     defaultConfig.dataQuality.maxOptionSpreadPct + 0.01;
