@@ -43,7 +43,13 @@ interface TradeReport {
 }
 
 const PRE_ENTRY_CONTEXT_MS = 5 * 60_000;
-const POST_FILL_CONTEXT_MS = 5_000;
+const DEFAULT_POST_FILL_CONTEXT_MS = 5_000;
+const postFillContextMs = process.env.PARITY_POST_FILL_CONTEXT_MS === undefined
+  ? DEFAULT_POST_FILL_CONTEXT_MS
+  : Number(process.env.PARITY_POST_FILL_CONTEXT_MS);
+if (!Number.isSafeInteger(postFillContextMs) || postFillContextMs < 0) {
+  throw new Error("PARITY_POST_FILL_CONTEXT_MS must be a non-negative integer");
+}
 const TIMESTAMP_TOLERANCE_MS = 10;
 const PNL_TOLERANCE_DOLLARS = 0.01;
 const PRICE_TOLERANCE_DOLLARS = 0.000_001;
@@ -120,7 +126,7 @@ async function main(): Promise<void> {
         resolution.config.symbol,
         position.symbol,
         position.entryTimestamp - PRE_ENTRY_CONTEXT_MS,
-        observedExit.fillTimestamp + POST_FILL_CONTEXT_MS,
+        observedExit.fillTimestamp + postFillContextMs,
       );
       const result = replayLiveTradeManagement({
         config: resolution.config,

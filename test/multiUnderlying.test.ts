@@ -1,6 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { configCatalog, defaultConfig, googlConfig, iwmConfig, qqqConfig, validateConfig } from "../src/config.js";
+import {
+  configCatalog, defaultConfig, googlConfig, iwmConfig, qqqConfig, tslaConfig, validateConfig,
+} from "../src/config.js";
 import type {
   AccountState, FeatureSnapshot, OptionContract, OptionQuote, OptionSnapshot, OptionTrade, StockQuote, StockTrade,
   TradeSignal, UnderlyingSymbol, WindowMetrics,
@@ -80,6 +82,16 @@ test("every supported underlying has an isolated valid configuration", () => {
     assert.equal(config.risk.onePositionAtATime, true);
     assert.doesNotThrow(() => validateConfig(config));
   }
+});
+
+test("TSLA applies its replay-tuned exit thresholds without changing the shared baseline", () => {
+  assert.equal(tslaConfig.version, "tsla-0dte-exit-retention-2");
+  assert.equal(tslaConfig.risk.softProtectionEmergencyLossDollars, 15);
+  assert.equal(tslaConfig.risk.directWinnerActivationDollars, 25);
+  assert.equal(tslaConfig.risk.recoveredActivationDollars, 30);
+  assert.equal(defaultConfig.risk.softProtectionEmergencyLossDollars, 0);
+  assert.equal(defaultConfig.risk.directWinnerActivationDollars, 10);
+  assert.equal(defaultConfig.risk.recoveredActivationDollars, 15);
 });
 
 test("feature engines stamp their own underlying and restoration state remains isolated", () => {
