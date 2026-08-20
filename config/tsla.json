@@ -1,4 +1,9 @@
 {
-  "version": "tsla-0dte-isolated-spy-baseline-1",
-  "symbol": "TSLA"
+  "version": "tsla-0dte-exit-retention-2",
+  "symbol": "TSLA",
+  "risk": {
+    "softProtectionEmergencyLossDollars": 15,
+    "directWinnerActivationDollars": 25,
+    "recoveredActivationDollars": 30
+  }
 }

@@ -285,6 +285,7 @@ export const iwmConfig = deepFreeze(mergeConfig(iwmConfigJson as Partial<EngineC
 export const gldConfig = deepFreeze(mergeConfig(gldConfigJson as Partial<EngineConfig>));
 export const xlfConfig = deepFreeze(mergeConfig(xlfConfigJson as Partial<EngineConfig>));
 export const xleConfig = deepFreeze(mergeConfig(xleConfigJson as Partial<EngineConfig>));
+/** TSLA keeps the common entry model with independently replay-tuned exit thresholds. */
 export const tslaConfig = deepFreeze(mergeConfig(tslaConfigJson as Partial<EngineConfig>));
 export const nvdaConfig = deepFreeze(mergeConfig(nvdaConfigJson as Partial<EngineConfig>));
 export const sndkConfig = deepFreeze(mergeConfig(sndkConfigJson as Partial<EngineConfig>));
