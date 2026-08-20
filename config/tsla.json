@@ -1,9 +1,15 @@
 {
-  "version": "tsla-0dte-one-contract-cap-3",
+  "version": "tsla-0dte-one-contract-exits-4",
   "symbol": "TSLA",
   "risk": {
-    "softProtectionEmergencyLossDollars": 15,
-    "directWinnerActivationDollars": 25,
-    "recoveredActivationDollars": 30
+    "softProtectionActivationDollars": 1,
+    "softProtectionRecoveryActivationDollars": 1,
+    "softProtectionMaximumFloorDollars": 1,
+    "softProtectionEmergencyLossDollars": 5,
+    "minimumProfitFloorDollars": 2,
+    "directWinnerActivationDollars": 9,
+    "recoveredActivationDollars": 10,
+    "meaningfulAdverseExcursionDollars": 2,
+    "profitRetentionPeakScaleDollars": 33
   }
 }

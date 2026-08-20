@@ -1,5 +1,5 @@
 {
-  "version": "qqq-0dte-one-contract-cap-6",
+  "version": "qqq-0dte-one-contract-exits-7",
   "symbol": "QQQ",
   "signals": {
     "lateEntryGuard": {
@@ -7,7 +7,14 @@
     }
   },
   "risk": {
-    "profitRetentionPeakScaleDollars": 50,
+    "softProtectionActivationDollars": 1,
+    "softProtectionRecoveryActivationDollars": 1,
+    "softProtectionMaximumFloorDollars": 1,
+    "minimumProfitFloorDollars": 2,
+    "directWinnerActivationDollars": 4,
+    "recoveredActivationDollars": 5,
+    "meaningfulAdverseExcursionDollars": 2,
+    "profitRetentionPeakScaleDollars": 17,
     "trendInvalidationGraceSec": 15
   }
 }
