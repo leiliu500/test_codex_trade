@@ -1,5 +1,5 @@
 {
-  "version": "spy-0dte-entry-confirmation-28-fill-aware-exit-metrics",
+  "version": "spy-0dte-entry-confirmation-29-one-contract-cap",
   "symbol": "SPY",
   "timeZone": "America/New_York",
   "session": {
@@ -178,7 +178,7 @@
     "riskFractionOfEquity": 0.0025,
     "maxRiskDollarsPerTrade": 500,
     "maxPremiumDollarsPerTrade": 1500,
-    "maxContracts": 3,
+    "maxContracts": 1,
     "maxTradesPerDay": 1000,
     "maxDailyLossDollars": 1000,
     "hardOptionStopPct": 0.25,

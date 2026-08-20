@@ -197,12 +197,12 @@ test("risk sizing honors every cap and resets the hard stop from actual fill", (
   });
   // The production contract cap is lower than the five-contract risk budget.
   assert.equal(decision.maxLossPerContract, 50);
-  assert.equal(decision.quantity, 3);
+  assert.equal(decision.quantity, 1);
   const cappedDecision = manager.evaluate({
     timestamp, optionMid: 1, hasOpenPosition: false,
     account: { equity: 1_000_000, optionBuyingPower: 100_000, active: true, optionsApproved: true, killSwitch: false },
   });
-  assert.equal(cappedDecision.quantity, 3);
+  assert.equal(cappedDecision.quantity, 1);
   const filled = manager.createFilledPosition("SPY260722C00500000", "BULLISH", 1, 2.20, timestamp);
   assert.ok(Math.abs(filled.stopPrice - 1.65) < 1e-12);
   for (let i = 0; i < riskConfig.risk.maxTradesPerDay - 1; i += 1) manager.recordEntry(timestamp);

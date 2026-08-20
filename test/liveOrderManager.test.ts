@@ -134,7 +134,7 @@ function candidate(): OptionCandidateEvaluation {
   };
 }
 
-test("production sizing submits no more than the three-contract cap", async () => {
+test("production sizing submits no more than the one-contract cap", async () => {
   const client = new FakeTradingClient();
   const manager = new LiveOrderManager({ config: defaultConfig, client });
   await manager.initialize(start);
@@ -147,15 +147,15 @@ test("production sizing submits no more than the three-contract cap", async () =
   });
 
   assert.equal(submitted.submitted, true);
-  assert.equal(submitted.risk?.quantity, 3);
-  assert.equal(client.requests[0]?.quantity, 3);
+  assert.equal(submitted.risk?.quantity, 1);
+  assert.equal(client.requests[0]?.quantity, 1);
 });
 
 test("live manager submits an option entry, reconciles partial fill, cancels remainder, and hard-stops exposure", async () => {
   const client = new FakeTradingClient();
   const recorder = new MemoryRecorder();
   const partialFillConfig = structuredClone(defaultConfig);
-  // Exercise multi-fill reconciliation with the production multi-contract cap.
+  // Exercise multi-fill reconciliation with an explicit multi-contract scenario override.
   partialFillConfig.risk.maxContracts = 3;
   const manager = new LiveOrderManager({ config: partialFillConfig, client, recorder });
   await manager.initialize(start);
@@ -226,7 +226,7 @@ test("trailing protection locks a configured profit floor after activation", asy
     entryTimestamp: start + 400,
     direction: "BULLISH",
     reason: "PROFIT_FLOOR_EXIT",
-    realizedPnl: 6.000000000000005,
+    realizedPnl: 2.0000000000000018,
   }]);
 });
 

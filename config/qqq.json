@@ -1,5 +1,5 @@
 {
-  "version": "qqq-0dte-trend-confirmation-5",
+  "version": "qqq-0dte-one-contract-cap-6",
   "symbol": "QQQ",
   "signals": {
     "lateEntryGuard": {
