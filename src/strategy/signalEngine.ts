@@ -508,6 +508,13 @@ export class SignalEngine {
     if (grind) {
       if (lateEntryGuardActive(this.#config, f.timestamp) &&
           direction === "BULLISH" &&
+          f.efficiency60 <
+            this.#config.signals.lateEntryGuard.bullishGrindMinEfficiency60) {
+        blockedReasons.push("LATE_ENTRY_BULLISH_GRIND_EFFICIENCY");
+        return undefined;
+      }
+      if (lateEntryGuardActive(this.#config, f.timestamp) &&
+          direction === "BULLISH" &&
           f.medium.normalizedSlope <
             this.#config.signals.lateEntryGuard.bullishGrindMinMediumNormalizedSlope) {
         blockedReasons.push("LATE_ENTRY_BULLISH_GRIND_MEDIUM_PERSISTENCE");
@@ -593,6 +600,7 @@ function isLateBullishLowNoiseGrindFeature(
   const profile = config.signals.lateEntryGuard.bullishLowNoiseGrind;
   return profile.enabled &&
     !isBullishImpulseSetup(config, feature) &&
+    feature.efficiency60 >= config.signals.lateEntryGuard.bullishGrindMinEfficiency60 &&
     feature.fast.noiseFloorBps <= profile.maxFastNoiseFloorBps &&
     feature.fast.normalizedSlope >= profile.minFastNormalizedSlope &&
     feature.medium.normalizedSlope >= profile.minMediumNormalizedSlope &&

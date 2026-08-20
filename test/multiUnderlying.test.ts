@@ -94,6 +94,14 @@ test("TSLA applies its replay-tuned exit thresholds without changing the shared 
   assert.equal(defaultConfig.risk.recoveredActivationDollars, 15);
 });
 
+test("QQQ applies its August 19 trend-quality tuning without changing the SPY baseline", () => {
+  assert.equal(qqqConfig.version, "qqq-0dte-trend-confirmation-5");
+  assert.equal(qqqConfig.risk.trendInvalidationGraceSec, 15);
+  assert.equal(defaultConfig.risk.trendInvalidationGraceSec, 8);
+  assert.equal(qqqConfig.signals.lateEntryGuard.bullishGrindMinEfficiency60, 0.28);
+  assert.equal(defaultConfig.signals.lateEntryGuard.bullishGrindMinEfficiency60, 0);
+});
+
 test("feature engines stamp their own underlying and restoration state remains isolated", () => {
   const qqqFeatures = new FeatureEngine(qqqConfig);
   const feature = qqqFeatures.onBar({

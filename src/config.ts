@@ -118,6 +118,7 @@ export interface EngineConfig {
       bearishGrindRequiresFollowThrough: boolean;
       bearishUnclassifiedImpulseMinMediumToFastRatio: number;
       bullishGrindMinMediumNormalizedSlope: number;
+      bullishGrindMinEfficiency60: number;
       bullishNoisyGrindMinMediumToFastRatio: number;
       bullishLowNoiseGrind: {
         enabled: boolean;
@@ -464,6 +465,8 @@ export function validateConfig(config: EngineConfig): void {
         config.signals.lateEntryGuard.bearishUnclassifiedImpulseMinMediumToFastRatio >= 0 &&
         config.signals.lateEntryGuard.bearishUnclassifiedImpulseMinMediumToFastRatio <= 1 &&
         config.signals.lateEntryGuard.bullishGrindMinMediumNormalizedSlope > 0 &&
+        config.signals.lateEntryGuard.bullishGrindMinEfficiency60 >= 0 &&
+        config.signals.lateEntryGuard.bullishGrindMinEfficiency60 <= 1 &&
         config.signals.lateEntryGuard.bullishNoisyGrindMinMediumToFastRatio > 0 &&
         typeof config.signals.lateEntryGuard.bullishLowNoiseGrind.enabled === "boolean" &&
         config.signals.lateEntryGuard.bullishLowNoiseGrind.maxFastNoiseFloorBps > 0 &&

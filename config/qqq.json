@@ -1,7 +1,13 @@
 {
-  "version": "qqq-0dte-isolated-baseline-4-tighter-profit-retention",
+  "version": "qqq-0dte-trend-confirmation-5",
   "symbol": "QQQ",
+  "signals": {
+    "lateEntryGuard": {
+      "bullishGrindMinEfficiency60": 0.28
+    }
+  },
   "risk": {
-    "profitRetentionPeakScaleDollars": 50
+    "profitRetentionPeakScaleDollars": 50,
+    "trendInvalidationGraceSec": 15
   }
 }
