@@ -42,10 +42,10 @@ test("QQQ, GOOGL, and IWM have independent configurations and reject cross-under
   assert.notEqual(googlConfig.version, defaultConfig.version);
   assert.notEqual(iwmConfig.version, defaultConfig.version);
   assert.notEqual(googlConfig.version, qqqConfig.version);
-  assert.equal(defaultConfig.risk.maxContracts, 3);
-  assert.equal(qqqConfig.risk.maxContracts, 3);
-  assert.equal(googlConfig.risk.maxContracts, 3);
-  assert.equal(iwmConfig.risk.maxContracts, 3);
+  assert.equal(defaultConfig.risk.maxContracts, 1);
+  assert.equal(qqqConfig.risk.maxContracts, 1);
+  assert.equal(googlConfig.risk.maxContracts, 1);
+  assert.equal(iwmConfig.risk.maxContracts, 1);
   assert.equal(qqqConfig.risk.onePositionAtATime, true);
   const qqq: OptionContract = {
     symbol: qqqOption, underlying: "QQQ", expirationDate: date, strike: 600,
@@ -78,14 +78,14 @@ test("every supported underlying has an isolated valid configuration", () => {
     const config = configCatalog[symbol];
     assert.equal(config.symbol, symbol);
     if (symbol !== "SPY") assert.notEqual(config.version, defaultConfig.version, `${symbol} must have a versioned override`);
-    assert.equal(config.risk.maxContracts, 3);
+    assert.equal(config.risk.maxContracts, 1);
     assert.equal(config.risk.onePositionAtATime, true);
     assert.doesNotThrow(() => validateConfig(config));
   }
 });
 
 test("TSLA applies its replay-tuned exit thresholds without changing the shared baseline", () => {
-  assert.equal(tslaConfig.version, "tsla-0dte-exit-retention-2");
+  assert.equal(tslaConfig.version, "tsla-0dte-one-contract-cap-3");
   assert.equal(tslaConfig.risk.softProtectionEmergencyLossDollars, 15);
   assert.equal(tslaConfig.risk.directWinnerActivationDollars, 25);
   assert.equal(tslaConfig.risk.recoveredActivationDollars, 30);
@@ -95,7 +95,7 @@ test("TSLA applies its replay-tuned exit thresholds without changing the shared 
 });
 
 test("QQQ applies its August 19 trend-quality tuning without changing the SPY baseline", () => {
-  assert.equal(qqqConfig.version, "qqq-0dte-trend-confirmation-5");
+  assert.equal(qqqConfig.version, "qqq-0dte-one-contract-cap-6");
   assert.equal(qqqConfig.risk.trendInvalidationGraceSec, 15);
   assert.equal(defaultConfig.risk.trendInvalidationGraceSec, 8);
   assert.equal(qqqConfig.signals.lateEntryGuard.bullishGrindMinEfficiency60, 0.28);
@@ -322,7 +322,7 @@ test("live order managers share the portfolio reservation before broker submissi
   const coordinator = new PortfolioRiskCoordinator({
     timeZone: defaultConfig.timeZone,
     maxConcurrentUnderlyings: 2,
-    maxAggregateRiskDollars: 225,
+    maxAggregateRiskDollars: 75,
     maxAggregatePremiumDollars: 1_000,
     maxDailyLossDollars: 1_000,
   }, timestamp);
@@ -340,7 +340,7 @@ test("live order managers share the portfolio reservation before broker submissi
   assert.equal(qqqBroker.requests.length, 0);
 });
 
-test("QQQ serializes concurrent entries to one three-contract broker order", async () => {
+test("QQQ serializes concurrent entries to one one-contract broker order", async () => {
   const broker = new FlatUnderlyingBroker("QQQ", qqqOption);
   const manager = new LiveOrderManager({ config: qqqConfig, client: broker });
   await manager.initialize(timestamp);
@@ -362,7 +362,7 @@ test("QQQ serializes concurrent entries to one three-contract broker order", asy
   assert.equal(second.submitted, false);
   assert.ok(second.reasons.includes("ORDER_ALREADY_PENDING"));
   assert.equal(broker.requests.length, 1);
-  assert.equal(broker.requests[0]?.quantity, 3);
+  assert.equal(broker.requests[0]?.quantity, 1);
 });
 
 test("dashboard forward-move diagnostics never compare QQQ evaluations with SPY prices", () => {

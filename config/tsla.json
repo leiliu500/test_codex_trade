@@ -1,5 +1,5 @@
 {
-  "version": "tsla-0dte-exit-retention-2",
+  "version": "tsla-0dte-one-contract-cap-3",
   "symbol": "TSLA",
   "risk": {
     "softProtectionEmergencyLossDollars": 15,
