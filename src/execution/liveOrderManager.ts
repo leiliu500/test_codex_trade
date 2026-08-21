@@ -392,6 +392,59 @@ export class LiveOrderManager {
     });
   }
 
+  /** Applies an account-stream update through the same serialized state machine as REST polling. */
+  applyBrokerOrderUpdate(broker: BrokerOrder, timestamp: number): Promise<LiveExecutionSnapshot> {
+    return this.#serialize(async () => {
+      this.#assertOperational();
+      const pending = this.#pending;
+      const matchesPending = pending !== undefined && broker.id === pending.brokerOrderId;
+      if (matchesPending) {
+        await this.#synchronizeBrokerOrder(broker, timestamp);
+        return this.snapshot();
+      }
+      if (this.#knownClientOrderIds.has(broker.clientOrderId) && isTerminalBrokerStatus(broker.status)) {
+        await this.#audit(timestamp, "duplicate_terminal_trade_update", { broker });
+        return this.snapshot();
+      }
+      return this.#halt(timestamp, "UNMATCHED_ACCOUNT_TRADE_UPDATE", {
+        broker,
+        pending: pending ?? null,
+      });
+    });
+  }
+
+  /** Re-establishes broker truth after every account-stream connection or reconnect. */
+  reconcileExternalState(timestamp: number, cause: string): Promise<LiveExecutionSnapshot> {
+    return this.#serialize(async () => {
+      this.#assertOperational();
+      if (this.#pending) {
+        const current = await this.#client.getOrder(this.#pending.brokerOrderId);
+        await this.#synchronizeBrokerOrder(current, timestamp);
+      }
+      const reconciliation = await reconcileBrokerState(
+        this.#client,
+        this.#position,
+        this.#knownClientOrderIds,
+      );
+      const pending = this.#pending;
+      const unexpectedKnownOpenOrders = reconciliation.openOrders.filter((order) =>
+        !pending || (order.id !== pending.brokerOrderId && order.clientOrderId !== pending.state.clientOrderId));
+      await this.#audit(timestamp, "external_broker_reconciliation", {
+        cause,
+        reconciliation,
+        unexpectedKnownOpenOrders,
+      });
+      if (!reconciliation.matched || unexpectedKnownOpenOrders.length > 0) {
+        await this.#halt(timestamp, "EXTERNAL_BROKER_RECONCILIATION_FAILED", {
+          cause,
+          reconciliation,
+          unexpectedKnownOpenOrders,
+        });
+      }
+      return this.snapshot();
+    });
+  }
+
   snapshot(): LiveExecutionSnapshot {
     return {
       halted: this.#halted,
@@ -1055,6 +1108,11 @@ export class LiveOrderManager {
     this.#tail = result.then(() => undefined, () => undefined);
     return result;
   }
+}
+
+function isTerminalBrokerStatus(status: string): boolean {
+  const normalized = status.toLowerCase();
+  return normalized === "filled" || normalized === "rejected" || CANCELED_BROKER_STATUSES.has(normalized);
 }
 
 function maximumEntryPremium(

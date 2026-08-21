@@ -59,6 +59,20 @@ export interface HealthState {
   lastFeatureTimestamp?: number;
   reconnectAttempt?: number;
   lastStreamError?: string;
+  marketDataPendingEvents?: number;
+  marketDataMaximumPendingEvents?: number;
+  marketDataConsumerLagMs?: number;
+  marketDataMaximumConsumerLagMs?: number;
+  marketDataCoalescedEvents?: number;
+  marketDataBackpressure?: boolean;
+  tradeUpdatesConnected?: boolean;
+  tradeUpdatePendingEvents?: number;
+  tradeUpdateMaximumPendingEvents?: number;
+  tradeUpdateConsumerLagMs?: number;
+  tradeUpdateMaximumConsumerLagMs?: number;
+  tradeUpdateBackpressure?: boolean;
+  tradeUpdateReconnectAttempt?: number;
+  leaderActive?: boolean;
   stockWebsocketConnected?: boolean;
   optionWebsocketConnected?: boolean;
   marketDataIdle?: boolean;
@@ -137,6 +151,10 @@ export function combineHealthStates(states: Readonly<Record<string, HealthState>
   const optionProviderAdvanceRatio = minimum("optionProviderAdvanceRatio");
   const optionProviderTimeVelocity = minimum("optionProviderTimeVelocity");
   const optionRestCircuitRetryAfterMs = maximum("optionRestCircuitRetryAfterMs");
+  const marketDataConsumerLagMs = maximum("marketDataConsumerLagMs");
+  const marketDataMaximumConsumerLagMs = minimum("marketDataMaximumConsumerLagMs");
+  const tradeUpdateConsumerLagMs = maximum("tradeUpdateConsumerLagMs");
+  const tradeUpdateMaximumConsumerLagMs = minimum("tradeUpdateMaximumConsumerLagMs");
   return {
     ready: values.every((state) => state.ready),
     brokerRequired: values.some((state) => state.brokerRequired !== false),
@@ -189,6 +207,21 @@ export function combineHealthStates(states: Readonly<Record<string, HealthState>
     restoredStockEvents: sum("restoredStockEvents"),
     restoredFeatureBars: sum("restoredFeatureBars"),
     reconnectAttempt: Math.max(...values.map((state) => state.reconnectAttempt ?? 0)),
+    marketDataPendingEvents: sum("marketDataPendingEvents"),
+    marketDataMaximumPendingEvents: sum("marketDataMaximumPendingEvents"),
+    ...(marketDataConsumerLagMs !== undefined ? { marketDataConsumerLagMs } : {}),
+    ...(marketDataMaximumConsumerLagMs !== undefined ? { marketDataMaximumConsumerLagMs } : {}),
+    marketDataCoalescedEvents: sum("marketDataCoalescedEvents"),
+    marketDataBackpressure: values.some((state) => state.marketDataBackpressure === true),
+    tradeUpdatesConnected: values.filter((state) => state.executionEnabled === true)
+      .every((state) => state.tradeUpdatesConnected !== false),
+    tradeUpdatePendingEvents: sum("tradeUpdatePendingEvents"),
+    tradeUpdateMaximumPendingEvents: sum("tradeUpdateMaximumPendingEvents"),
+    ...(tradeUpdateConsumerLagMs !== undefined ? { tradeUpdateConsumerLagMs } : {}),
+    ...(tradeUpdateMaximumConsumerLagMs !== undefined ? { tradeUpdateMaximumConsumerLagMs } : {}),
+    tradeUpdateBackpressure: values.some((state) => state.tradeUpdateBackpressure === true),
+    tradeUpdateReconnectAttempt: Math.max(...values.map((state) => state.tradeUpdateReconnectAttempt ?? 0)),
+    leaderActive: values.every((state) => state.leaderActive !== false),
     stockWebsocketConnected: values.every((state) => state.stockWebsocketConnected !== false),
     optionWebsocketConnected: values
       .filter((state) => state.optionDataFeed === "opra")
@@ -223,9 +256,13 @@ export function combineHealthStates(states: Readonly<Record<string, HealthState>
 }
 
 export function healthReadiness(state: HealthState): { status: "ok" | "degraded" | "halted"; checks: HealthState } {
-  if (state.killSwitch || !state.positionsReconciled || !state.recorderHealthy) return { status: "halted", checks: state };
+  if (state.killSwitch || !state.positionsReconciled || !state.recorderHealthy || state.leaderActive === false) {
+    return { status: "halted", checks: state };
+  }
   if (!state.ready || (!state.websocketConnected && !state.marketDataIdle) ||
-      (state.brokerRequired !== false && !state.brokerAvailable)) {
+      state.marketDataBackpressure === true ||
+      state.tradeUpdateBackpressure === true ||
+      (state.brokerRequired !== false && (!state.brokerAvailable || state.tradeUpdatesConnected === false))) {
     return { status: "degraded", checks: state };
   }
   return { status: "ok", checks: state };

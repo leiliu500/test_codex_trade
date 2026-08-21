@@ -5,6 +5,7 @@ import { combineHealthStates, startHealthServer, type HealthState } from "./ops/
 import { AlpacaStockWebSocket } from "./alpaca/stockStream.js";
 import { AlpacaOptionWebSocket } from "./alpaca/optionStream.js";
 import { AlpacaTradingRestClient, UnderlyingTradingRestClient } from "./alpaca/restClient.js";
+import { AccountTradeUpdateCoordinator, AlpacaTradeUpdateWebSocket } from "./alpaca/tradingStream.js";
 import { SpySipReceiver } from "./runtime/spySipReceiver.js";
 import { SpyOptionsTradingRuntime } from "./runtime/spyOptionsTradingRuntime.js";
 import { SharedOptionStreamHub, SharedStockStreamHub } from "./runtime/sharedStreams.js";
@@ -16,6 +17,7 @@ import { CompositeMarketHistorySink, SharedPriorityMarketHistoryHub } from "./hi
 import { JsonLogger } from "./utils/logger.js";
 import { marketDate } from "./utils/time.js";
 import type { FeatureSnapshot, UnderlyingSymbol } from "./types.js";
+import { PostgresLeaderLease } from "./ops/leaderLease.js";
 import {
   mergeOrderCardQuoteDynamics,
   type DashboardOrderCard,
@@ -26,13 +28,30 @@ const environment = readEnvironment();
 const configs = environment.tradingSymbols.map((symbol) => configCatalog[symbol]);
 for (const config of configs) validateConfig(config);
 
-if (environment.tradingMode === "live") {
-  throw new Error("Live mode needs explicitly promoted multi-underlying adapters; refusing implicit live startup");
-}
-
 const logger = new JsonLogger([
   environment.alpacaApiKey ?? "", environment.alpacaApiSecret ?? "", environment.databaseUrl ?? "",
 ]);
+let shuttingDown = false;
+let startupLifecycleReady = false;
+let pendingLeaderLoss = false;
+let leaderActive = !environment.leaderElectionEnabled;
+const leaderLease = environment.leaderElectionEnabled ? new PostgresLeaderLease({
+  connectionString: environment.databaseUrl!,
+  lockKey: environment.leaderLockKey,
+  heartbeatMs: environment.leaderHeartbeatMs,
+  onLost: (error) => {
+    leaderActive = false;
+    logger.log("error", "leader_lease_lost", { error: error.message });
+    process.exitCode = 1;
+    if (startupLifecycleReady) void shutdown("SIGTERM");
+    else pendingLeaderLoss = true;
+  },
+}) : undefined;
+if (leaderLease) {
+  leaderActive = await leaderLease.acquire();
+  if (!leaderActive) throw new Error(`Another engine owns leader lock ${environment.leaderLockKey}`);
+  logger.log("info", "leader_lease_acquired", { lockKey: environment.leaderLockKey });
+}
 const dashboard = new TradingDashboardStore(
   Date.now(),
   environment.historyDatabaseEnabled,
@@ -106,6 +125,7 @@ const idleHealthState: HealthState = {
   positionsReconciled: true,
   recorderHealthy: history?.healthy() ?? true,
   killSwitch: environment.killSwitch,
+  leaderActive,
 };
 
 const physicalStockStream = environment.marketDataEnabled ? new AlpacaStockWebSocket({
@@ -115,7 +135,10 @@ const physicalStockStream = environment.marketDataEnabled ? new AlpacaStockWebSo
   symbols: environment.tradingSymbols,
 }) : undefined;
 const stockHub = physicalStockStream
-  ? new SharedStockStreamHub(physicalStockStream, environment.tradingSymbols)
+  ? new SharedStockStreamHub(physicalStockStream, environment.tradingSymbols, {
+    maxPendingEventsPerChannel: environment.marketDataMaxPendingEventsPerSymbol,
+    maxConsumerLagMs: environment.marketDataMaxInternalLagMs,
+  })
   : undefined;
 const physicalOptionStream = environment.liveOrdersEnabled ? new AlpacaOptionWebSocket({
   apiKey: environment.alpacaApiKey!,
@@ -123,15 +146,20 @@ const physicalOptionStream = environment.liveOrdersEnabled ? new AlpacaOptionWeb
   feed: environment.optionDataFeed,
 }) : undefined;
 const optionHub = physicalOptionStream
-  ? new SharedOptionStreamHub(physicalOptionStream, environment.tradingSymbols)
+  ? new SharedOptionStreamHub(physicalOptionStream, environment.tradingSymbols, {
+    maxSubscriptions: environment.optionMaxSubscriptions,
+    maxPendingEventsPerChannel: environment.marketDataMaxPendingEventsPerSymbol,
+    maxConsumerLagMs: environment.marketDataMaxInternalLagMs,
+  })
   : undefined;
 const broker = environment.liveOrdersEnabled ? new AlpacaTradingRestClient({
   apiKey: environment.alpacaApiKey!,
   apiSecret: environment.alpacaApiSecret!,
-  paper: true,
+  paper: environment.tradingMode === "paper",
   optionFeed: environment.optionDataFeed,
   underlyings: environment.tradingSymbols,
 }) : undefined;
+let tradeUpdateCoordinator: AccountTradeUpdateCoordinator | undefined;
 const portfolioRisk = broker ? new PortfolioRiskCoordinator({
   timeZone: defaultConfig.timeZone,
   maxConcurrentUnderlyings: configs.length,
@@ -148,7 +176,9 @@ const tradingRuntimes = broker && stockHub && optionHub ? configs.map((config) =
     stockStream: stockHub.channel(symbol),
     optionStream: optionHub.channel(symbol),
     executionEnabled: true,
-    executionMode: "paper",
+    executionMode: environment.tradingMode,
+    tradeUpdatesRequired: true,
+    tradeUpdateTelemetry: () => tradeUpdateCoordinator?.telemetry(symbol),
     killSwitch: environment.killSwitch,
     recorder: auditRecorder,
     history: priorityHistory.channel(symbol),
@@ -170,6 +200,30 @@ const tradingRuntimes = broker && stockHub && optionHub ? configs.map((config) =
   });
 }) : [];
 
+if (broker && tradingRuntimes.length > 0) {
+  const physicalTradeUpdates = new AlpacaTradeUpdateWebSocket({
+    apiKey: environment.alpacaApiKey!,
+    apiSecret: environment.alpacaApiSecret!,
+    paper: environment.tradingMode === "paper",
+  });
+  tradeUpdateCoordinator = new AccountTradeUpdateCoordinator(
+    physicalTradeUpdates,
+    Object.fromEntries(configs.map((config, index) => [config.symbol, {
+      onUpdate: (update) => tradingRuntimes[index]!.ingestTradeUpdate(update),
+      onReconcile: (timestamp) => tradingRuntimes[index]!.reconcileTradeUpdateState(timestamp),
+      onState: (connected) => tradingRuntimes[index]!.setTradeUpdateConnectionState(connected),
+      onError: (error) => logger.log("error", "trade_update_consumer_error", {
+        underlying: config.symbol,
+        error: error instanceof Error ? error.message : String(error),
+      }),
+    }])),
+    {
+      maxPendingEventsPerUnderlying: environment.tradeUpdateMaxPendingEventsPerUnderlying,
+      maxConsumerLagMs: environment.marketDataMaxInternalLagMs,
+    },
+  );
+}
+
 const sipReceivers = environment.marketDataEnabled && stockHub && tradingRuntimes.length === 0
   ? configs.map((config) => new SpySipReceiver({
       config,
@@ -183,16 +237,16 @@ const sipReceivers = environment.marketDataEnabled && stockHub && tradingRuntime
 
 const getHealth = (): HealthState => {
   if (tradingRuntimes.length > 0) {
-    return combineHealthStates(Object.fromEntries(configs.map((config, index) => [
+    return { ...combineHealthStates(Object.fromEntries(configs.map((config, index) => [
       config.symbol, tradingRuntimes[index]!.healthState(),
-    ])));
+    ]))), leaderActive };
   }
   if (sipReceivers.length > 0) {
-    return combineHealthStates(Object.fromEntries(configs.map((config, index) => [
+    return { ...combineHealthStates(Object.fromEntries(configs.map((config, index) => [
       config.symbol, sipReceivers[index]!.healthState(environment.killSwitch),
-    ])));
+    ]))), leaderActive };
   }
-  return idleHealthState;
+  return { ...idleHealthState, leaderActive };
 };
 
 const server = startHealthServer(
@@ -213,17 +267,17 @@ const server = startHealthServer(
 server.on("listening", () => {
   process.stdout.write(`${JSON.stringify({
     status: "running",
-    mode: "paper",
+    mode: environment.tradingMode,
     symbols: environment.tradingSymbols,
     marketData: tradingRuntimes.length > 0 ? "sip-and-opra-connecting"
       : environment.marketDataEnabled ? "sip-connecting" : "disabled",
-    orderSubmission: tradingRuntimes.length > 0 ? "alpaca-paper-enabled" : "disabled",
+    orderSubmission: tradingRuntimes.length > 0 ? `alpaca-${environment.tradingMode}-enabled` : "disabled",
     configVersions: Object.fromEntries(configs.map((config) => [config.symbol, config.version])),
     health: `http://${environment.healthHost}:${environment.healthPort}`,
     dashboard: `http://${environment.healthHost}:${environment.healthPort}/dashboard`,
     historyDatabase: history ? "postgres-ready" : "disabled",
     message: tradingRuntimes.length > 0
-      ? "Paper runtimes are connecting isolated SIP signals and option state through shared market-data and broker boundaries."
+      ? `${environment.tradingMode === "paper" ? "Paper" : "Live"} runtimes are connecting isolated SIP signals and option state through shared market-data and broker boundaries.`
       : environment.marketDataEnabled
       ? "Paper-safe SIP receivers are connecting."
       : "Paper-safe runtime is alive with market data disabled.",
@@ -235,10 +289,18 @@ server.on("error", (error) => {
   process.exitCode = 1;
 });
 
-if (tradingRuntimes.length > 0) {
-  void Promise.all(tradingRuntimes.map((runtime) => runtime.start())).then(() => {
-    logger.log("info", "multi_underlying_paper_runtime_started", {
+process.once("SIGINT", (signal) => void shutdown(signal));
+process.once("SIGTERM", (signal) => void shutdown(signal));
+startupLifecycleReady = true;
+
+if (pendingLeaderLoss) {
+  void shutdown("SIGTERM");
+} else if (tradingRuntimes.length > 0) {
+  void Promise.all(tradingRuntimes.map((runtime) => runtime.start())).then(async () => {
+    await tradeUpdateCoordinator?.start();
+    logger.log("info", "multi_underlying_runtime_started", {
       underlyings: environment.tradingSymbols,
+      executionMode: environment.tradingMode,
       underlyingOrdersAllowed: false,
       expiration: "current-market-day-only",
       stockFeed: "sip",
@@ -261,7 +323,6 @@ if (tradingRuntimes.length > 0) {
   });
 }
 
-let shuttingDown = false;
 async function shutdown(signal: NodeJS.Signals): Promise<void> {
   if (shuttingDown) return;
   shuttingDown = true;
@@ -269,11 +330,14 @@ async function shutdown(signal: NodeJS.Signals): Promise<void> {
   const forcedExit = setTimeout(() => process.exit(1), 9_000);
   forcedExit.unref();
   try {
+    await tradeUpdateCoordinator?.close();
     await Promise.allSettled([
       ...tradingRuntimes.map((runtime) => runtime.close()),
       ...sipReceivers.map((receiver) => receiver.close()),
     ]);
     await history?.close();
+    await leaderLease?.release();
+    leaderActive = false;
     await new Promise<void>((resolve, reject) => {
       server.close((error) => error ? reject(error) : resolve());
     });
@@ -284,9 +348,6 @@ async function shutdown(signal: NodeJS.Signals): Promise<void> {
     clearTimeout(forcedExit);
   }
 }
-
-process.once("SIGINT", (signal) => void shutdown(signal));
-process.once("SIGTERM", (signal) => void shutdown(signal));
 
 function restoredPortfolioPnl(events: readonly AuditEvent[], timestamp: number, timeZone: string): number {
   const date = marketDate(timestamp, timeZone);

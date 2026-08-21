@@ -245,6 +245,110 @@ test("a QQQ stream-consumer failure does not interrupt SPY delivery", async () =
   ]);
   assert.deepEqual(spyStocks, ["SPY"]);
   assert.deepEqual(qqqErrors, ["QQQ consumer failed"]);
+  assert.equal(stockHub.channel("QQQ").telemetry?.().overloaded, true);
+});
+
+test("shared OPRA admission rejects cross-underlying contracts and the account-wide budget atomically", async () => {
+  const option = new FakeOptionStream();
+  const hub = new SharedOptionStreamHub(option, ["SPY", "QQQ"], { maxSubscriptions: 2 });
+  const spy = hub.channel("SPY");
+  const qqq = hub.channel("QQQ");
+  await spy.subscribe([spyOption]);
+  await qqq.subscribe([qqqOption]);
+  await assert.rejects(() => spy.subscribe(["SPY260722P00500000"]), /budget exceeded.*3.*2/i);
+  await assert.rejects(() => spy.subscribe([qqqOption]), /cross-underlying/i);
+  await Promise.all([
+    spy.connect(optionCollector([])),
+    qqq.connect(optionCollector([])),
+  ]);
+  assert.deepEqual([...option.subscribed].sort(), [qqqOption, spyOption]);
+  await Promise.all([spy.close(), qqq.close()]);
+});
+
+test("one physical SIP reconnect restores every active ticker exactly once", async () => {
+  const stock = new FakeStockStream();
+  const hub = new SharedStockStreamHub(stock, ["SPY", "QQQ"], {
+    reconnectBaseMs: 1,
+    reconnectMaximumMs: 1,
+  });
+  const states = new Map<string, boolean[]>();
+  const connect = (underlying: UnderlyingSymbol) => hub.channel(underlying).connect({
+    onQuote: () => undefined,
+    onTrade: () => undefined,
+    onState: (connected) => {
+      const values = states.get(underlying) ?? [];
+      values.push(connected);
+      states.set(underlying, values);
+    },
+  });
+  await Promise.all([connect("SPY"), connect("QQQ")]);
+  stock.disconnect();
+  await waitFor(() => stock.connectCalls === 2);
+  assert.equal(stock.connectCalls, 2);
+  assert.deepEqual(states.get("SPY"), [true, false, true]);
+  assert.deepEqual(states.get("QQQ"), [true, false, true]);
+  await Promise.all([hub.channel("SPY").close(), hub.channel("QQQ").close()]);
+});
+
+test("one physical OPRA reconnect restores every ticker subscription exactly once", async () => {
+  const option = new FakeOptionStream();
+  const hub = new SharedOptionStreamHub(option, ["SPY", "QQQ"], {
+    reconnectBaseMs: 1,
+    reconnectMaximumMs: 1,
+  });
+  const spy = hub.channel("SPY");
+  const qqq = hub.channel("QQQ");
+  const states = new Map<string, boolean[]>();
+  await Promise.all([spy.subscribe([spyOption]), qqq.subscribe([qqqOption])]);
+  await Promise.all([spy.connect({
+    ...optionCollector([]),
+    onState: (connected) => states.set("SPY", [...(states.get("SPY") ?? []), connected]),
+  }), qqq.connect({
+    ...optionCollector([]),
+    onState: (connected) => states.set("QQQ", [...(states.get("QQQ") ?? []), connected]),
+  })]);
+  option.disconnect();
+  await waitFor(() => option.connectCalls === 2 &&
+    option.subscriptionRequests.flat().filter((symbol) => symbol === spyOption).length === 2 &&
+    option.subscriptionRequests.flat().filter((symbol) => symbol === qqqOption).length === 2);
+  assert.deepEqual(states.get("SPY"), [true, false, true]);
+  assert.deepEqual(states.get("QQQ"), [true, false, true]);
+  assert.deepEqual([...option.subscribed].sort(), [qqqOption, spyOption]);
+  await Promise.all([spy.close(), qqq.close()]);
+});
+
+test("a slow SIP ticker fails closed without delaying another ticker", async () => {
+  const stock = new FakeStockStream();
+  let releaseSlow!: () => void;
+  const slow = new Promise<void>((resolve) => { releaseSlow = resolve; });
+  const hub = new SharedStockStreamHub(stock, ["SPY", "QQQ"], {
+    maxPendingEventsPerChannel: 2,
+    maxConsumerLagMs: 10_000,
+  });
+  const spyValues: string[] = [];
+  const qqqErrors: string[] = [];
+  const spy = hub.channel("SPY");
+  const qqq = hub.channel("QQQ");
+  await Promise.all([
+    spy.connect(stockCollector(spyValues)),
+    qqq.connect({
+      onQuote: async () => slow,
+      onTrade: async () => slow,
+      onError: (error) => qqqErrors.push(error instanceof Error ? error.message : String(error)),
+    }),
+  ]);
+  await stock.emit([{ type: "quote", value: stockQuote("QQQ", 600) }]);
+  await stock.emit([
+    { type: "quote", value: stockQuote("QQQ", 600) },
+    { type: "trade", value: stockTrade("QQQ", 600) },
+    { type: "quote", value: stockQuote("QQQ", 600) },
+    { type: "quote", value: stockQuote("SPY", 500) },
+  ]);
+  assert.deepEqual(spyValues, ["SPY"]);
+  assert.equal(qqq.telemetry?.().overloaded, true);
+  assert.match(qqqErrors[0] ?? "", /pending-event limit exceeded/);
+  releaseSlow();
+  await Promise.all([spy.close(), qqq.close()]);
 });
 
 test("broker views are scoped by underlying while account state remains shared", async () => {
@@ -543,6 +647,7 @@ class FakeStockStream implements StockStream {
   async emit(events: Parameters<NonNullable<StockStreamHandlers["onEvents"]>>[0]): Promise<void> {
     await this.handlers?.onEvents?.(events);
   }
+  disconnect(): void { this.handlers?.onState?.(false); }
 }
 
 class FakeOptionStream implements OptionStream {
@@ -550,7 +655,11 @@ class FakeOptionStream implements OptionStream {
   readonly subscribed = new Set<string>();
   connectCalls = 0;
   closeCalls = 0;
-  async subscribe(symbols: readonly string[]): Promise<void> { for (const symbol of symbols) this.subscribed.add(symbol); }
+  readonly subscriptionRequests: string[][] = [];
+  async subscribe(symbols: readonly string[]): Promise<void> {
+    this.subscriptionRequests.push([...symbols]);
+    for (const symbol of symbols) this.subscribed.add(symbol);
+  }
   async unsubscribe(symbols: readonly string[]): Promise<void> { for (const symbol of symbols) this.subscribed.delete(symbol); }
   async connect(handlers: OptionStreamHandlers): Promise<void> {
     this.connectCalls += 1;
@@ -558,6 +667,7 @@ class FakeOptionStream implements OptionStream {
     handlers.onState?.(true);
   }
   async close(): Promise<void> { this.closeCalls += 1; this.handlers?.onState?.(false); }
+  disconnect(): void { this.handlers?.onState?.(false); }
   async emit(quotes: readonly OptionQuote[]): Promise<void> {
     this.handlers?.onActivity?.({ receiveWallTimestamp: timestamp, receiveMonotonicTimestamp: timestamp });
     this.handlers?.onQuoteObservations?.(quotes.map((quote) => ({
@@ -574,6 +684,14 @@ class FakeOptionStream implements OptionStream {
       trades.map((trade) => ({ type: "trade" as const, value: trade })),
       { receiveWallTimestamp: timestamp, receiveMonotonicTimestamp: timestamp },
     );
+  }
+}
+
+async function waitFor(predicate: () => boolean, timeoutMs = 1_000): Promise<void> {
+  const started = Date.now();
+  while (!predicate()) {
+    if (Date.now() - started >= timeoutMs) throw new Error("Timed out waiting for test condition");
+    await new Promise<void>((resolve) => setTimeout(resolve, 2));
   }
 }
 
