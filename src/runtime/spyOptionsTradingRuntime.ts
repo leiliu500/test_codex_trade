@@ -4,6 +4,8 @@ import { AlpacaOptionFeatureEngine } from "../alpaca/optionFeatures.js";
 import type { StockStream } from "../alpaca/stockStream.js";
 import type { StockStreamEvent } from "../alpaca/stockStream.js";
 import type { TradingRestClient } from "../alpaca/restClient.js";
+import type { AlpacaTradeUpdate } from "../alpaca/tradingStream.js";
+import type { MarketStreamTelemetry } from "../marketData/streamTelemetry.js";
 import {
   isUnderlyingSymbol, type AccountState, type FeatureSnapshot, type OptionCandidateEvaluation,
   type OptionContract, type OptionQuote, type RegimeDecision, type StockQuote, type TradeSignal,
@@ -75,6 +77,8 @@ export interface SpyOptionsTradingRuntimeOptions {
   ) => AsyncIterable<readonly HistoricalMarketEvent[]>;
   restoredFeatureCheckpoint?: FeatureSnapshot;
   portfolioRisk?: PortfolioRiskCoordinator;
+  tradeUpdatesRequired?: boolean;
+  tradeUpdateTelemetry?: () => MarketStreamTelemetry | undefined;
 }
 
 export function optionUniverseRequired(
@@ -123,6 +127,8 @@ export class SpyOptionsTradingRuntime {
   readonly #onError: ((error: unknown) => void) | undefined;
   readonly #requireStrategyRecovery: boolean;
   readonly #loadStockHistory: SpyOptionsTradingRuntimeOptions["loadStockHistory"];
+  readonly #tradeUpdatesRequired: boolean;
+  readonly #tradeUpdateTelemetry: (() => MarketStreamTelemetry | undefined) | undefined;
   readonly #queue = new SerializedDecisionQueue();
   readonly #book = new OptionBook();
   readonly #selector: OptionSelector;
@@ -144,6 +150,7 @@ export class SpyOptionsTradingRuntime {
   #optionConnected = false;
   #brokerAvailable = false;
   #positionsReconciled = false;
+  #tradeUpdatesConnected = false;
   #account: AccountState | undefined;
   #marketOpen = false;
   #marketDataIdle = false;
@@ -209,6 +216,8 @@ export class SpyOptionsTradingRuntime {
     this.#onError = options.onError;
     this.#requireStrategyRecovery = options.requireStrategyRecovery === true;
     this.#loadStockHistory = options.loadStockHistory;
+    this.#tradeUpdatesRequired = options.tradeUpdatesRequired === true;
+    this.#tradeUpdateTelemetry = options.tradeUpdateTelemetry;
     this.#selector = new OptionSelector(options.config);
     this.#universe = new OptionUniverseManager(options.config);
     this.#signals = new SignalEngine(options.config);
@@ -324,7 +333,7 @@ export class SpyOptionsTradingRuntime {
         knownClientOrderIds: this.#restoredRuntimeState.knownClientOrderIds.size,
       });
       this.#synchronizeHistoryPriorities();
-      this.#positionsReconciled = true;
+      this.#positionsReconciled = !this.#tradeUpdatesRequired || this.#tradeUpdatesConnected;
       this.#brokerAvailable = true;
       if (clock.isOpen) {
         const latestQuote = await this.#getLatestSipQuote();
@@ -334,7 +343,9 @@ export class SpyOptionsTradingRuntime {
         for (const result of streamStarts) {
           if (result.status === "rejected") this.#recordError(result.reason);
         }
-        if (streamStarts[0]?.status === "rejected") this.#scheduleOptionReconnect();
+        if (streamStarts[0]?.status === "rejected" && !this.#optionStream.reconnectManaged) {
+          this.#scheduleOptionReconnect();
+        }
         const catchup = await this.#stockReceiver.activate();
         if (catchup.latestFeature) {
           this.#lastFeature = catchup.latestFeature;
@@ -400,6 +411,50 @@ export class SpyOptionsTradingRuntime {
     await this.#queue.drained();
     this.#optionConnected = false;
     this.#history?.setPrioritySymbols?.(new Set());
+  }
+
+  setTradeUpdateConnectionState(connected: boolean): void {
+    this.#tradeUpdatesConnected = connected;
+    if (!connected && this.#tradeUpdatesRequired) this.#positionsReconciled = false;
+  }
+
+  async reconcileTradeUpdateState(timestamp: number): Promise<void> {
+    this.#positionsReconciled = false;
+    try {
+      this.#execution = await this.#orders.reconcileExternalState(timestamp, "TRADE_UPDATE_STREAM_CONNECTED");
+      this.#positionsReconciled = true;
+      this.#brokerAvailable = true;
+      this.#synchronizePositionLifecycle();
+      this.#synchronizeHistoryPriorities();
+    } catch (error) {
+      this.#brokerAvailable = false;
+      this.#recordError(error);
+      throw error;
+    }
+  }
+
+  async ingestTradeUpdate(update: AlpacaTradeUpdate): Promise<void> {
+    try {
+      this.#execution = await this.#orders.applyBrokerOrderUpdate(update.order, update.timestamp);
+      this.#positionsReconciled = !this.#tradeUpdatesRequired || this.#tradeUpdatesConnected;
+      this.#brokerAvailable = true;
+      this.#synchronizePositionLifecycle();
+      this.#synchronizeHistoryPriorities();
+      this.#emit("broker_trade_update", {
+        event: update.event,
+        timestamp: update.timestamp,
+        orderId: update.order.id,
+        clientOrderId: update.order.clientOrderId,
+        symbol: update.order.symbol,
+        status: update.order.status,
+        filledQuantity: update.order.filledQuantity,
+      });
+    } catch (error) {
+      this.#positionsReconciled = false;
+      this.#brokerAvailable = false;
+      this.#recordError(error);
+      throw error;
+    }
   }
 
   async ingestFeature(feature: FeatureSnapshot): Promise<void> {
@@ -844,18 +899,29 @@ export class SpyOptionsTradingRuntime {
       submitted: result.submitted,
       reasons: result.reasons,
       brokerOrderId: result.brokerOrder?.id ?? null,
+      executionMode: this.#executionMode,
     };
-    await this.#auditRuntime(this.#now(), "paper_order_submission_result", submissionEvent);
-    this.#emit("paper_order_submission_result", submissionEvent);
+    const submissionEventType = this.#executionMode === "live"
+      ? "live_order_submission_result"
+      : "paper_order_submission_result";
+    await this.#auditRuntime(this.#now(), submissionEventType, submissionEvent);
+    this.#emit(submissionEventType, submissionEvent);
   }
 
   healthState(): HealthState {
     const now = this.#now();
     const stock = this.#stockReceiver.healthState(this.#killSwitch);
+    const optionTelemetry = this.#optionStream.telemetry?.();
+    const tradeUpdateTelemetry = this.#tradeUpdateTelemetry?.();
     const recorderHealthy = this.#recorder.healthy();
-    const brokerReady = !this.#executionEnabled || (this.#brokerAvailable && this.#positionsReconciled && this.#account?.optionsApproved === true);
+    const brokerReady = !this.#executionEnabled || (
+      this.#brokerAvailable && this.#positionsReconciled && this.#account?.optionsApproved === true &&
+      (!this.#tradeUpdatesRequired || this.#tradeUpdatesConnected) &&
+      tradeUpdateTelemetry?.overloaded !== true
+    );
     const streamsConnected = stock.websocketConnected && this.#optionConnected;
-    const streamsReady = this.#marketDataIdle || streamsConnected;
+    const marketDataBackpressure = stock.marketDataBackpressure === true || optionTelemetry?.overloaded === true;
+    const streamsReady = this.#marketDataIdle || (streamsConnected && !marketDataBackpressure);
     const hasOptionExposure = this.#execution.position !== undefined || this.#execution.pending !== undefined;
     const noSameDayOptionContracts = this.#optionUniverseInitialized && this.#contracts.length === 0 &&
       !hasOptionExposure;
@@ -940,7 +1006,34 @@ export class SpyOptionsTradingRuntime {
         ? { lastOptionRestFallbackError: this.#lastOptionRestFallbackError }
         : {}),
       rejectedMarketEvents: (stock.rejectedMarketEvents ?? 0) + this.#rejectedOptionQuotes,
-      reconnectAttempt: Math.max(stock.reconnectAttempt ?? 0, this.#optionReconnectAttempt),
+      reconnectAttempt: Math.max(
+        stock.reconnectAttempt ?? 0,
+        this.#optionReconnectAttempt,
+        optionTelemetry?.reconnectAttempt ?? 0,
+      ),
+      marketDataPendingEvents: (stock.marketDataPendingEvents ?? 0) + (optionTelemetry?.pendingEvents ?? 0),
+      marketDataMaximumPendingEvents: (stock.marketDataMaximumPendingEvents ?? 0) +
+        (optionTelemetry?.maximumPendingEvents ?? 0),
+      marketDataConsumerLagMs: Math.max(
+        stock.marketDataConsumerLagMs ?? 0,
+        optionTelemetry?.consumerLagMs ?? 0,
+      ),
+      marketDataMaximumConsumerLagMs: Math.min(
+        stock.marketDataMaximumConsumerLagMs ?? Number.POSITIVE_INFINITY,
+        optionTelemetry?.maximumConsumerLagMs ?? Number.POSITIVE_INFINITY,
+      ),
+      marketDataCoalescedEvents: (stock.marketDataCoalescedEvents ?? 0) +
+        (optionTelemetry?.coalescedEvents ?? 0),
+      marketDataBackpressure,
+      tradeUpdatesConnected: !this.#tradeUpdatesRequired || this.#tradeUpdatesConnected,
+      tradeUpdatePendingEvents: tradeUpdateTelemetry?.pendingEvents ?? 0,
+      tradeUpdateMaximumPendingEvents: tradeUpdateTelemetry?.maximumPendingEvents ?? 0,
+      tradeUpdateConsumerLagMs: tradeUpdateTelemetry?.consumerLagMs ?? 0,
+      ...(tradeUpdateTelemetry?.maximumConsumerLagMs !== undefined
+        ? { tradeUpdateMaximumConsumerLagMs: tradeUpdateTelemetry.maximumConsumerLagMs }
+        : {}),
+      tradeUpdateBackpressure: tradeUpdateTelemetry?.overloaded === true,
+      tradeUpdateReconnectAttempt: tradeUpdateTelemetry?.reconnectAttempt ?? 0,
       ...(this.#lastError ? { lastStreamError: this.#lastError } : {}),
       stockWebsocketConnected: stock.websocketConnected,
       optionWebsocketConnected: this.#optionConnected,
@@ -980,6 +1073,12 @@ export class SpyOptionsTradingRuntime {
     if (this.#execution.safeMode) reasons.push("EXECUTION_SAFE_MODE");
     if (this.#executionEnabled && !this.#brokerAvailable) reasons.push("BROKER_UNAVAILABLE");
     if (this.#executionEnabled && !this.#positionsReconciled) reasons.push("POSITIONS_NOT_RECONCILED");
+    if (this.#executionEnabled && this.#tradeUpdatesRequired && !this.#tradeUpdatesConnected) {
+      reasons.push("TRADE_UPDATES_DISCONNECTED");
+    }
+    if (this.#executionEnabled && this.#tradeUpdateTelemetry?.()?.overloaded === true) {
+      reasons.push("TRADE_UPDATE_BACKPRESSURE");
+    }
     if (this.#executionEnabled && !this.#marketClockAvailable) reasons.push("MARKET_CLOCK_UNAVAILABLE");
     if (this.#executionEnabled &&
         (this.#account?.active !== true || this.#account.optionsApproved !== true)) {
@@ -994,6 +1093,12 @@ export class SpyOptionsTradingRuntime {
     }
     if (this.#executionEnabled && !this.#stockReceiver.healthState(this.#killSwitch).websocketConnected) {
       reasons.push("STOCK_FEED_DISCONNECTED");
+    }
+    if (this.#executionEnabled && (
+      this.#stockReceiver.healthState(this.#killSwitch).marketDataBackpressure === true ||
+      this.#optionStream.telemetry?.().overloaded === true
+    )) {
+      reasons.push("MARKET_DATA_BACKPRESSURE");
     }
     const optionHealth = this.#optionChainHealth(timestamp);
     if (this.#executionEnabled && this.#isOptionQuoteStalled(timestamp)) {
@@ -1396,7 +1501,7 @@ export class SpyOptionsTradingRuntime {
           this.#optionHealth.reset(this.#monotonicNow());
           this.#lastOptionDiagnosis = undefined;
           this.#lastError = undefined;
-        } else if (this.#started && !this.#stopping && !this.#marketDataIdle &&
+        } else if (!this.#optionStream.reconnectManaged && this.#started && !this.#stopping && !this.#marketDataIdle &&
             !this.#optionReconnectInProgress) {
           this.#scheduleOptionReconnect();
         }
@@ -1408,6 +1513,12 @@ export class SpyOptionsTradingRuntime {
   #scheduleOptionReconnect(): void {
     if (this.#stopping || this.#marketDataIdle || this.#optionReconnectTimer ||
         this.#optionReconnectInProgress) return;
+    if (this.#optionStream.reconnectManaged) {
+      this.#optionReconnectAttempt += 1;
+      void this.#optionStream.requestReconnect?.("runtime detected stale or stalled OPRA data")
+        .catch((error: unknown) => this.#recordError(error));
+      return;
+    }
     this.#optionReconnectAttempt += 1;
     const delay = Math.min(30_000, 1_000 * (2 ** Math.max(0, this.#optionReconnectAttempt - 1)));
     this.#optionReconnectTimer = setTimeout(() => {
@@ -1592,7 +1703,7 @@ export class SpyOptionsTradingRuntime {
       await this.#connectOptionStream();
     } catch (error) {
       this.#recordError(error);
-      this.#scheduleOptionReconnect();
+      if (!this.#optionStream.reconnectManaged) this.#scheduleOptionReconnect();
     }
     const catchup = await this.#stockReceiver.activate();
     if (catchup.latestFeature) {

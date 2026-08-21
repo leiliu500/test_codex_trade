@@ -39,6 +39,18 @@ test("dashboard exposes liveness and feed tabs before any entries, orders, or hi
   assert.ok(snapshot.liveData.uptimeMs >= 2_000);
   const html = tradingDashboardHtml();
   assert.match(html, /Engine heartbeat/);
+  assert.match(html, /Engine leadership/);
+  assert.match(html, /Account trade updates/);
+  assert.match(html, /Stream queues/);
+  assert.match(html, /dashboardReadiness/);
+  assert.match(html, /h\.marketDataBackpressure/);
+  assert.match(html, /h\.tradeUpdateBackpressure/);
+  assert.match(html, /h\.tradeUpdatesConnected/);
+  assert.match(html, /aggregateHealth\.leaderActive/);
+  assert.match(html, /h\.marketDataPendingEvents/);
+  assert.match(html, /h\.marketDataCoalescedEvents/);
+  assert.match(html, /h\.tradeUpdatePendingEvents/);
+  assert.match(html, /h\.tradeUpdateConsumerLagMs/);
   assert.match(html, /data-tab="liveDataTab"/);
   assert.match(html, /data-tab="tuningTab"/);
   assert.match(html, /Entry &amp; Order Tuning/);

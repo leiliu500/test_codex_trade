@@ -144,8 +144,10 @@ export class SpySipReceiver {
       await this.#connect();
     } catch (error) {
       this.#recordError(error);
-      await this.#stream.close();
-      this.#scheduleReconnect();
+      if (!this.#stream.reconnectManaged) {
+        await this.#stream.close();
+        this.#scheduleReconnect();
+      }
       throw error;
     }
   }
@@ -259,8 +261,9 @@ export class SpySipReceiver {
 
   healthState(killSwitch = false): HealthState {
     const now = this.#now();
+    const telemetry = this.#stream.telemetry?.();
     return {
-      ready: this.#connected && !this.#queue.halted,
+      ready: this.#connected && !this.#queue.halted && telemetry?.overloaded !== true,
       brokerRequired: false,
       marketDataFeed: "sip",
       ...(this.#lastQuoteTimestamp !== undefined ? { lastStockQuoteAgeMs: Math.max(0, now - this.#lastQuoteTimestamp) } : {}),
@@ -273,7 +276,15 @@ export class SpySipReceiver {
       restorationRejectedEvents: this.#restorationRejectedCount,
       rejectedMarketEvents: this.#rejectedCount,
       ...(this.#lastFeatureTimestamp !== undefined ? { lastFeatureTimestamp: this.#lastFeatureTimestamp } : {}),
-      reconnectAttempt: this.#reconnectAttempt,
+      reconnectAttempt: Math.max(this.#reconnectAttempt, telemetry?.reconnectAttempt ?? 0),
+      ...(telemetry ? {
+        marketDataPendingEvents: telemetry.pendingEvents,
+        marketDataMaximumPendingEvents: telemetry.maximumPendingEvents,
+        marketDataConsumerLagMs: telemetry.consumerLagMs,
+        marketDataMaximumConsumerLagMs: telemetry.maximumConsumerLagMs,
+        marketDataCoalescedEvents: telemetry.coalescedEvents,
+        marketDataBackpressure: telemetry.overloaded,
+      } : {}),
       ...(this.#lastStreamError ? { lastStreamError: this.#lastStreamError } : {}),
       subscribedOptionContracts: 0,
       websocketConnected: this.#connected,
@@ -314,7 +325,7 @@ export class SpySipReceiver {
           this.#lastStreamError = undefined;
         } else if (this.#started && !this.#stopping) {
           this.#lastStreamError = `${this.#config.symbol} SIP stream disconnected`;
-          this.#scheduleReconnect();
+          if (!this.#stream.reconnectManaged) this.#scheduleReconnect();
         }
       },
       onError: (error) => this.#recordError(error),

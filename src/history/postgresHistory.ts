@@ -70,6 +70,7 @@ const PRESERVED_DASHBOARD_AUDIT_EVENT_TYPES = [
   "risk_decision",
   "entry_blocked",
   "paper_order_submission_result",
+  "live_order_submission_result",
   "broker_order_request",
   "broker_order_state",
   "broker_order_replaced",

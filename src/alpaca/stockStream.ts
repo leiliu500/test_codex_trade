@@ -1,5 +1,6 @@
 import { isUnderlyingSymbol, type StockQuote, type StockTrade, type UnderlyingSymbol } from "../types.js";
 import WebSocket, { type RawData } from "ws";
+import type { MarketStreamTelemetry } from "../marketData/streamTelemetry.js";
 
 export interface StockStreamHandlers {
   onQuote(quote: StockQuote): void | Promise<void>;
@@ -16,6 +17,10 @@ export type StockStreamEvent =
 export interface StockStream {
   connect(handlers: StockStreamHandlers): Promise<void>;
   close(): Promise<void>;
+  /** Shared logical streams leave physical reconnect ownership at the hub. */
+  readonly reconnectManaged?: boolean;
+  requestReconnect?(reason?: string): Promise<void>;
+  telemetry?(): MarketStreamTelemetry;
 }
 
 export interface AlpacaStockStreamConfig {
@@ -27,6 +32,7 @@ export interface AlpacaStockStreamConfig {
   symbols?: readonly UnderlyingSymbol[];
   url?: string;
   connectTimeoutMs?: number;
+  maxPendingEvents?: number;
 }
 
 export class AlpacaStockWebSocket implements StockStream {
@@ -37,12 +43,14 @@ export class AlpacaStockWebSocket implements StockStream {
     symbols: readonly UnderlyingSymbol[];
     url: string;
     connectTimeoutMs: number;
+    maxPendingEvents: number;
   };
   #socket: WebSocket | undefined;
   #handlers: StockStreamHandlers | undefined;
   readonly #pendingEvents: StockStreamEvent[] = [];
   #dispatching = false;
   #dispatchTail: Promise<void> = Promise.resolve();
+  #overloaded = false;
 
   constructor(config: AlpacaStockStreamConfig) {
     const feed = config.feed ?? "iex";
@@ -55,11 +63,16 @@ export class AlpacaStockWebSocket implements StockStream {
       symbols,
       url: config.url ?? `wss://stream.data.alpaca.markets/v2/${feed}`,
       connectTimeoutMs: config.connectTimeoutMs ?? 10_000,
+      maxPendingEvents: config.maxPendingEvents ?? 100_000,
     };
+    if (!Number.isInteger(this.#config.maxPendingEvents) || this.#config.maxPendingEvents < 1) {
+      throw new Error("Stock stream maxPendingEvents must be a positive integer");
+    }
   }
 
   connect(handlers: StockStreamHandlers): Promise<void> {
     if (this.#socket) throw new Error("Stock stream is already connected");
+    this.#overloaded = false;
     this.#handlers = handlers;
     return new Promise((resolve, reject) => {
       let settled = false;
@@ -115,6 +128,7 @@ export class AlpacaStockWebSocket implements StockStream {
         } catch (error) {
           handlers.onError?.(error);
           rejectOnce(error);
+          socket.close();
         }
       });
       socket.on("error", (error) => {
@@ -142,7 +156,30 @@ export class AlpacaStockWebSocket implements StockStream {
     await this.#dispatchTail;
   }
 
+  telemetry(): MarketStreamTelemetry {
+    return {
+      pendingEvents: this.#pendingEvents.length,
+      maximumPendingEvents: this.#config.maxPendingEvents,
+      consumerLagMs: 0,
+      maximumConsumerLagMs: Number.MAX_SAFE_INTEGER,
+      coalescedEvents: 0,
+      overloaded: this.#overloaded,
+      reconnectAttempt: 0,
+    };
+  }
+
   #enqueueEvents(events: readonly StockStreamEvent[]): void {
+    if (this.#overloaded) return;
+    if (this.#pendingEvents.length + events.length > this.#config.maxPendingEvents) {
+      this.#overloaded = true;
+      const error = new Error(
+        `SIP pending-event limit exceeded (${this.#pendingEvents.length + events.length} > ` +
+        `${this.#config.maxPendingEvents})`,
+      );
+      this.#handlers?.onError?.(error);
+      this.#socket?.close();
+      return;
+    }
     this.#pendingEvents.push(...events);
     if (this.#dispatching) return;
     this.#dispatching = true;

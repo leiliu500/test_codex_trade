@@ -7,6 +7,10 @@ export interface RuntimeEnvironment {
   stockDataFeed: "sip";
   optionDataFeed: "opra";
   tradingSymbols: readonly UnderlyingSymbol[];
+  optionMaxSubscriptions: number;
+  marketDataMaxPendingEventsPerSymbol: number;
+  marketDataMaxInternalLagMs: number;
+  tradeUpdateMaxPendingEventsPerUnderlying: number;
   historyDatabaseEnabled: boolean;
   historyQuoteSampleMs: number;
   historyRetentionDays: number;
@@ -14,6 +18,9 @@ export interface RuntimeEnvironment {
   killSwitch: boolean;
   healthHost: string;
   healthPort: number;
+  leaderElectionEnabled: boolean;
+  leaderLockKey: string;
+  leaderHeartbeatMs: number;
   alpacaApiKey?: string;
   alpacaApiSecret?: string;
 }
@@ -25,11 +32,18 @@ export function readEnvironment(env: NodeJS.ProcessEnv = process.env): RuntimeEn
   const stockDataFeed = env.STOCK_DATA_FEED ?? "sip";
   const optionDataFeed = env.OPTION_DATA_FEED ?? "opra";
   const tradingSymbols = parseTradingSymbols(env.TRADING_SYMBOLS ?? "SPY");
+  const optionMaxSubscriptions = Number(env.OPRA_MAX_SUBSCRIPTIONS ?? "900");
+  const marketDataMaxPendingEventsPerSymbol = Number(env.MARKET_DATA_MAX_PENDING_PER_SYMBOL ?? "50000");
+  const marketDataMaxInternalLagMs = Number(env.MARKET_DATA_MAX_INTERNAL_LAG_MS ?? "500");
+  const tradeUpdateMaxPendingEventsPerUnderlying = Number(env.TRADE_UPDATE_MAX_PENDING_PER_SYMBOL ?? "10000");
   const historyDatabaseEnabled = env.HISTORY_DATABASE_ENABLED === "true";
   const historyQuoteSampleMs = Number(env.MARKET_HISTORY_QUOTE_SAMPLE_MS ?? "250");
   const historyRetentionDays = Number(env.MARKET_HISTORY_RETENTION_DAYS ?? "7");
   const healthPort = Number(env.HEALTH_PORT ?? "3001");
   const healthHost = env.HEALTH_HOST?.trim() || "127.0.0.1";
+  const leaderElectionEnabled = env.LEADER_ELECTION_ENABLED === "true";
+  const leaderLockKey = env.LEADER_LOCK_KEY?.trim() || "alpaca-options-engine";
+  const leaderHeartbeatMs = Number(env.LEADER_HEARTBEAT_MS ?? "5000");
   if (!Number.isInteger(healthPort) || healthPort < 1 || healthPort > 65_535) {
     throw new Error("HEALTH_PORT must be an integer between 1 and 65535");
   }
@@ -38,6 +52,15 @@ export function readEnvironment(env: NodeJS.ProcessEnv = process.env): RuntimeEn
   }
   if (!Number.isInteger(historyRetentionDays) || historyRetentionDays < 0 || historyRetentionDays > 3_650) {
     throw new Error("MARKET_HISTORY_RETENTION_DAYS must be an integer between 0 and 3650");
+  }
+  for (const [label, value] of [
+    ["OPRA_MAX_SUBSCRIPTIONS", optionMaxSubscriptions],
+    ["MARKET_DATA_MAX_PENDING_PER_SYMBOL", marketDataMaxPendingEventsPerSymbol],
+    ["MARKET_DATA_MAX_INTERNAL_LAG_MS", marketDataMaxInternalLagMs],
+    ["TRADE_UPDATE_MAX_PENDING_PER_SYMBOL", tradeUpdateMaxPendingEventsPerUnderlying],
+    ["LEADER_HEARTBEAT_MS", leaderHeartbeatMs],
+  ] as const) {
+    if (!Number.isInteger(value) || value < 1) throw new Error(`${label} must be a positive integer`);
   }
   if (stockDataFeed !== "sip") throw new Error("This runtime is hard-limited to the SIP stock-data feed");
   if (optionDataFeed !== "opra") throw new Error("Executable option trading requires the real-time OPRA option-data feed");
@@ -53,6 +76,15 @@ export function readEnvironment(env: NodeJS.ProcessEnv = process.env): RuntimeEn
   if (tradingMode === "live" && (!env.ALPACA_API_KEY || !env.ALPACA_API_SECRET)) {
     throw new Error("Live mode requires broker credentials");
   }
+  if (tradingMode === "live" && env.LIVE_TRADING_CONFIRMATION !== "I_UNDERSTAND_LIVE_ORDERS") {
+    throw new Error("Live mode requires LIVE_TRADING_CONFIRMATION=I_UNDERSTAND_LIVE_ORDERS");
+  }
+  if (tradingMode === "live" && !leaderElectionEnabled) {
+    throw new Error("Live mode requires LEADER_ELECTION_ENABLED=true");
+  }
+  if (leaderElectionEnabled && !env.DATABASE_URL) {
+    throw new Error("Leader election requires DATABASE_URL");
+  }
   if (marketDataEnabled && (!env.ALPACA_API_KEY || !env.ALPACA_API_SECRET)) {
     throw new Error("SIP market data requires ALPACA_API_KEY and ALPACA_API_SECRET");
   }
@@ -63,12 +95,19 @@ export function readEnvironment(env: NodeJS.ProcessEnv = process.env): RuntimeEn
     stockDataFeed,
     optionDataFeed,
     tradingSymbols,
+    optionMaxSubscriptions,
+    marketDataMaxPendingEventsPerSymbol,
+    marketDataMaxInternalLagMs,
+    tradeUpdateMaxPendingEventsPerUnderlying,
     historyDatabaseEnabled,
     historyQuoteSampleMs,
     historyRetentionDays,
     killSwitch: env.KILL_SWITCH === "true",
     healthHost,
     healthPort,
+    leaderElectionEnabled,
+    leaderLockKey,
+    leaderHeartbeatMs,
     ...(env.ALPACA_API_KEY ? { alpacaApiKey: env.ALPACA_API_KEY } : {}),
     ...(env.ALPACA_API_SECRET ? { alpacaApiSecret: env.ALPACA_API_SECRET } : {}),
     ...(env.DATABASE_URL ? { databaseUrl: env.DATABASE_URL } : {}),

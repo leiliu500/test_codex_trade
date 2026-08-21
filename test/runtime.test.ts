@@ -19,23 +19,51 @@ test("runtime environment is paper-safe and validates the health listener", () =
     stockDataFeed: "sip",
     optionDataFeed: "opra",
     tradingSymbols: ["SPY"],
+    optionMaxSubscriptions: 900,
+    marketDataMaxPendingEventsPerSymbol: 50_000,
+    marketDataMaxInternalLagMs: 500,
+    tradeUpdateMaxPendingEventsPerUnderlying: 10_000,
     historyDatabaseEnabled: false,
     historyQuoteSampleMs: 250,
     historyRetentionDays: 7,
     killSwitch: false,
     healthHost: "127.0.0.1",
     healthPort: 3001,
+    leaderElectionEnabled: false,
+    leaderLockKey: "alpaca-options-engine",
+    leaderHeartbeatMs: 5_000,
   });
   assert.throws(() => readEnvironment({ HEALTH_PORT: "0" }), /HEALTH_PORT/);
   assert.throws(() => readEnvironment({ HEALTH_PORT: "not-a-port" }), /HEALTH_PORT/);
   assert.throws(() => readEnvironment({ MARKET_HISTORY_QUOTE_SAMPLE_MS: "-1" }), /QUOTE_SAMPLE/);
   assert.throws(() => readEnvironment({ MARKET_HISTORY_RETENTION_DAYS: "3.5" }), /RETENTION_DAYS/);
+  assert.throws(() => readEnvironment({ OPRA_MAX_SUBSCRIPTIONS: "0" }), /OPRA_MAX_SUBSCRIPTIONS/);
+  assert.throws(() => readEnvironment({ MARKET_DATA_MAX_INTERNAL_LAG_MS: "0" }), /MAX_INTERNAL_LAG/);
+  assert.throws(() => readEnvironment({ LEADER_ELECTION_ENABLED: "true" }), /DATABASE_URL/);
   assert.throws(() => readEnvironment({ STOCK_DATA_FEED: "iex" }), /hard-limited.*SIP/i);
   assert.throws(() => readEnvironment({ OPTION_DATA_FEED: "indicative" }), /OPRA/i);
   assert.throws(() => readEnvironment({ ENABLE_LIVE_ORDERS: "true" }), /MARKET_DATA_ENABLED/);
   assert.throws(() => readEnvironment({ HISTORY_DATABASE_ENABLED: "true" }), /DATABASE_URL/);
   assert.throws(() => readEnvironment({ MARKET_DATA_ENABLED: "true" }), /ALPACA_API_KEY/);
   assert.throws(() => readEnvironment({ TRADING_MODE: "live" }), /ENABLE_LIVE_ORDERS/);
+  const liveBase = {
+    TRADING_MODE: "live",
+    ENABLE_LIVE_ORDERS: "true",
+    MARKET_DATA_ENABLED: "true",
+    ALPACA_API_KEY: "key",
+    ALPACA_API_SECRET: "secret",
+  };
+  assert.throws(() => readEnvironment(liveBase), /LIVE_TRADING_CONFIRMATION/);
+  assert.throws(() => readEnvironment({
+    ...liveBase,
+    LIVE_TRADING_CONFIRMATION: "I_UNDERSTAND_LIVE_ORDERS",
+  }), /LEADER_ELECTION_ENABLED/);
+  assert.equal(readEnvironment({
+    ...liveBase,
+    LIVE_TRADING_CONFIRMATION: "I_UNDERSTAND_LIVE_ORDERS",
+    LEADER_ELECTION_ENABLED: "true",
+    DATABASE_URL: "postgresql://localhost/trading",
+  }).tradingMode, "live");
   assert.equal(readEnvironment({
     MARKET_DATA_ENABLED: "true", ALPACA_API_KEY: "key", ALPACA_API_SECRET: "secret",
   }).marketDataEnabled, true);
@@ -94,6 +122,30 @@ test("market-closed idle is healthy without connected market-data sockets", () =
     killSwitch: false,
   };
   assert.equal(healthReadiness(state).status, "ok");
+});
+
+test("readiness fails closed for stream pressure, account-stream loss, and leader loss", () => {
+  const healthy: HealthState = {
+    ready: true,
+    brokerRequired: true,
+    executionEnabled: true,
+    subscribedOptionContracts: 10,
+    websocketConnected: true,
+    brokerAvailable: true,
+    marketClockState: "market-open",
+    openOrderCount: 0,
+    positionsReconciled: true,
+    recorderHealthy: true,
+    killSwitch: false,
+    marketDataBackpressure: false,
+    tradeUpdatesConnected: true,
+    leaderActive: true,
+  };
+  assert.equal(healthReadiness(healthy).status, "ok");
+  assert.equal(healthReadiness({ ...healthy, marketDataBackpressure: true }).status, "degraded");
+  assert.equal(healthReadiness({ ...healthy, tradeUpdateBackpressure: true }).status, "degraded");
+  assert.equal(healthReadiness({ ...healthy, tradeUpdatesConnected: false }).status, "degraded");
+  assert.equal(healthReadiness({ ...healthy, leaderActive: false }).status, "halted");
 });
 
 test("dashboard database cleanup requires exact confirmation and a safe idle system", async (context) => {

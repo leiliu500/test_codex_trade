@@ -151,6 +151,26 @@ test("production sizing submits no more than the one-contract cap", async () => 
   assert.equal(client.requests[0]?.quantity, 1);
 });
 
+test("account trade updates apply fills immediately and reconnect reconciliation preserves pending truth", async () => {
+  const client = new FakeTradingClient();
+  const manager = new LiveOrderManager({ config: defaultConfig, client });
+  await manager.initialize(start);
+  const submitted = await manager.submitEntry({
+    timestamp: start,
+    signal: signal(),
+    candidate: candidate(),
+    quote: optionQuote(start),
+  });
+  let state = await manager.applyBrokerOrderUpdate(submitted.brokerOrder!, start + 100);
+  assert.equal(state.pending?.brokerOrderId, submitted.brokerOrder!.id);
+  state = await manager.reconcileExternalState(start + 200, "TEST_RECONNECT");
+  assert.equal(state.pending?.brokerOrderId, submitted.brokerOrder!.id);
+  client.fill(submitted.brokerOrder!.id, 1, 2, "filled");
+  state = await manager.applyBrokerOrderUpdate(await client.getOrder(submitted.brokerOrder!.id), start + 300);
+  assert.equal(state.position?.quantity, 1);
+  assert.equal(state.pending, undefined);
+});
+
 test("live manager submits an option entry, reconciles partial fill, cancels remainder, and hard-stops exposure", async () => {
   const client = new FakeTradingClient();
   const recorder = new MemoryRecorder();

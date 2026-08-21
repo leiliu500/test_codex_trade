@@ -495,6 +495,18 @@ export class UnderlyingTradingRestClient implements MultiUnderlyingTradingRestCl
   }
 }
 
+export function adaptAlpacaBrokerOrder(raw: Record<string, unknown>): BrokerOrder {
+  if (typeof raw.id !== "string" || typeof raw.client_order_id !== "string" ||
+      typeof raw.symbol !== "string" || typeof raw.status !== "string") {
+    throw new Error("Invalid Alpaca broker order payload");
+  }
+  const filledQuantity = Number(raw.filled_qty);
+  if (!Number.isFinite(filledQuantity) || filledQuantity < 0) {
+    throw new Error("Invalid Alpaca broker filled quantity");
+  }
+  return mapOrder(raw as unknown as RawOrder);
+}
+
 function mapOrder(raw: RawOrder): BrokerOrder {
   return {
     id: raw.id, clientOrderId: raw.client_order_id, symbol: raw.symbol, status: raw.status,

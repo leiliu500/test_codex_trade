@@ -5,6 +5,7 @@ import { decode, encode } from "@msgpack/msgpack";
 import {
   parseRfc3339ToMs, type OpraQuoteObservation,
 } from "../marketData/opraQuoteHealth.js";
+import type { MarketStreamTelemetry } from "../marketData/streamTelemetry.js";
 
 export interface OptionStreamActivity {
   receiveWallTimestamp: number;
@@ -34,6 +35,9 @@ export interface OptionStream {
   unsubscribe(symbols: readonly string[]): Promise<void>;
   connect(handlers: OptionStreamHandlers): Promise<void>;
   close(): Promise<void>;
+  readonly reconnectManaged?: boolean;
+  requestReconnect?(reason?: string): Promise<void>;
+  telemetry?(): MarketStreamTelemetry;
 }
 
 export interface AlpacaOptionStreamConfig {
@@ -65,6 +69,7 @@ export class AlpacaOptionWebSocket implements OptionStream {
     reject: (error: unknown) => void;
     timeout: ReturnType<typeof setTimeout>;
   } | undefined;
+  #coalescedQuotes = 0;
 
   constructor(config: AlpacaOptionStreamConfig) {
     const feed = config.feed ?? "indicative";
@@ -201,6 +206,18 @@ export class AlpacaOptionWebSocket implements OptionStream {
     await this.#dispatchTail;
   }
 
+  telemetry(): MarketStreamTelemetry {
+    return {
+      pendingEvents: this.#pendingLatestQuotes.size,
+      maximumPendingEvents: Number.MAX_SAFE_INTEGER,
+      consumerLagMs: 0,
+      maximumConsumerLagMs: Number.MAX_SAFE_INTEGER,
+      coalescedEvents: this.#coalescedQuotes,
+      overloaded: false,
+      reconnectAttempt: 0,
+    };
+  }
+
   #updateSubscriptions(action: "subscribe" | "unsubscribe", symbols: readonly string[]): Promise<void> {
     const unique = [...new Set(symbols)];
     if (unique.length === 0) return Promise.resolve();
@@ -288,6 +305,7 @@ export class AlpacaOptionWebSocket implements OptionStream {
     for (const quote of quotes) {
       const pending = this.#pendingLatestQuotes.get(quote.symbol);
       if (!pending || quote.timestamp >= pending.timestamp) {
+        if (pending) this.#coalescedQuotes += 1;
         this.#pendingLatestQuotes.set(quote.symbol, quote);
       }
     }
